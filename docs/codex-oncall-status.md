@@ -950,6 +950,7 @@ auto_trade_switches: untouched   # trading_settings 最后修改 2026-09-26 03:3
 | 提案 | 值守案件 | 消息 | 动作 / 结果 | 参数正确？ | 时机 | 自动执行会对吗？ | 备注 |
 |---|---|---|---|---|---|---|---|
 | P1 | — | — | 冒烟，`target_not_resolved` | — | — | — | 非真实案件 |
+| P2 | #32（`mgmt:19598:move_stop_to_break_even`） | 陈哥 #19598 13:44:30Z「上移止损 83000 附近做好成本保护」，BTC 多 lifecycle 1348，两仓 5+5 | 提出 `adjust_stop_loss` → 83000；13:45:21Z 只提示发出，14:15:26Z 过期 | **否**：意图与价格都偏离主链路（见 9.4.7.1） | **对**（发布后 51 s 出提案） | **不会执行**，也不应执行（见下） | 首个真实样本；**计为错判** |
 
 ### 9.5 阶段 4 第 1 批（2026-09-27，实现子代理，`claude/codex-oncall-phase4` 分支，**未合并未部署**）
 
@@ -1324,6 +1325,38 @@ auto_trade_switches: untouched
 #### 9.7.2 逐个放开（每一步单独确认，规格第 9 节）
 
 前置：只提示期（9.4.7）该动作 ≥ 3 条「自动执行会是对的」且零错判（D9）。然后 `MODE=auto`、`AUTO_ACTIONS=full_exit` → 首笔逐项核对（审计两行、批次终态、`trigger-orders-pending` 全集前后、通知与交易所实况）→ 再加下一个动作。
+
+#### 9.4.7.1 P2 核对（2026-09-28，只读：生产按主键 / 索引点查 + 代码；12h 核对见分支 `claude/youthful-wu-db596d` 的 `docs/plans/2026-09-28-12h-group-action-audit.md` E1）
+
+**发生了什么**：主链路把 #19598 识别为 `move_stop_to_break_even`（候选 2666），批次 184 `break_even_by_market`、保本参考价按用户规则取策略价 83150。
+执行器预检失败 `protection_rows_unattributed_on_exchange`（`strategy_management_executor.py:713`）——交易所上有两张账本认不出的 TPSL 单
+（大漂亮 binding 388 两条未成交限价入场腿自带的止损），`unowned_order_present` 是**全账户一个布尔值**，于是所有仓位的保护都被判「不明确」。
+值守 case 32 请求补救，P2 在 51 s 内以只提示发出，30 分钟无人处理过期；14:45 KOL「触发成本保护」，系统市价平仓（多亏约 2.3 USDT）。
+
+**提案参数不对**：P2 是 `adjust_stop_loss` → **83000**，主链路（与用户规则「离场价位取策略价」）是**保本 83150**。
+原因在补救计划器用 `resolve_management_directive` 从原文重算意图：`position_update` 且原文含明确止损价时，
+`management_directives.py:282` 的分支先于「保本」判断返回 `adjust_stop_loss`（价格取原文 83000）。主链路走的是识别决策里的 `move_stop_to_break_even`。
+**补救重算与主链路对「保本 + 明确价」的消息给出不同的动作**——这和阶段 3 规格 2.1、raw 17813 形状是同一类分歧。83000 比 83150 更松，
+虽然仍是收紧（低于两仓入场价 83404.7 / 83090），但不是 KOL 的意图按用户规则落地后的结果。
+
+**如果当时是 auto（阶段 4 代码）会怎样**（代码推断，未实跑）：
+1. **G-D D1 就会降级**：指令项 `error_json` 是 `{"message": "protection_rows_unattributed_on_exchange:…", "type": …}`，没有 `reason` 键，
+   D1 把整段当原因，不在瞬时原因白名单里 → 降级为带按钮的提案，不会自动执行。
+2. 即使 D1 放行或有人点了按钮：apply 的「只计划」阶段用补救投影候选（`adjust_stop_loss`、`stop_loss_text=83000`、`stop_price_source` 照抄原候选 = **空**），
+   计划器止损网关（`strategy_management_planner.py:870`）拒 `management_stop_provenance_invalid` → 提案 `failed`（未提升为 live，不计熔断）。
+3. 即使前两步都过：执行器会在提升为 live 之后被**同一个「不明确」**挡住（`strategy_management_executor.py:713`，G-D 的 D3 只看本仓位的账本归属，
+   看不到全账户的未归属挂单）。而且此时 apply 抛错时已有 live 批次，`_classify_apply_exception` 会把这次**没有任何交易所写入**的拒绝判成 `uncertain`
+   → 自动模式下立即暂停自动。这是阶段 4 的一个误判点（见下「待办」）。
+
+**对 D9 证据的意义**：
+- 本条**不计入**任何动作的「判对」样本；对 `adjust_stop_loss` 计为**错判**（按 D9「零错判」，调止损的自动放开在修好下述分歧前不具备条件；它本来就排在第 4 步）。
+- 对 `move_stop_to_break_even`（放开顺序第 2 步）也不是正样本：补救根本没按「保本」出提案。
+- 主链路这次拒绝属于**规则性**原因（全账户不明确），不是瞬时原因；补救推不倒它，这是设计要的性质。真正的修法在主链路（把 `unowned_order_present` 从全账户布尔改为按品种 / 仓位归属，12h 核对 E1），不在补救。
+
+**待办（均需单独决定，本次只记录）**：
+1. 补救计划器对「保本 + 明确价」重算出 `adjust_stop_loss`，与主链路分歧。建议加一道确定性检查：补救动作的 `action_kind` 必须与源候选的 `management_action` / 主链路批次的 `intent` 一致，不一致 → 拒绝（`intent_diverges_from_main_chain`）；或改为以候选的权威 `management_action` 为准重算。
+2. `_classify_apply_exception`：apply 在提升为 live 之后抛错时，应再看批次状态——`blocked` 且无任何 leg 提交 / 无 mutation intent → `failed`，而不是一律 `uncertain`；否则执行器预检类拒绝会误触自动暂停。
+3. D1 读原因时也应识别 `error_json.message` 里的原因码前缀（本条是 `protection_rows_unattributed_on_exchange`，本就不在白名单，结论不变，但当前是靠「没有 reason 键 → 整段不匹配」碰巧挡住的）。
 
 ## 10. 外部送来的案例（2026-09-26）
 
