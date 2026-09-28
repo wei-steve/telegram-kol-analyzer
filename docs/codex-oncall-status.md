@@ -1372,6 +1372,23 @@ auto_trade_switches: untouched
 
 新增 `tests/test_oncall_remediation_intent_guard.py`（25 条）。
 
+#### 9.4.7.3 P2 修正的部署记录（2026-09-28 18:24Z / 北京 09-29 02:24，用户在本会话确认）
+
+```yaml
+production_commit: 2402773f873f55ff2366ee0a7deea4421ff94baf   # 代码 = 全量通过的 8d8cf6b8
+rollback_commit: 546d991346fd063d1c0d3098cf24de2589476fcd
+schema_change: none
+worker_mode: shadow           # 未改 env；无 AUTO_ACTIONS
+verification_level: L1
+```
+
+- 部署前：生产 `546d9913`；在途管理批次 0、执行中 / 待确认提案 0、未终态 mutation intent 0；最近 5 分钟无下单动作。
+- `tg-deploy 2402773f…` → worker 2873719 / web 2873729 / ingest 2873741 active；值守侧与 `deploy/` 无改动，未重启值守。
+- `origin/main` 快进到 `2402773f`（不带 `-f`）；OFFENDERS 判 PASS，自测（旧生产 `546d9913` 对候选）判 FAIL。
+- L1：worker 日志 `effective_mode=shadow`；服务器只读监控 18:25Z–18:40Z 每分钟采样，**15 分钟**全程 Traceback / `schema_invalid` / ERROR 为 0、四服务 active、
+  `MODE=shadow`、无 `AUTO_ACTIONS`、worker PID 不变；窗口内 0 条新消息（北京凌晨），按 L1「15 分钟或 5 条消息先到者」以 15 分钟满足。监控脚本已删除。
+- 新行为（意图一致检查、零写入判 failed、D1 读 message 原因码）要等下一个真实补救案件才会在生产上被触发。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
