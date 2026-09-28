@@ -860,6 +860,38 @@ def _note_capped_alert(store: OncallStateStore, now: datetime) -> None:
     store.bump_counter(_daily_counter_key(now))
 
 
+#: Severities whose opening alert may outrun the daily cap (see below).
+CAP_EXEMPT_SEVERITIES = frozenset({"high", "critical"})
+#: The rule whose whole job is "an alert never reached anybody".
+UNHEARD_INCIDENT_RULE = "D6c"
+
+
+def _case_open_bypasses_cap(case: CaseRecord) -> bool:
+    """Whether this case's *opening* alert is sent even past the daily cap.
+
+    2026-09-28: the cap was spent by 13:25 Beijing, mostly on follow-ups, and
+    every case opened after that -- a D3 in an auto_trade group, two D6c
+    "never notified" incidents -- was silenced for the rest of the day with no
+    second chance. The design (2026-09-28 audit fixes, 3.2) exempts
+    high-severity openings in auto_trade groups and D6c openings.
+
+    The group's trading mode lives in ``groups.yaml``, which this module may
+    not import and the watcher does not read, so "auto_trade group" is
+    approximated by "the case is about a message": every such rule (D1/D2/D3,
+    D6a/D6b) only opens for a group holding a position, a batch, or a
+    deletion exit, i.e. a group that trades. Health, read-failure and
+    medium-severity cases keep the cap. The opening still counts.
+    """
+
+    if str(case.severity or "").strip().lower() not in CAP_EXEMPT_SEVERITIES:
+        return False
+    rules = {str(case.rule or "")}
+    rules.update(str(rule) for rule in (case.evidence or {}).get("rules") or ())
+    if any(UNHEARD_INCIDENT_RULE in rule for rule in rules):
+        return True
+    return case.raw_message_id is not None
+
+
 def _suppress_for_cap(store: OncallStateStore, now: datetime, policy: AlertPolicy) -> None:
     suppressed = store.bump_counter(_daily_suppressed_key(now))
     body = format_cap_reached_alert(policy.daily_cap, suppressed)
@@ -901,7 +933,8 @@ def compose_case_alerts(
         is_health = case.case_key.startswith("health:")
         if is_health and _health_in_cooldown(store, case, now, settings):
             continue
-        if _cap_reached(store, now, settings):
+        bypasses_cap = not is_health and _case_open_bypasses_cap(case)
+        if not bypasses_cap and _cap_reached(store, now, settings):
             _suppress_for_cap(store, now, settings)
             continue
         if not is_health and _should_merge_into_group_notice(
@@ -944,9 +977,9 @@ def compose_case_alerts(
             # Never announce the recovery of a problem nobody was told about.
             continue
         is_health = case.case_key.startswith("health:")
-        if _cap_reached(store, now, settings):
-            _suppress_for_cap(store, now, settings)
-            continue
+        # A follow-up, not a new problem: it only ever trails an opening that
+        # was sent, so it neither waits on the daily cap nor spends it
+        # (2026-09-28 audit fixes, 3.2).
         kind = ALERT_KIND_HEALTH_RESOLVED if is_health else ALERT_KIND_CASE_RESOLVED
         body = _format_resolved_alert(case, is_health=is_health)
         if store.enqueue_alert(
@@ -957,7 +990,6 @@ def compose_case_alerts(
             dedupe_key=_episode_key(kind, case),
         ) is not None:
             queued += 1
-            _note_capped_alert(store, now)
     return queued
 
 
@@ -969,12 +1001,14 @@ def compose_diagnosis_alert(
     now: datetime,
     policy: AlertPolicy | None = None,
 ) -> bool:
-    """Queue the follow-up diagnosis for one case. At most one, ever."""
+    """Queue the follow-up diagnosis for one case. At most one, ever.
 
-    settings = policy or AlertPolicy()
-    if _cap_reached(store, now, settings):
-        _suppress_for_cap(store, now, settings)
-        return False
+    A follow-up to an opening that was already sent, so it neither waits on
+    the daily cap nor spends it (2026-09-28 audit fixes, 3.2). ``policy`` is
+    kept for callers' signatures.
+    """
+
+    del policy
     queued = store.enqueue_alert(
         kind=ALERT_KIND_DIAGNOSIS,
         body=format_diagnosis_message(case, verdict),
@@ -982,10 +1016,7 @@ def compose_diagnosis_alert(
         case_id=case.id,
         dedupe_key=f"{ALERT_KIND_DIAGNOSIS}:{case.id}",
     )
-    if queued is None:
-        return False
-    _note_capped_alert(store, now)
-    return True
+    return queued is not None
 
 
 def compose_codex_state_alert(

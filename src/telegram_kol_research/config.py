@@ -338,6 +338,14 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # switched off by an env line.
         "mimo_provider_failure_streak",
         "mimo_provider_probe_failed",
+        # A-8c meant a refused management fraction in an auto_trade group to
+        # be delivered, but never added it here, and production's whitelist
+        # does not name it: eight auto_trade rows sat ``pending`` from
+        # 2026-09-20 on (2026-09-28 audit, problem 3). notify_only rows are
+        # written ``suppressed`` at capture by
+        # ``management_fraction_gate.record_fraction_rejection``, so this
+        # adds no delivery for them.
+        "management_fraction_rejected",
     }
 )
 

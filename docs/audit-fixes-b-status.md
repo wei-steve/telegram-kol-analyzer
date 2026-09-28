@@ -9,7 +9,7 @@
 | 问题 | 状态 | 提交 |
 |---|---|---|
 | 2 比例错配 + 「加仓后」 | 完成（本地测试） | 见 git log「audit fix 2」 |
-| 3 告警送达 | 未开始 | |
+| 3 告警送达 | 完成（本地测试） | 见 git log「audit fix 3」 |
 | 4 模糊止损修饰词 | 未开始 | |
 
 ## 问题 2
@@ -28,3 +28,24 @@
   - 残留缺口：「全部出局！持仓收益高达370％」这种动词和百分数之间**没有任何数字**的写法仍会被拒
     （与修复前相同）。生产样本里没有见到这种形态；如需覆盖，要先决定怎样区分它和 `减仓；比例120%`。
 - 测试：`tests/test_management_directives.py` 中 `test_r2a_*`…`test_r2f_*`；修复前 6 个失败、修复后全部通过。
+
+## 问题 3
+
+- 3a：`config.ALWAYS_NOTIFIED_INCIDENT_TYPES` 加入 `management_fraction_rejected`。notify_only 群的行在写入时
+  已被 `record_fraction_rejection` 标成 `suppressed`，不会多发。没有既有测试断言该集合的精确内容（只有
+  「某类型在集合里」的断言），无需改动。
+- 3b：`oncall_alerts`
+  - `compose_case_alerts` 的「已恢复」告警、`compose_diagnosis_alert` 的诊断告警：不再检查上限、不再计数。
+  - 开案：`_case_open_bypasses_cap(case)` 为真则不受上限拦截，但仍计数；其余开案维持上限 30。
+    合并通知、上限通知、每日汇报不变。
+  - **「auto_trade 群」的判定（设计稿未说明，本实现的选择）**：采用保守规则
+    「严重度 high/critical，且（规则含 D6c，或案例带 `raw_message_id`）」。原因：群的交易模式只在
+    `groups.yaml` 里，生产库没有；值守进程不读它，且架构边界测试只允许 `oncall_alerts` 导入
+    `oncall_codex` / `oncall_state`；要拿到模式就得给值守新增一次生产配置读取。带 `raw_message_id`
+    的规则（D1a–c、D2、D3、D6a、D6b）都只在群里有持仓 / 批次 / 删除退出时才开案，实际就是交易群。
+    仍受上限约束的：D1d（medium）、D4/D5 健康类、D5a 读库失败。合并规则的 `evidence["rules"]` 里含 D6c 也算 D6c。
+  - 既有测试 `test_the_daily_cap_stops_at_the_limit_and_resets_the_next_beijing_day` 用的是高严重度、带消息的案例，
+    按批准的设计它们现在不受上限拦截；改为 medium（D1d）案例，测试的上限机制本身不变。
+- 测试：`tests/test_system_operator_bot.py::test_r3a_*`（2 个），`tests/test_oncall_alerts.py::test_r3b_*`（2 个）、
+  `test_r3c_*`（1 个）；修复前全部失败、修复后通过。
+- 部署提醒（设计稿第 5 节）：值守代码有改动，部署后要单独重启 `telegram-kol-oncall.service`。

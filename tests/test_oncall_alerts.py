@@ -632,9 +632,30 @@ def test_a_health_rule_that_comes_back_after_the_cooldown_alerts_again(store):
     assert queued == 1
 
 
+def open_capped_case(store, *, key, chat_id, now=NOW):
+    """A case the daily cap still applies to: medium severity (D1d)."""
+
+    case, _created = store.upsert_case(
+        case_key=key,
+        rule="D1d",
+        severity="medium",
+        now=now,
+        raw_message_id=15660,
+        chat_id=chat_id,
+        reason_code="instruction_stuck_submitted",
+        evidence={"group_name": "龚有财群", "action": "full_exit"},
+    )
+    return case
+
+
 def test_the_daily_cap_stops_at_the_limit_and_resets_the_next_beijing_day(store):
+    # Medium-severity openings: since the 2026-09-28 audit fix, a high-severity
+    # opening about a message is exempt from the cap (tests below).
     policy = AlertPolicy(daily_cap=2)
-    case_ids = [open_case(store, key=f"mgmt:{index}:full_exit", chat_id=-index).id for index in range(4)]
+    case_ids = [
+        open_capped_case(store, key=f"mgmt:{index}:full_exit", chat_id=-index).id
+        for index in range(4)
+    ]
 
     compose_case_alerts(
         store, now=NOW, new_case_ids=case_ids, resolved_case_ids=[], policy=policy
@@ -650,7 +671,7 @@ def test_the_daily_cap_stops_at_the_limit_and_resets_the_next_beijing_day(store)
     assert "今日告警已达上限（2 条），其余 2 条" in notice.body
 
     tomorrow = NOW + timedelta(days=1)
-    fresh = open_case(store, key="mgmt:99:full_exit", chat_id=-99, now=tomorrow)
+    fresh = open_capped_case(store, key="mgmt:99:full_exit", chat_id=-99, now=tomorrow)
     compose_case_alerts(
         store,
         now=tomorrow,
@@ -663,6 +684,146 @@ def test_the_daily_cap_stops_at_the_limit_and_resets_the_next_beijing_day(store)
         alert.kind == ALERT_KIND_CASE_OPEN and alert.case_id == fresh.id
         for alert in store.pending_alerts()
     )
+
+
+# ----------------------------------------- 2026-09-28 audit fixes, problem 3b
+# Production 2026-09-28: the cap of 30 was spent by 13:25 Beijing, mostly on
+# "resolved" and diagnosis follow-ups, and every case opened afterwards -- a D3
+# in an auto_trade group, two D6c "never notified" incidents -- was silenced.
+
+
+def _fill_cap_with_ordinary_openings(store, *, count=30):
+    case_ids = [
+        open_capped_case(store, key=f"mgmt:{9000 + index}:full_exit", chat_id=-9000 - index).id
+        for index in range(count)
+    ]
+    queued = compose_case_alerts(
+        store, now=NOW, new_case_ids=case_ids, resolved_case_ids=[]
+    )
+    assert queued == count
+    return case_ids
+
+
+def _daily_count(store):
+    from telegram_kol_research.oncall_alerts import beijing_date
+
+    return store.get_int_meta(f"daily_alerts:{beijing_date(NOW)}", 0)
+
+
+def test_r3b_high_severity_message_and_d6c_openings_outrun_a_spent_cap(store):
+    _fill_cap_with_ordinary_openings(store)
+    assert _daily_count(store) == 30
+
+    d3 = open_recognition_case(store)
+    d6c = open_unheard_incident_case(store)
+    ordinary = open_capped_case(store, key="mgmt:9999:full_exit", chat_id=-9999)
+    health = _stall_episode(store, now=NOW)
+
+    queued = compose_case_alerts(
+        store,
+        now=NOW,
+        new_case_ids=[d3.id, d6c.id, ordinary.id, health.id],
+        resolved_case_ids=[],
+    )
+
+    assert queued == 2
+    opened = {
+        alert.case_id
+        for alert in store.pending_alerts(limit=100)
+        if alert.kind == ALERT_KIND_CASE_OPEN
+    }
+    assert {d3.id, d6c.id} <= opened
+    assert store.get_case(d3.id).alerted_at is not None
+    assert store.get_case(d6c.id).alerted_at is not None
+    # Everything else keeps the cap.
+    assert ordinary.id not in opened
+    assert store.get_case(ordinary.id).alerted_at is None
+    assert store.get_case(health.id).alerted_at is None
+    # The exempt openings still count; the cap notice stays as it was.
+    assert _daily_count(store) == 32
+    notice = next(
+        alert
+        for alert in store.pending_alerts(limit=100)
+        if alert.kind == ALERT_KIND_CAP_REACHED
+    )
+    assert "今日告警已达上限（30 条），其余 2 条" in notice.body
+
+
+def test_r3b_a_merged_d6c_rule_list_still_counts_as_d6c(store):
+    _fill_cap_with_ordinary_openings(store)
+    case, _created = store.upsert_case(
+        case_key="unheard:77",
+        rule="D5b",
+        severity="high",
+        now=NOW,
+        reason_code="runtime_incident_never_notified",
+        evidence={"kind": "unheard_incident", "rules": ["D5b", "D6c"]},
+    )
+
+    assert compose_case_alerts(
+        store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[]
+    ) == 1
+
+
+def test_r3c_follow_ups_neither_wait_on_nor_spend_the_cap(store):
+    from telegram_kol_research.oncall_alerts import (
+        ALERT_KIND_CASE_RESOLVED,
+        ALERT_KIND_DIAGNOSIS,
+        compose_diagnosis_alert,
+    )
+
+    policy = AlertPolicy(daily_cap=3)
+    first = open_capped_case(store, key="mgmt:1:full_exit", chat_id=-1)
+    compose_case_alerts(
+        store, now=NOW, new_case_ids=[first.id], resolved_case_ids=[], policy=policy
+    )
+    verdict = {
+        "urgency": "low",
+        "category": "transient_failure",
+        "should_have_executed": "yes",
+        "confidence": "high",
+        "what_message_wanted_zh": "平仓",
+        "explanation_zh": "暂时失败",
+        "recommended_action_zh": "观察",
+    }
+    assert compose_diagnosis_alert(
+        store, case=store.get_case(first.id), verdict=verdict, now=NOW, policy=policy
+    )
+    store.resolve_case(first.id, NOW)
+    assert compose_case_alerts(
+        store, now=NOW, new_case_ids=[], resolved_case_ids=[first.id], policy=policy
+    ) == 1
+    # Opening + diagnosis + resolved: only the opening was counted.
+    assert _daily_count(store) == 1
+
+    second = open_capped_case(store, key="mgmt:2:full_exit", chat_id=-2)
+    third = open_capped_case(store, key="mgmt:3:full_exit", chat_id=-3)
+    fourth = open_capped_case(store, key="mgmt:4:full_exit", chat_id=-4)
+    queued = compose_case_alerts(
+        store,
+        now=NOW,
+        new_case_ids=[second.id, third.id, fourth.id],
+        resolved_case_ids=[],
+        policy=policy,
+    )
+    assert queued == 2
+    assert _daily_count(store) == 3
+    assert store.get_case(fourth.id).alerted_at is None
+
+    # With the cap spent, follow-ups for already-announced cases still go out.
+    assert compose_diagnosis_alert(
+        store, case=store.get_case(second.id), verdict=verdict, now=NOW, policy=policy
+    )
+    store.resolve_case(second.id, NOW)
+    assert compose_case_alerts(
+        store, now=NOW, new_case_ids=[], resolved_case_ids=[second.id], policy=policy
+    ) == 1
+    assert _daily_count(store) == 3
+    kinds = [
+        (alert.kind, alert.case_id) for alert in store.pending_alerts(limit=100)
+    ]
+    assert (ALERT_KIND_DIAGNOSIS, second.id) in kinds
+    assert (ALERT_KIND_CASE_RESOLVED, second.id) in kinds
 
 
 def test_the_daily_summary_is_sent_once_after_nine_in_beijing(store):

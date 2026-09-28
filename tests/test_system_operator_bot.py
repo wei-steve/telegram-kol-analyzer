@@ -4790,3 +4790,117 @@ def test_telegram_evidence_probe_enforces_wall_clock_deadline(
 
     assert time.monotonic() - started_at < 0.2
     assert {call[0] for call in cancelled} == {"get", "post"}
+
+
+# --- 2026-09-28 audit fixes, problem 3a: refused fractions never delivered ---
+# Production's whitelist is non-empty and does not name
+# ``management_fraction_rejected``; before the fix the fold of
+# ``ALWAYS_NOTIFIED_INCIDENT_TYPES`` did not add it either, so auto_trade rows
+# sat ``pending`` forever (docs/plans/2026-09-28-audit-fixes-design.md 3.1).
+
+_R3A_ENV = {
+    "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true",
+    "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": (
+        "management_partial_failed,severe_protection_incident"
+    ),
+}
+
+
+def _r3a_fraction_incident(session_factory, *, raw_message_id, mode):
+    from telegram_kol_research.management_directives import (
+        ManagementFractionInvalid,
+    )
+    from telegram_kol_research.management_fraction_gate import (
+        record_fraction_rejection,
+    )
+
+    return record_fraction_rejection(
+        session_factory,
+        raw_message_id=raw_message_id,
+        error=ManagementFractionInvalid("invalid_format", "retained_percentage"),
+        authoritative_generation=1,
+        chat_id=-1002337721508,
+        group_trading_mode_provider=lambda chat_id: mode,
+    )
+
+
+def test_r3a_production_whitelist_still_notifies_refused_fractions():
+    from telegram_kol_research.config import load_runtime_incident_config
+
+    runtime_config = load_runtime_incident_config(
+        environ=dict(_R3A_ENV), env_file_paths=[]
+    )
+
+    assert runtime_config.telegram_notification_types is not None
+    assert (
+        "management_fraction_rejected" in runtime_config.telegram_notification_types
+    )
+    assert runtime_config.notifies("management_fraction_rejected")
+
+
+def test_r3a_auto_trade_refused_fraction_is_claimed_and_routed_to_notification_bot(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.config import load_runtime_incident_config
+
+    session_factory = create_session_factory(tmp_path / "r3a-fraction.db")
+    runtime_config = load_runtime_incident_config(
+        environ=dict(_R3A_ENV), env_file_paths=[]
+    )
+    auto_trade = _r3a_fraction_incident(
+        session_factory, raw_message_id=19597, mode="auto_trade"
+    )
+    notify_only = _r3a_fraction_incident(
+        session_factory, raw_message_id=19598, mode="notify_only"
+    )
+
+    claim = operator_bot_module.claim_next_runtime_incident_notification(
+        session_factory,
+        claimed_at=NOW,
+        notification_types=runtime_config.telegram_notification_types,
+    )
+    assert claim is not None
+    assert claim["incident"].id == auto_trade.id
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, auto_trade.id)
+        row.notification_status = "pending"
+        row.notification_claim_token = None
+        row.notification_claimed_at = None
+        session.commit()
+
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append((kwargs["config"], kwargs["text"]))
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", capture
+    )
+    operator_config = SystemOperatorBotConfig("op-token", "op-chat")
+    notification_config = SystemOperatorBotConfig("notif-token", "notif-chat")
+
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=operator_config,
+            notification_config=notification_config,
+            runtime_config=runtime_config,
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 1
+    assert len(deliveries) == 1
+    routed_config, text = deliveries[0]
+    assert routed_config is notification_config
+    assert f"事件ID: {auto_trade.id}" in text
+    with session_factory() as session:
+        assert (
+            session.get(RuntimeIncident, auto_trade.id).notification_status
+            == "delivered"
+        )
+        # notify_only rows are written ``suppressed`` at capture and stay so.
+        assert (
+            session.get(RuntimeIncident, notify_only.id).notification_status
+            == "suppressed"
+        )
