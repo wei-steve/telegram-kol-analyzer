@@ -25,6 +25,7 @@ import ast
 import inspect
 from datetime import UTC, datetime
 from types import SimpleNamespace
+import logging
 
 import pytest
 
@@ -36,6 +37,23 @@ from telegram_kol_research.runtime_incidents import (
     _SUMMARY_FIELDS,
     _validate_redacted_json_contract,
 )
+
+
+@pytest.fixture
+def caplog(caplog, monkeypatch):
+    """``caplog`` that still sees this package's records in a full run.
+
+    ``app_logging.configure_application_logging`` sets the package logger's
+    ``propagate = False`` for the whole process, so once an earlier test has
+    called it these records never reach pytest's root handler -- the same way
+    ``test_recognition_execution_finding_noise`` passed alone and failed in the
+    suite. Restored after the test by ``monkeypatch``.
+    """
+
+    monkeypatch.setattr(
+        logging.getLogger("telegram_kol_research"), "propagate", True
+    )
+    return caplog
 
 
 NOW = datetime(2026, 9, 28, 3, 23, 38, tzinfo=UTC)

@@ -21,6 +21,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+import logging
 
 import pytest
 
@@ -53,6 +54,23 @@ from telegram_kol_research.recognition_failure_attribution import (
     MIMO_AUTHORITATIVE_FAILED,
     MIMO_AUTHORITATIVE_FAILED_EXHAUSTED,
 )
+
+
+@pytest.fixture
+def caplog(caplog, monkeypatch):
+    """``caplog`` that still sees this package's records in a full run.
+
+    ``app_logging.configure_application_logging`` sets the package logger's
+    ``propagate = False`` for the whole process, so once an earlier test has
+    called it these records never reach pytest's root handler -- the same way
+    ``test_recognition_execution_finding_noise`` passed alone and failed in the
+    suite. Restored after the test by ``monkeypatch``.
+    """
+
+    monkeypatch.setattr(
+        logging.getLogger("telegram_kol_research"), "propagate", True
+    )
+    return caplog
 
 
 CHAT_ID = -1002337721508
