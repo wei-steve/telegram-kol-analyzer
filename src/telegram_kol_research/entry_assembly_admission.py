@@ -47,6 +47,9 @@ from telegram_kol_research.recognition_failure_attribution import (
     MIMO_AUTHORITATIVE_FAILED,
     MIMO_AUTHORITATIVE_FAILED_EXHAUSTED,
 )
+from telegram_kol_research.strategy_thread_candidates import (
+    ACTIVE_LIFECYCLE_STATUSES,
+)
 
 
 ADJACENT_ENTRY_MAX_AGE = timedelta(minutes=30)
@@ -121,6 +124,23 @@ _RISK_REDUCING_ACTIONS = frozenset(
 )
 _MANAGEMENT_CLASS_LABELS = frozenset({"策略管理", "仓位管理"})
 _QUOTE_SUFFIXES = ("SWAP", "USDT", "USDC", "USD")
+
+#: Lifecycle statuses an exact target must be in for that target to prove
+#: "this cancellation is about a different position". ``ACTIVE_LIFECYCLE_STATUSES``
+#: (``strategy_thread_candidates.py:29-31``) is
+#: ``{"pending_entry", "entered", "holding", "expired"}`` -- it keeps ``expired``
+#: in the set because the candidate generator still has to *show* an expired
+#: thread to management messages, not because an expired thread is still live.
+#: Here the question is the opposite one ("can this lifecycle still be
+#: cancelled?"), so ``expired`` is dropped. Terminal statuses this excludes:
+#: ``expired`` plus ``exited`` / ``cancelled`` / ``invalidated`` (grep
+#: ``lifecycle_status =`` across the codebase), none of which are in
+#: ``ACTIVE_LIFECYCLE_STATUSES`` to begin with. 2026-09-28: 陈哥's 19490 pinned
+#: a "取消，不进了" exactly onto lifecycle 1327, which was already ``expired``
+#: -- an exact target to a dead lifecycle proves nothing about which position
+#: the cancellation means, so it must not excuse releasing a same-symbol/side
+#: blocker.
+_LIVE_LIFECYCLE_STATUSES = ACTIVE_LIFECYCLE_STATUSES - {"expired"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,59 +263,17 @@ def _side(value: object) -> str | None:
     return None
 
 
-def _exhausted_blocker_may_cancel_entry(
-    normalized: dict,
-    *,
-    blocker: RawMessage,
-    strategy: RawMessage,
-    candidate: SignalCandidate,
-    own_lifecycle_ids: frozenset[int],
-) -> bool:
-    """Whether an unreadable neighbour could be the cancellation of this entry.
+def _evidence_targets(normalized: dict) -> list[tuple[int | None, object, object]]:
+    """Every (exact lifecycle id or None, symbol, side) target ``normalized`` names.
 
-    4a/4b made an exhausted recognition failure terminal, which releases the
-    entry behind it after about ten minutes. Before that it waited six hours
-    and expired -- fail-closed. That is still the right answer for the one
-    shape where releasing is dangerous: the KOL posts an entry, then a
-    "取消 / 不进了 / 全部出局" for it, and the cancellation is the message we
-    could not read. The first-pass evidence survives the failure, so it says
-    enough to tell that shape apart; anything else is released.
-
-    Released (``False``) when any of these holds:
-
-    * the neighbour was posted before the strategy message. A cancellation
-      cannot cancel an entry that did not exist yet -- 陈哥's 19490 preceded
-      19491 by five seconds. Posting *after* is necessary, not sufficient: the
-      adjacent window also holds later messages about other positions, which
-      the three tests below tell apart;
-    * its lifecycle event takes no risk off (``_RISK_REDUCING_EVENT_TYPES`` /
-      ``_RISK_REDUCING_ACTIONS``). ``message_classes`` carries no action of its
-      own, so it cannot make a message risk-reducing -- only targets come
-      from it;
-    * every target it names is an ``exact`` lifecycle that is not this
-      entry's. Admission runs before this entry has a lifecycle in the normal
-      order, so the entry's own set is whatever ``strategy_lifecycles`` row
-      already carries its candidate or its (chat, message) -- usually none,
-      in which case any exact target is another position's;
-    * every target it names is for a different symbol or side. A missing or
-      unreadable symbol or side matches, so ignorance keeps the block.
+    Shared by ``_exhausted_blocker_may_cancel_entry`` (to decide) and its
+    callers (to know, before deciding, which lifecycle ids they must load
+    ``lifecycle_status`` for -- one query for all of them, not one per id).
     """
 
-    if source_order_key(
-        blocker.posted_at, blocker.message_id, blocker.id
-    ) < source_order_key(strategy.posted_at, strategy.message_id, strategy.id):
-        return False
+    targets: list[tuple[int | None, object, object]] = []
     lifecycle = normalized.get("lifecycle_event")
     lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
-    event_type = str(lifecycle.get("event_type") or "").strip().lower()
-    action = str(lifecycle.get("management_action") or "").strip().lower()
-    if (
-        event_type not in _RISK_REDUCING_EVENT_TYPES
-        and action not in _RISK_REDUCING_ACTIONS
-    ):
-        return False
-
-    targets: list[tuple[int | None, object, object]] = []
     try:
         lifecycle_target = int(lifecycle.get("target_lifecycle_id"))
     except (TypeError, ValueError):
@@ -316,12 +294,112 @@ def _exhausted_blocker_may_cancel_entry(
             except (TypeError, ValueError):
                 exact_id = None
         targets.append((exact_id, target.get("symbol"), target.get("side")))
+    return targets
+
+
+def _target_lifecycle_ids(normalized: dict) -> frozenset[int]:
+    """Every exact lifecycle id ``_evidence_targets`` would extract from ``normalized``."""
+
+    return frozenset(
+        exact_id for exact_id, _symbol, _side in _evidence_targets(normalized) if exact_id is not None
+    )
+
+
+def _lifecycle_statuses(session, lifecycle_ids) -> dict[int, str]:
+    """Bulk-load ``lifecycle_status`` for a set of exact targets, one query.
+
+    ``_exhausted_blocker_may_cancel_entry`` needs to tell a target that is
+    still ``pending_entry``/``entered``/``holding`` from one that has already
+    gone terminal (or does not exist at all): only a *live* exact target
+    proves the cancellation is about a different position. Callers pass every
+    id a single blocker's evidence names -- across however many
+    ``message_classes`` elements, and across however many pending attempts
+    that blocker guards in ``exhausted_blocker_wake_is_safe`` -- so this runs
+    once, never once per id or once per attempt.
+    """
+
+    ids = frozenset(int(value) for value in lifecycle_ids)
+    if not ids:
+        return {}
+    rows = (
+        session.query(StrategyLifecycle.id, StrategyLifecycle.lifecycle_status)
+        .filter(StrategyLifecycle.id.in_(ids))
+        .all()
+    )
+    return {int(row_id): str(status or "") for row_id, status in rows}
+
+
+def _exhausted_blocker_may_cancel_entry(
+    normalized: dict,
+    *,
+    blocker: RawMessage,
+    strategy: RawMessage,
+    candidate: SignalCandidate,
+    own_lifecycle_ids: frozenset[int],
+    lifecycle_status_by_id: dict[int, str] | None = None,
+) -> bool:
+    """Whether an unreadable neighbour could be the cancellation of this entry.
+
+    4a/4b made an exhausted recognition failure terminal, which releases the
+    entry behind it after about ten minutes. Before that it waited six hours
+    and expired -- fail-closed. That is still the right answer for the one
+    shape where releasing is dangerous: the KOL posts an entry, then a
+    "取消 / 不进了 / 全部出局" for it, and the cancellation is the message we
+    could not read. The first-pass evidence survives the failure, so it says
+    enough to tell that shape apart; anything else is released.
+
+    Released (``False``) when any of these holds:
+
+    * the neighbour was posted before the strategy message. A cancellation
+      cannot cancel an entry that did not exist yet -- 陈哥's 19490 preceded
+      19491 by five seconds. Posting *after* is necessary, not sufficient: the
+      adjacent window also holds later messages about other positions, which
+      the tests below tell apart;
+    * its lifecycle event takes no risk off (``_RISK_REDUCING_EVENT_TYPES`` /
+      ``_RISK_REDUCING_ACTIONS``). ``message_classes`` carries no action of its
+      own, so it cannot make a message risk-reducing -- only targets come
+      from it;
+    * every target it names is either this entry's own lifecycle set, or an
+      ``exact`` lifecycle that is some *other*, still-``_LIVE_LIFECYCLE_STATUSES``
+      lifecycle. Admission runs before this entry has a lifecycle in the
+      normal order, so the entry's own set is whatever ``strategy_lifecycles``
+      row already carries its candidate or its (chat, message) -- usually
+      none, in which case only a *live* exact target is excluded as another
+      position's. An exact target to a lifecycle that is missing or already
+      terminal (``expired``/``exited``/``cancelled``/``invalidated``) proves
+      nothing -- 陈哥's 19490 pinned "取消" exactly onto lifecycle 1327, which
+      was already ``expired`` -- so it is treated as if there were no exact
+      target at all, and falls through to the symbol/side check below;
+    * every target it names is for a different symbol or side. A missing or
+      unreadable symbol or side matches, so ignorance keeps the block.
+    """
+
+    if source_order_key(
+        blocker.posted_at, blocker.message_id, blocker.id
+    ) < source_order_key(strategy.posted_at, strategy.message_id, strategy.id):
+        return False
+    lifecycle = normalized.get("lifecycle_event")
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+    event_type = str(lifecycle.get("event_type") or "").strip().lower()
+    action = str(lifecycle.get("management_action") or "").strip().lower()
+    if (
+        event_type not in _RISK_REDUCING_EVENT_TYPES
+        and action not in _RISK_REDUCING_ACTIONS
+    ):
+        return False
+
+    targets = _evidence_targets(normalized)
+    status_by_id = lifecycle_status_by_id or {}
 
     entry_symbol = _base_symbol(candidate.symbol)
     entry_side = _side(candidate.side)
     for exact_id, symbol, side in targets:
         if exact_id is not None and exact_id not in own_lifecycle_ids:
-            continue
+            if status_by_id.get(exact_id) in _LIVE_LIFECYCLE_STATUSES:
+                continue
+            # Missing or terminal: this exact id does not prove the target is
+            # someone else's still-open position, so do not let it exclude
+            # this target -- fall through and judge it on symbol/side alone.
         target_symbol = _base_symbol(symbol)
         target_side = _side(side)
         if target_symbol and entry_symbol and target_symbol != entry_symbol:
@@ -708,12 +786,16 @@ def _load_source_facts(
                         own_lifecycle_ids = _own_lifecycle_ids(
                             session, strategy=strategy, candidate=candidate
                         )
+                    lifecycle_status_by_id = _lifecycle_statuses(
+                        session, _target_lifecycle_ids(normalized)
+                    )
                     decision_terminal = not _exhausted_blocker_may_cancel_entry(
                         normalized,
                         blocker=raw,
                         strategy=strategy,
                         candidate=candidate,
                         own_lifecycle_ids=own_lifecycle_ids,
+                        lifecycle_status_by_id=lifecycle_status_by_id,
                     )
                 application_pending = fragment_application_pending or (
                     action_expected
@@ -819,6 +901,12 @@ def exhausted_blocker_wake_is_safe(
             return False
         if not isinstance(normalized, dict):
             return False
+        # ``normalized`` is the same one blocker for every attempt in
+        # ``blocked``, so its exact targets' ``lifecycle_status`` is loaded
+        # once here, not once per attempt.
+        lifecycle_status_by_id = _lifecycle_statuses(
+            session, _target_lifecycle_ids(normalized)
+        )
         for attempt in blocked:
             strategy = session.get(RawMessage, int(attempt.strategy_raw_message_id))
             candidate = session.get(SignalCandidate, int(attempt.signal_candidate_id))
@@ -832,6 +920,7 @@ def exhausted_blocker_wake_is_safe(
                 own_lifecycle_ids=_own_lifecycle_ids(
                     session, strategy=strategy, candidate=candidate
                 ),
+                lifecycle_status_by_id=lifecycle_status_by_id,
             ):
                 return False
         return True

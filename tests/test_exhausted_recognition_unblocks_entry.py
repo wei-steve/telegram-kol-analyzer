@@ -481,6 +481,8 @@ def _entry_then_later_cancel(
     reason: str = MIMO_AUTHORITATIVE_FAILED,
     job_status: str = "failed",
     own_lifecycle_id: int | None = None,
+    other_lifecycle_id: int | None = None,
+    other_lifecycle_status: str | None = None,
     attempt_count: int = 5,
 ):
     """19491's entry, then a later "BTC多单取消，不进了" whose recognition died."""
@@ -533,6 +535,27 @@ def _entry_then_later_cancel(
                     side="long",
                     lifecycle_status="pending_entry",
                     signal_at=STRATEGY_POSTED_AT.replace(tzinfo=None),
+                )
+            )
+        if other_lifecycle_id is not None:
+            # A lifecycle that is NOT this entry's own -- e.g. the old,
+            # pre-existing thread a later "取消" is pinned onto exactly, the
+            # way 陈哥's 19490 pinned onto lifecycle 1327. Its own
+            # ``signal_candidate_id``/``message_id`` deliberately do not
+            # match ``strategy``, so ``_own_lifecycle_ids`` never includes it.
+            from telegram_kol_research.models import StrategyLifecycle
+
+            session.add(
+                StrategyLifecycle(
+                    id=other_lifecycle_id,
+                    chat_id=CHAT_ID,
+                    message_id=10758,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status=other_lifecycle_status or "expired",
+                    signal_at=(STRATEGY_POSTED_AT - timedelta(days=1)).replace(
+                        tzinfo=None
+                    ),
                 )
             )
         session.add(
@@ -610,8 +633,17 @@ def test_a_later_unreadable_cancellation_of_this_entry_keeps_blocking(
     assert decision.blocking_raw_message_ids == (LATER_CANCEL_RAW_ID,)
 
 
-def test_a_later_cancellation_naming_another_lifecycle_is_released(tmp_path):
-    """(c) An exact first-pass target that is not this entry's lifecycle."""
+def test_a_later_cancellation_naming_an_expired_lifecycle_keeps_blocking(tmp_path):
+    """(e) An exact target to a same-symbol/side lifecycle that is EXPIRED.
+
+    This is exactly the shape the reader-side guard's first cut missed: first
+    pass readily pins a "取消，不进了" onto an old, already-``expired`` thread
+    of the same symbol/side (陈哥's 19490 -> lifecycle 1327). An exact target
+    that no longer exists as a live position proves nothing about which
+    position the cancellation means, so it must not excuse releasing -- it
+    falls through to the symbol/side check, which matches, so this still
+    blocks.
+    """
 
     session_factory, candidate_id = _entry_then_later_cancel(
         tmp_path,
@@ -629,9 +661,60 @@ def test_a_later_cancellation_naming_another_lifecycle_is_released(tmp_path):
                 }
             ],
         ),
+        other_lifecycle_id=1327,
+        other_lifecycle_status="expired",
+    )
+
+    decision = _assess(session_factory, candidate_id)
+
+    assert decision.status == "deferred"
+    assert decision.blocking_raw_message_ids == (LATER_CANCEL_RAW_ID,)
+
+
+def test_a_later_cancellation_naming_a_live_lifecycle_is_released(tmp_path):
+    """(f) The same exact target, but the targeted lifecycle is still LIVE
+    (``entered``): it really is some other, still-open position, so this
+    releases.
+    """
+
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(
+            target_lifecycle_id=1327,
+            message_classes=[
+                {
+                    "class": "策略管理",
+                    "target": {
+                        "resolution": "exact",
+                        "lifecycle_id": 1327,
+                        "symbol": "BTC",
+                        "side": "long",
+                    },
+                }
+            ],
+        ),
+        other_lifecycle_id=1327,
+        other_lifecycle_status="entered",
     )
 
     assert _assess(session_factory, candidate_id).status != "deferred"
+
+
+def test_a_later_cancellation_naming_a_missing_lifecycle_keeps_blocking(tmp_path):
+    """An exact target to an id that does not exist at all behaves like the
+    expired case: it cannot prove "someone else's position", so it falls
+    through to symbol/side, which matches here.
+    """
+
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(target_lifecycle_id=999999),
+    )
+
+    decision = _assess(session_factory, candidate_id)
+
+    assert decision.status == "deferred"
+    assert decision.blocking_raw_message_ids == (LATER_CANCEL_RAW_ID,)
 
 
 def test_a_later_cancellation_naming_this_entrys_own_lifecycle_keeps_blocking(
