@@ -24,6 +24,7 @@ and keeps failing loudly.
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
@@ -189,7 +190,13 @@ def _cancel_mimo(
     if target_lifecycle_id is not None:
         lifecycle_event["target_lifecycle_id"] = target_lifecycle_id
     payload = {
-        "recognition_result": "是策略",
+        # A pure cancel_entry with no strategy material is recognition_result
+        # "非策略" by this codebase's own convention -- see
+        # test_mimo_cancel_entry_for_entered_strategy_creates_full_exit_candidate
+        # in test_authoritative_recognition.py. "是策略" is reserved for a
+        # message that also carries new strategy material, which is exactly
+        # what the new "strategy material" guard below must not swallow.
+        "recognition_result": "非策略",
         "reason": "止盈止损有调整我删了重新发",
         "strategy": {},
         "lifecycle_event": lifecycle_event,
@@ -201,7 +208,7 @@ def _cancel_mimo(
         payload=payload,
         input_kind="text",
         model="mimo-v2.5",
-        status="是策略",
+        status="非策略",
     )
 
 
@@ -324,6 +331,68 @@ def test_terminal_noop_target_none_when_target_not_among_candidates():
     assert _context_resolution_failure_terminal_noop_target(mimo, ()) is None
 
 
+def test_terminal_noop_target_none_when_recognition_result_is_is_strategy():
+    """A message can say "cancel the old one" and open a new one in the same
+    breath -- the ``cancel_pending_entry`` + ``entry`` instruction pair this
+    file already handles for an entered strategy
+    (test_authoritative_recognition.py's ``test_mimo_cancel_entry_...``). Such
+    a first pass reports ``recognition_result == "是策略"`` precisely because
+    it carries real strategy material, and the no-op must not swallow it."""
+
+    mimo = replace(
+        _cancel_mimo(),
+        payload={**_cancel_mimo().payload, "recognition_result": "是策略"},
+    )
+    candidate = _dead_flat_candidate()
+
+    assert _context_resolution_failure_terminal_noop_target(mimo, (candidate,)) is None
+
+
+def test_terminal_noop_target_none_when_strategy_has_material_evidence():
+    """19490's shape plus a material new strategy (BTC long 83000-83300, SL
+    81400) in the same message -- the cancellation must not eat the re-entry."""
+
+    mimo = replace(
+        _cancel_mimo(),
+        payload={
+            **_cancel_mimo().payload,
+            "strategy": {
+                "symbol": "BTC",
+                "side": "long",
+                "entry": "83000-83300",
+                "stop_loss": "81400",
+            },
+        },
+    )
+    candidate = _dead_flat_candidate()
+
+    assert _context_resolution_failure_terminal_noop_target(mimo, (candidate,)) is None
+
+
+def test_terminal_noop_target_none_when_message_classes_include_new_strategy():
+    """A ``新策略`` element among ``message_classes`` is the same signal as
+    material ``strategy`` evidence, from the first-pass classification
+    contract rather than the legacy ``strategy`` dict."""
+
+    mimo = _cancel_mimo(
+        message_classes=[
+            {
+                "class": "策略管理",
+                "target": {
+                    "lifecycle_id": LIFECYCLE_1327,
+                    "resolution": "exact",
+                    "symbol": "BTC",
+                    "side": "long",
+                },
+            },
+            {"class": "新策略"},
+        ]
+    )
+    candidate = _dead_flat_candidate()
+
+    assert _context_resolution_failure_terminal_noop_target(mimo, (candidate,)) is None
+
+
 # ---------------------------------------------------------------------------
 # 3d, end to end: 19490 replayed through ``assess_message_authoritatively``,
 # ``process_authoritative_message``, and the message processing job.
@@ -384,7 +453,10 @@ def _cancel_first_pass(lifecycle_id: int) -> MimoAuthoritativeResult:
     return MimoAuthoritativeResult(
         raw_message_id=19490,
         payload={
-            "recognition_result": "是策略",
+            # See the comment on ``_cancel_mimo`` above: a pure cancellation
+            # with no strategy material is "非策略" by this codebase's own
+            # convention, not "是策略".
+            "recognition_result": "非策略",
             "reason": "撤销并调整止盈止损后重新发布",
             "strategy": {},
             "lifecycle_event": {
@@ -410,7 +482,7 @@ def _cancel_first_pass(lifecycle_id: int) -> MimoAuthoritativeResult:
         },
         input_kind="text",
         model="mimo-v2.5",
-        status="是策略",
+        status="非策略",
     )
 
 
@@ -471,6 +543,63 @@ def test_19490_replay_ends_terminal_noop_not_authoritative_failed(tmp_path, monk
     assert diagnostic["rejected_ids_matching_candidate_lifecycle"] == [lifecycle_id]
     assert decision_row.agreement_status != "authoritative_failed"
     assert decision_row.automation_reason == "target_terminal_noop"
+
+
+def test_19490_replay_with_material_strategy_keeps_the_old_failure_path(
+    tmp_path, monkeypatch
+):
+    """19490's shape, but the same message also gives a fresh BTC entry
+    (83000-83300, SL 81400) -- the no-op must not eat it, so the old, retried
+    ``mimo_authoritative_failed`` path stays unchanged."""
+
+    session_factory = create_session_factory(tmp_path / "raw-19490-with-repost.db")
+    current_id, lifecycle_id, thread_id = _install_repost_incident(session_factory)
+    first_pass = _cancel_first_pass(lifecycle_id)
+    first_pass = replace(
+        first_pass,
+        status="是策略",
+        payload={
+            **first_pass.payload,
+            "recognition_result": "是策略",
+            "strategy": {
+                "symbol": "BTC",
+                "side": "long",
+                "entry": "83000-83300",
+                "stop_loss": "81400",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: first_pass,
+    )
+
+    def model_caller(**kwargs):
+        return {
+            "decision": "cancel_thread",
+            "target_thread_ids": [lifecycle_id],
+            "management_action": "cancel_pending_entry",
+            "confidence": 0.95,
+            "supporting_message_ids": [10758, 10791],
+            "opposing_message_ids": [],
+            "conflict_types": [],
+            "risk_reducing_fanout_allowed": False,
+            "reanalysis_triggers": [],
+            "reason": f"策略{lifecycle_id}(thread_id {thread_id})",
+        }
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=current_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        context_resolver=lambda **kwargs: resolve_contextual_strategy(
+            **kwargs, model_caller=model_caller
+        ),
+    )
+
+    assert result.assessment.agreement_status == "authoritative_failed"
+    assert result.automation == {"status": "skipped", "reason": "mimo_authoritative_failed"}
 
 
 def test_19490_replay_job_succeeds_without_retry(tmp_path, monkeypatch):

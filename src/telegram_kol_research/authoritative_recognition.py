@@ -46,12 +46,14 @@ from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
 from telegram_kol_research.message_classification import (
+    CLASS_NEW_STRATEGY,
     message_class_identities,
 )
 from telegram_kol_research.message_evidence import (
     build_current_message_input_fingerprint,
     claim_message_evidence_extraction,
     finalize_claimed_mimo_message_evidence,
+    has_material_strategy_evidence,
     release_message_evidence_extraction_claim,
 )
 from telegram_kol_research.mimo_recognition_runs import (
@@ -643,6 +645,17 @@ def _context_resolution_failure_terminal_noop_target(
     that a real instruction on a live position (raw 17972 "止损改为2600", raw
     18501 "全部仓位止盈出局") is untouched and keeps failing loudly:
 
+    * the first pass carries no strategy material of its own -- a message can
+      say "cancel the old one" and give a fresh entry in the same breath (the
+      ``cancel_pending_entry`` + ``entry`` instruction pair this file already
+      handles for an entered strategy), and swallowing that would drop the new
+      strategy along with the dead one. Checked three ways: the first pass's
+      own ``recognition_result`` already said ``是策略``; its ``strategy``
+      dict has a real field value (``message_evidence.has_material_strategy_
+      evidence``); or one of its ``message_classes`` elements is
+      ``message_classification.CLASS_NEW_STRATEGY`` ("新策略",
+      ``message_classification.py:116``, the class the first-pass contract
+      uses for "this message also opens a new position");
     * the first pass's ``lifecycle_event`` is risk-reducing, by event type or
       management action (``entry_assembly_admission._RISK_REDUCING_EVENT_TYPES``
       / ``_RISK_REDUCING_ACTIONS`` -- reused, not duplicated, so this and the
@@ -677,6 +690,17 @@ def _context_resolution_failure_terminal_noop_target(
     )
 
     payload = mimo.payload if isinstance(mimo.payload, Mapping) else {}
+    if str(payload.get("recognition_result") or "") == "是策略":
+        return None
+    if has_material_strategy_evidence(payload.get("strategy")):
+        return None
+    message_classes = payload.get("message_classes")
+    if isinstance(message_classes, list) and any(
+        isinstance(element, Mapping)
+        and str(element.get("class") or "") == CLASS_NEW_STRATEGY
+        for element in message_classes
+    ):
+        return None
     lifecycle = payload.get("lifecycle_event")
     lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
     event_type = str(lifecycle.get("event_type") or "").strip().lower()
