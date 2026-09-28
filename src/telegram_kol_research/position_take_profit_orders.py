@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
@@ -25,6 +26,17 @@ from telegram_kol_research.partial_take_profit_explanation import (
 )
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 
+
+logger = logging.getLogger(__name__)
+
+#: Protection-leg rows that no longer speak for their exchange order.
+#: 2026-09-28 05:40Z: a composite management replacement re-recorded two live
+#: take-profit orders of 大镖客's BTC short (leg 658) under new leg indexes and
+#: marked the originals ``superseded`` -- same ``exchange_order_id``, two rows.
+#: The lookup below took ``.one_or_none()`` over both, raised
+#: ``MultipleResultsFound``, and every Deepcoin execution reconcile round
+#: failed from then on.
+_SUPERSEDED_PROTECTION_STATUSES = frozenset({"superseded"})
 
 _TERMINAL_BINDING_STATES = frozenset(
     {"closed", "cancelled", "completed", "failed", "resolved", "superseded"}
@@ -170,6 +182,45 @@ def record_take_profit_cancelled(
     return row
 
 
+def _take_profit_protection_leg_for_order(
+    session: Session, row: PositionTakeProfitOrder
+) -> PositionProtectionLeg | None:
+    """The protection leg that currently speaks for ``row``'s exchange order.
+
+    Superseded rows are history, not owners. If more than one row is still
+    left, the newest ``verified`` one owns the order when it is the only
+    ``verified`` row; otherwise the owner is ambiguous, which is logged and
+    answered with ``None`` -- the caller then skips only the first-take-profit
+    fill proof for this order, and the round goes on for every other order.
+    """
+
+    rows = (
+        session.query(PositionProtectionLeg)
+        .filter(
+            PositionProtectionLeg.venue == row.venue,
+            PositionProtectionLeg.execution_order_leg_id == row.execution_order_leg_id,
+            PositionProtectionLeg.role == "take_profit",
+            PositionProtectionLeg.exchange_order_id == row.order_id,
+            PositionProtectionLeg.status.notin_(_SUPERSEDED_PROTECTION_STATUSES),
+        )
+        .order_by(PositionProtectionLeg.created_at.desc(), PositionProtectionLeg.id.desc())
+        .all()
+    )
+    if len(rows) <= 1:
+        return rows[0] if rows else None
+    verified = [leg for leg in rows if leg.status == "verified"]
+    if len(verified) == 1:
+        return verified[0]
+    logger.warning(
+        "take-profit protection leg ambiguous, skipping fill proof "
+        "order_id=%s execution_order_leg_id=%s leg_ids=%s",
+        row.order_id,
+        row.execution_order_leg_id,
+        [int(leg.id) for leg in rows],
+    )
+    return None
+
+
 def reconcile_trigger_take_profit_order_history(
     session: Session,
     *,
@@ -223,16 +274,7 @@ def reconcile_trigger_take_profit_order_history(
     )
     for row in active_rows:
         local_order_id = str(row.order_id or "").strip()
-        protection_leg = (
-            session.query(PositionProtectionLeg)
-            .filter_by(
-                venue=row.venue,
-                execution_order_leg_id=row.execution_order_leg_id,
-                role="take_profit",
-                exchange_order_id=row.order_id,
-            )
-            .one_or_none()
-        )
+        protection_leg = _take_profit_protection_leg_for_order(session, row)
         if protection_leg is not None and int(protection_leg.leg_index) == 1:
             from telegram_kol_research.take_profit_fill_evidence import (
                 prove_first_take_profit_fill,
