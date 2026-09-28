@@ -44,3 +44,15 @@
   - incident 是否已带上详细摘要，日志里是否不再出现 `failed open`；
   - 没有新的入场被错误放行或错误挡住。
 - 本次部署**不涉及任何数据改动**。2026-09-28 那次人工 L3 修复的记录，见设计稿 §6。
+
+## 热修复：superseded 止盈保护腿导致对账整轮中断（2026-09-28）
+
+- 现象：从 05:40:18Z 起，每一轮都报 `backup-stop reconciliation before take-profit lane failed` 和 `Deepcoin execution reconcile failed`（`MultipleResultsFound`），所有 Deepcoin 持仓的执行对账都停了。它比 `099d6cdc` 部署早 11 分钟开始，与那次部署无关。
+- 起因：大镖客 BTC 空单（腿 658，binding 386）在 05:38:53 成交了 TP1。05:40:18 一次 `composite_management_replacement`（component:30）为同样两个交易所单号 `…752123` 和 `…752301`，新写了保护腿 1181、1182（verified，leg_index 4/5），原来的 1169、1170 标成 `superseded`。
+- 修复：`position_take_profit_orders._take_profit_protection_leg_for_order` 查询时排除 `superseded`。如果剩下的仍不止一行，取唯一那条 `verified`；否则打 WARNING，只跳过这一单的 TP1 成交证明，整轮对账照常继续。
+- 同类隐患排查：扫描了所有对 `PositionProtectionLeg`、`PositionTakeProfitOrder`、`PositionBackupStopOrder` 调用 `.one_or_none()` / `.one()` 的查询，结论是**只有这一处会被本次场景触发**。其余查询都落在唯一约束上，同一个键不可能查出两行：
+  - `position_protection_legs.py:92`、`entry_protection_ledger_repair.py:900`、`strategy_management_executor.py:444`、`trigger_backup_stop_executor.py:320`：按 `(venue, execution_order_leg_id, role, leg_index)` 查，这组字段就是 `uq_position_protection_legs_logical_identity`。替换时换的是新的 `leg_index`，不会撞上。
+  - `position_take_profit_orders.py:99`：按 `(venue, order_id)` 查，对应 `uq_position_take_profit_orders_venue_order`。
+  - `legacy_conditional_cancel.py:1010`、`protection_replacement_persistence.py:175`：按 `(venue, order_id)` 查，对应 `uq_position_backup_stop_orders_venue_order`。
+  - `protection_replacement_persistence.py:298`：带状态过滤，并且有部分唯一索引 `uq_position_backup_stop_orders_active_position`。
+- 停摆期间的交易所事件：05:40:44Z 之后，大镖客（pos `1001125406750883`）和陈哥（pos `1001125406857038`）在 WS 上都没有新的成交或离场推送。部署后还要用交易所实时读数再核对一次。
