@@ -524,6 +524,11 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
    - 那 11 次有结果变化的调用，删除后要靠新判据接住（`unknown`，或「`exact` 目标不在候选集合内」）。
    - 它们里面哪些是纠正、哪些是 2026-09-24 米娅 msg 696 式的误覆盖，**尚未人工标注**。
    - 验收要求：重做快照取出这 11 条的 raw_message_id，逐条人工标注，再用新判据回放。时延报告当时的分析快照已按规定删除，所以样本 id 需要重新取。
+3. **`apparent_entry_may_be_revision` 换掉触发判据时，必须保留 2a 的收窄条件（只算 `pending_entry` 的重叠），并回放 raw 19481。**
+   - 出处：`docs/plans/2026-09-28-chen-btc-expired-repost-and-queue-block-design.md` §2.3、§5；实现提交见本仓库 `git log` 中对应的 `fix:` 提交（`src/telegram_kol_research/authoritative_recognition.py` 的 2a/2b 改动）。
+   - 背景：陈哥群 `-1002337721508` 09-25 14:07:58 的 raw 19073（lifecycle 1327、strategy_thread 696）从未成交，于 09-26 01:32 过期。09-28 02:58:35 raw 19481 逐字重发同一条策略；候选生成器只因入场区间重叠就给 696 打了 `overlapping_entry`，命中 `apparent_entry_may_be_revision`，上下文判 `manage_thread → 696` / `management_action=null`，首轮「是策略」被抹成「非策略」，静默漏单。
+   - 2a 把 `overlapping_entry` 收窄成只统计 `pending_entry`（还能被改单）的候选；`expired` 已经终态，不存在「新策略其实是在改它」这种可能。阶段 3 重写触发判据时，这个收窄条件必须原样保留，不能被 §5 的判据整理覆盖掉。
+   - 验收要求：用阶段 3 的新判据集合重放 raw 19481，必须得到「是策略 → `new_thread`」（不再经过 `manage_thread` 降级），且不再触发 `apparent_entry_may_be_revision`。
 
 
 ## 阶段 4 · 收口（planned）

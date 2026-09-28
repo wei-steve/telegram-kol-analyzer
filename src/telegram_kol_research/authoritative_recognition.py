@@ -244,6 +244,15 @@ def requires_context_resolution(
         or any(
             "overlapping_entry"
             in tuple(_context_value(candidate, "reasons", ()) or ())
+            # 2026-09-28 chen-btc-repost design §2.3 (2a). Only a
+            # ``pending_entry`` candidate can plausibly be what this new
+            # message is revising -- it is still live and un-entered. An
+            # ``expired`` candidate is already terminal: raw 19481
+            # (2026-09-28 02:58) reposted lifecycle 1327/thread 696's
+            # strategy word-for-word 60.8 hours after 696 had expired, and
+            # counting that overlap fired this trigger for a message that
+            # was actually a fresh re-entry, not a revision of anything.
+            and str(_context_value(candidate, "status", "")) == "pending_entry"
             for candidate in candidates
         )
     ):
@@ -579,6 +588,29 @@ def _load_current_mimo_evidence_result(
     )
 
 
+def _candidate_has_unsettled_exchange_leg(candidate: StrategyThreadCandidate) -> bool:
+    """Whether ``candidate`` still has anything of ours live on the exchange.
+
+    Mirrors ``strategy_thread_candidates._has_unsettled_exchange_leg`` (2026-
+    09-28 chen-btc-repost design §2.3, 2b) without a fresh session query: a
+    ``StrategyThreadCandidate`` already carries every input that function
+    reads off the lifecycle and its binding at generation time, so the same
+    four questions can be asked straight from the candidate.
+    """
+
+    if candidate.lifecycle_summary.get("execution_binding_id") is not None:
+        return True
+    if candidate.binding_summary is not None:
+        return True
+    if str(candidate.risk_state) != "no_current_risk":
+        return True
+    return bool(
+        candidate.live_verified_pos_ids
+        or candidate.pending_entry_leg_ids
+        or candidate.uncertain_entry_leg_ids
+    )
+
+
 def _resolved_mimo_result(
     mimo: MimoAuthoritativeResult,
     decision: ContextResolutionDecision,
@@ -650,6 +682,31 @@ def _resolved_mimo_result(
     ]
     if len(selected_candidates) != len(decision.target_thread_ids):
         raise ContextResolutionError("resolved_lifecycle_missing")
+    if (
+        str(mimo.payload.get("recognition_result") or "") == "是策略"
+        and decision.decision in {"manage_thread", "revise_thread"}
+        and decision.management_action is None
+        and selected_candidates
+        and all(candidate.status == "expired" for candidate in selected_candidates)
+        and not any(
+            _candidate_has_unsettled_exchange_leg(candidate)
+            for candidate in selected_candidates
+        )
+    ):
+        # 2026-09-28 chen-btc-repost design (docs/plans/2026-09-28-chen-btc-
+        # expired-repost-and-queue-block-design.md §2.3, 2b). Raw 19481
+        # (2026-09-28 02:58) reposted lifecycle 1327/thread 696's strategy
+        # word-for-word after it had already expired at 09-26 01:32 with no
+        # exchange leg ever placed. The context model still resolved it to
+        # manage_thread/null against 696 (`apparent_entry_may_be_revision`),
+        # and the unconditional downgrade below turned an actual re-entry
+        # signal into a silent no-op with no alert. A target whose lifecycle
+        # is terminal and holds nothing cannot be "managed" -- there is
+        # nothing left to revise or update -- so keep the first pass exactly
+        # as ``new_thread`` does above, and record the override for audit
+        # rather than silently downgrading it.
+        context_payload["override_rejected"] = "terminal_target"
+        return replace(mimo, payload=payload)
     lifecycle_ids = [candidate.lifecycle_id for candidate in selected_candidates]
     payload["instructions"] = _resolved_instruction_payloads(
         payload.get("instructions"),
