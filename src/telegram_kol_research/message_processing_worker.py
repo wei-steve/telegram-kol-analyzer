@@ -17,7 +17,11 @@ from telegram_kol_research.authoritative_recognition import (
     AutomaticRetryBlocked,
 )
 from telegram_kol_research.models import RawMessage, utc_now
-from telegram_kol_research.models import MessageProcessingJob
+from telegram_kol_research.models import MessageProcessingJob, RecognitionDecision
+from telegram_kol_research.recognition_failure_attribution import (
+    MIMO_AUTHORITATIVE_FAILED,
+    MIMO_AUTHORITATIVE_FAILED_EXHAUSTED,
+)
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 from telegram_kol_research.system_operator_bot import system_operator_bot_enabled
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -501,6 +505,43 @@ def _settle_message_processing_job(
         return updated == 1
 
 
+def _mark_authoritative_failure_exhausted_in_session(
+    session,
+    *,
+    raw_message_id: int,
+    now: datetime,
+) -> bool:
+    """Say on the decision row that its failed recognition will not be retried.
+
+    2026-09-28: 陈哥's raw 19490 failed its fifth attempt and its job went
+    ``failed``, but the decision still read ``mimo_authoritative_failed`` --
+    the value the entry admission barrier reads as "a decision may still
+    arrive". The corrected BTC entry 19491 waited behind it until a manual
+    rewrite to this exact value released it; left alone it would have waited
+    the six-hour deadline and expired. Only that one reason is rewritten: any
+    other decision already says what it means.
+    """
+
+    updated = (
+        session.query(RecognitionDecision)
+        .filter(
+            RecognitionDecision.raw_message_id == int(raw_message_id),
+            RecognitionDecision.automation_status == "skipped",
+            RecognitionDecision.automation_reason == MIMO_AUTHORITATIVE_FAILED,
+        )
+        .update(
+            {
+                RecognitionDecision.automation_reason: (
+                    MIMO_AUTHORITATIVE_FAILED_EXHAUSTED
+                ),
+                RecognitionDecision.updated_at: _naive_utc(now),
+            },
+            synchronize_session=False,
+        )
+    )
+    return updated == 1
+
+
 def _defer_or_fail_message_processing_job(
     session_factory,
     *,
@@ -510,7 +551,14 @@ def _defer_or_fail_message_processing_job(
     max_attempts: int,
     retry_base_seconds: float,
     retry_max_seconds: float,
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
+    """Defer the job for another attempt, or fail it for good.
+
+    The third value says whether failing it also rewrote the message's
+    decision to ``mimo_authoritative_failed_exhausted``; it is written in the
+    same transaction as the terminal job status, so the two never disagree.
+    """
+
     attempt_count = int(claim.attempt_count) + 1
     terminal = attempt_count >= max(1, int(max_attempts))
     reason = f"processing_error:{type(error).__name__}"
@@ -545,8 +593,19 @@ def _defer_or_fail_message_processing_job(
                 synchronize_session=False,
             )
         )
+        decision_exhausted = False
+        if terminal and updated == 1:
+            decision_exhausted = _mark_authoritative_failure_exhausted_in_session(
+                session,
+                raw_message_id=claim.raw_message_id,
+                now=failed_at,
+            )
         session.commit()
-    return (status if updated == 1 else "stale_claim"), reason
+    return (
+        (status if updated == 1 else "stale_claim"),
+        reason,
+        decision_exhausted,
+    )
 
 
 def _alert_expired_without_decision(
@@ -600,6 +659,7 @@ async def run_message_processing_worker_tick(
     terminal_failure_notifier: Callable[..., Any] | None = None,
     activity: MessageProcessingActivity | None = None,
     group_trading_mode_provider: Callable[[int], str] | None = None,
+    entry_assembly_wakeup: Callable[[int], Any] | None = None,
     _preclaimed_jobs: list[MessageProcessingClaim] | None = None,
 ) -> MessageProcessingWorkerResult:
     """Claim one ordered job per chat and process chat lanes concurrently.
@@ -608,6 +668,12 @@ async def run_message_processing_worker_tick(
     group raise an alert (step-18). Missing it is silent -- no alert, no error
     -- so the production wiring is pinned by a chain test, not only by the
     behaviour tests that each pass it themselves.
+
+    ``entry_assembly_wakeup`` is called with the raw message id once a job's
+    final failure has marked its decision exhausted: the message will never
+    finish, so it releases any entry deferred behind it the way a completed
+    authoritative run would. Missing it only costs time -- the admission
+    reconciler reads the exhausted decision as terminal on its own recheck.
     """
 
     tick_time = now or utc_now()
@@ -704,7 +770,7 @@ async def run_message_processing_worker_tick(
                 counts["succeeded"] += 1
             return
         except BaseException as exc:
-            status, reason = await asyncio.to_thread(
+            status, reason, decision_exhausted = await asyncio.to_thread(
                 _defer_or_fail_message_processing_job,
                 session_factory,
                 claim=claim,
@@ -727,6 +793,22 @@ async def run_message_processing_worker_tick(
                         logger.exception(
                             "message processing terminal failure notification failed "
                             "raw_message_id=%s",
+                            claim.raw_message_id,
+                        )
+                if decision_exhausted and entry_assembly_wakeup is not None:
+                    # After the commit above, in its own thread and sessions,
+                    # exactly where a completed authoritative run wakes its
+                    # blocked entries. A failure here is logged and never
+                    # fails the lane: the reconciler's recheck is the backstop.
+                    try:
+                        await asyncio.to_thread(
+                            entry_assembly_wakeup,
+                            int(claim.raw_message_id),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "entry assembly wakeup after exhausted recognition "
+                            "failed raw_message_id=%s",
                             claim.raw_message_id,
                         )
             if isinstance(exc, AutomaticRetryBlocked):

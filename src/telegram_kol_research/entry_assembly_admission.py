@@ -33,6 +33,7 @@ from telegram_kol_research.models import (
     MessageEvidenceExtractionClaim,
     MessageEvidenceVersion,
     MessageInstructionItem,
+    MessageProcessingJob,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
@@ -40,6 +41,9 @@ from telegram_kol_research.models import (
 from telegram_kol_research.message_evidence import (
     has_material_strategy_evidence,
     normalize_entry_strategy_fragments,
+)
+from telegram_kol_research.recognition_failure_attribution import (
+    MIMO_AUTHORITATIVE_FAILED,
 )
 
 
@@ -65,7 +69,17 @@ _TERMINAL_NO_ACTION_STATUSES = frozenset({"completed", "blocked"})
 #: failure is retried by the message processing job, so a candidate may still
 #: arrive. See ``authoritative_recognition.py`` (the automation branch around
 #: lines 2570-2590) for the full vocabulary.
-_NON_TERMINAL_SKIP_REASONS = frozenset({"mimo_authoritative_failed"})
+#:
+#: ``mimo_authoritative_failed_exhausted`` is deliberately absent, which makes
+#: it terminal: the worker writes it when that retry has been spent, and no
+#: candidate can follow. So is ``mimo_authoritative_failed`` itself once the
+#: message's processing job is ``failed`` (``_JOB_EXHAUSTED_STATUSES``) -- the
+#: rows written before the worker learned to rewrite the reason, and any path
+#: that fails a job without doing so. 2026-09-28: 陈哥's raw 19490 held the
+#: corrected BTC entry 19491 for 25 minutes on exactly such a row.
+_NON_TERMINAL_SKIP_REASONS = frozenset({MIMO_AUTHORITATIVE_FAILED})
+#: ``message_processing_jobs.status`` values after which no retry is coming.
+_JOB_EXHAUSTED_STATUSES = frozenset({"failed"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +133,11 @@ def _fragment_signature(
     )
 
 
-def _decision_is_terminal_no_action(decision: RecognitionDecision | None) -> bool:
+def _decision_is_terminal_no_action(
+    decision: RecognitionDecision | None,
+    *,
+    job_status: str | None = None,
+) -> bool:
     """Whether an adjacent message's authoritative decision can still act.
 
     Evidence only says "this message looks like it wants something"; the
@@ -129,6 +147,9 @@ def _decision_is_terminal_no_action(decision: RecognitionDecision | None) -> boo
     six-hour deadline elapses. See section 3 of
     ``docs/plans/2026-09-16-adjacent-entry-deadlock-and-market-entry-geometry-analysis.md``
     for the six production entries killed this way between 2026-09-04 and 09-16.
+
+    ``job_status`` is the message's processing job status: a retryable
+    failure stops being retryable once its job has failed for good.
     """
 
     if decision is None:
@@ -137,7 +158,11 @@ def _decision_is_terminal_no_action(decision: RecognitionDecision | None) -> boo
     reason = str(decision.automation_reason or "").strip().lower()
     if status in _TERMINAL_NO_ACTION_STATUSES:
         return True
-    return status == "skipped" and reason not in _NON_TERMINAL_SKIP_REASONS
+    if status != "skipped":
+        return False
+    if reason not in _NON_TERMINAL_SKIP_REASONS:
+        return True
+    return str(job_status or "").strip().lower() in _JOB_EXHAUSTED_STATUSES
 
 
 def _is_adjacent_entry_context_defer(result_json: str | None) -> bool:
@@ -285,6 +310,14 @@ def _load_source_facts(
         int(row.raw_message_id): row
         for row in session.query(RecognitionDecision)
         .filter(RecognitionDecision.raw_message_id.in_(raw_ids))
+        .all()
+    }
+    job_status_by_raw = {
+        int(raw_id): str(job_status)
+        for raw_id, job_status in session.query(
+            MessageProcessingJob.raw_message_id, MessageProcessingJob.status
+        )
+        .filter(MessageProcessingJob.raw_message_id.in_(raw_ids))
         .all()
     }
     evidence_rows = (
@@ -494,7 +527,8 @@ def _load_source_facts(
                     action_expected
                     and raw_id not in candidate_raw_ids
                     and not _decision_is_terminal_no_action(
-                        decisions_by_raw.get(raw_id)
+                        decisions_by_raw.get(raw_id),
+                        job_status=job_status_by_raw.get(raw_id),
                     )
                 )
             facts.append(

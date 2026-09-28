@@ -5436,6 +5436,34 @@ def _run_entry_assembly_ready_wakeup_cycle(app: FastAPI) -> int:
     return 0
 
 
+def _run_exhausted_recognition_entry_wakeup(
+    app: FastAPI, raw_message_id: int
+) -> None:
+    """Release entries deferred behind a message whose retries are spent.
+
+    Called by the message processing worker, on a worker thread, after the
+    transaction that failed the job and marked its decision exhausted has
+    committed. The message will never complete, so this is the wakeup its
+    completed authoritative run would have made -- same function, same owner,
+    registry and executor ``_run_authoritative_processor`` passes, and the
+    same ``auto_trade_executor is not None`` guard that run applies.
+    """
+
+    if (
+        app.state.runtime_role not in {"worker", "all"}
+        or app.state.recognition_execution_owner is None
+        or app.state.auto_trade_executor is None
+    ):
+        return
+    _run_entry_assembly_wakeups(
+        app.state.session_factory,
+        completed_raw_message_id=int(raw_message_id),
+        auto_trade_executor=app.state.auto_trade_executor,
+        execution_owner=app.state.recognition_execution_owner,
+        execution_registry=app.state.recognition_execution_registry,
+    )
+
+
 async def _run_recognition_execution_scanner_cycle_async(
     app: FastAPI,
     *,
@@ -7236,6 +7264,11 @@ def create_web_app(
                 # alert is silently skipped.
                 group_trading_mode_provider=lambda chat: _group_trading_mode(
                     app.state.group_config, chat
+                ),
+                # 2026-09-28: a message whose last retry failed must release
+                # the entry waiting behind it, as its completion would have.
+                entry_assembly_wakeup=lambda raw_message_id: (
+                    _run_exhausted_recognition_entry_wakeup(app, raw_message_id)
                 ),
             )
 

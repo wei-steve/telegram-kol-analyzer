@@ -101,6 +101,10 @@ LOSSY_RECOGNITION_REASONS = frozenset(
     {
         "target_not_verifiable",
         "mimo_authoritative_failed",
+        # 2026-09-28: the same failure once its retries are spent. Missing
+        # here, the worker's rewrite would read to D3 as "re-recognised" and
+        # clear the case of a message that was never read.
+        "mimo_authoritative_failed_exhausted",
         "authoritative_gap_recovery_expired",
         "lifecycle_apply_failed",
         "management_recognition_unresolved",

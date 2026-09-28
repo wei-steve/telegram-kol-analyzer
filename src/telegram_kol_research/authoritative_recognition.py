@@ -2000,6 +2000,10 @@ def _failure_point_for(reason: str) -> str:
             "the authoritative model produced no decision, so nothing in this "
             "message was read or executed"
         ),
+        recognition_attribution.MIMO_AUTHORITATIVE_FAILED_EXHAUSTED: (
+            "the authoritative model produced no decision and every retry was "
+            "spent, so nothing in this message was read or executed"
+        ),
         recognition_attribution.GAP_RECOVERY_EXPIRED: (
             "no authoritative decision before the recovery window closed; the "
             "message is permanently unrecognised and was not executed"

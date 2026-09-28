@@ -157,6 +157,7 @@ REASON_LABELS = {
     # --- rule D3: the message was never read at all ---
     "authoritative_failed": "识别失败，权威模型没有产出可用结果",
     "mimo_authoritative_failed": "权威模型调用失败，这条消息没有被识别",
+    "mimo_authoritative_failed_exhausted": "权威模型调用失败且重试已耗尽，这条消息没有被识别",
     "authoritative_gap_recovery_expired": "补识别窗口已过，这条消息始终没有被识别",
     "context_resolution_failed": "上下文解析失败",
     "management_recognition_unresolved": "上下文解析失败，认不出这条消息管的是哪个仓位",

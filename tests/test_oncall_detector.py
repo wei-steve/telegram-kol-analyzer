@@ -1038,6 +1038,7 @@ def test_the_lossy_reason_codes_are_the_pipelines_own_spelling():
 
     assert attribution.TARGET_NOT_VERIFIABLE in LOSSY_RECOGNITION_REASONS
     assert attribution.MIMO_AUTHORITATIVE_FAILED in LOSSY_RECOGNITION_REASONS
+    assert attribution.MIMO_AUTHORITATIVE_FAILED_EXHAUSTED in LOSSY_RECOGNITION_REASONS
     assert attribution.GAP_RECOVERY_EXPIRED in LOSSY_RECOGNITION_REASONS
     assert attribution.APPLY_FAILED in LOSSY_RECOGNITION_REASONS
     # And the benign outcomes stay out: alerting on them is what buried the

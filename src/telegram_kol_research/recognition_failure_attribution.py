@@ -80,6 +80,15 @@ MEDIA_UNREADABLE = "media_unreadable"
 #: nothing was refused because the message asked for nothing; nothing was read.
 MIMO_AUTHORITATIVE_FAILED = "mimo_authoritative_failed"
 GAP_RECOVERY_EXPIRED = "authoritative_gap_recovery_expired"
+#: The same outcome once the message processing job has spent its last retry.
+#: ``MIMO_AUTHORITATIVE_FAILED`` alone says "a decision may still arrive", and
+#: the entry admission barrier waits on it; on 2026-09-28 陈哥's raw 19490 held
+#: the corrected BTC entry 19491 for 25 minutes after its job had gone
+#: ``failed`` and would have held it the full six hours. The worker rewrites
+#: the reason to this value in the transaction that fails the job, so the row
+#: itself says no decision is coming. Still "no decision was produced" for
+#: every reporting consumer below.
+MIMO_AUTHORITATIVE_FAILED_EXHAUSTED = "mimo_authoritative_failed_exhausted"
 
 #: Every reason meaning "no authoritative decision was produced".
 #:
@@ -91,7 +100,7 @@ GAP_RECOVERY_EXPIRED = "authoritative_gap_recovery_expired"
 #: registered in ``AUTHORITY_NOT_PRODUCED_WRITERS`` with the reason it records,
 #: and requires every such reason to be alerted.
 AUTHORITY_NOT_PRODUCED_REASONS = frozenset(
-    {MIMO_AUTHORITATIVE_FAILED, GAP_RECOVERY_EXPIRED}
+    {MIMO_AUTHORITATIVE_FAILED, MIMO_AUTHORITATIVE_FAILED_EXHAUSTED, GAP_RECOVERY_EXPIRED}
 )
 
 #: ``module.function`` of each writer of a terminal ``authoritative_failed``
@@ -102,6 +111,16 @@ AUTHORITY_NOT_PRODUCED_WRITERS: dict[str, str] = {
     ),
     "telegram_live_listener._record_expired_authoritative_recovery_gap_in_session": (
         GAP_RECOVERY_EXPIRED
+    ),
+}
+
+#: ``module.function`` of each place that rewrites an already-written
+#: "no decision" reason into another one, and the reason it writes. Kept apart
+#: from the writers above because it creates no decision, but held to the same
+#: bar: every reason here is in ``AUTHORITY_NOT_PRODUCED_REASONS`` and alerted.
+AUTHORITY_NOT_PRODUCED_REWRITERS: dict[str, str] = {
+    "message_processing_worker._mark_authoritative_failure_exhausted_in_session": (
+        MIMO_AUTHORITATIVE_FAILED_EXHAUSTED
     ),
 }
 

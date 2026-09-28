@@ -784,6 +784,8 @@ def _persist_neighbor_evidence_and_decision(
         ("skipped", "no_actionable_intent", False),
         ("blocked", "source_message_deleted", False),
         ("skipped", "mimo_authoritative_failed", True),
+        # 2026-09-28: written once the processing job has spent its retries.
+        ("skipped", "mimo_authoritative_failed_exhausted", False),
         ("deferred", "source_message_deletion_hold", True),
     ],
 )

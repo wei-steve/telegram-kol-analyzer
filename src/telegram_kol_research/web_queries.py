@@ -1654,6 +1654,9 @@ def _serialize_system_acceptance(
     admission_failure_reasons = {
         "target_unresolved",
         "mimo_authoritative_failed",
+        # Also in ALERTED_REASONS; named here so the "未安全接纳" verdict does
+        # not hinge on that set's membership.
+        recognition_attribution.MIMO_AUTHORITATIVE_FAILED_EXHAUSTED,
         # Rows written before A-8 split this one into the five below.
         "mimo_authoritative_not_safely_applied",
         # A-8: only the outcomes that are actually a refusal. A message that

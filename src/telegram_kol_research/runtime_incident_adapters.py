@@ -211,6 +211,7 @@ def _capture(
     message_operation_contract_id: int | None = None,
     recorder: Callable[..., Any] | None = None,
     strict_final: bool = True,
+    fallback_follows: bool = False,
 ):
     if not config.captures(incident_type):
         return None
@@ -258,6 +259,18 @@ def _capture(
         # test rather than by someone reading a journal weeks later.
         if strict_final and _strict_capture_enabled():
             raise
+        if fallback_follows:
+            # A refused detailed summary is not a lost incident: the caller
+            # retries with the minimal one. Saying "failed open" here made the
+            # 2026-09-28 logs read as if nothing had been recorded.
+            logger.warning(
+                "Runtime incident detailed summary refused: type=%s source=%s "
+                "error=%s",
+                incident_type,
+                source_kind,
+                type(exc).__name__,
+            )
+            return None
         logger.warning(
             "Runtime incident capture failed open: type=%s source=%s error=%s",
             incident_type,
@@ -459,6 +472,7 @@ def _capture_with_minimal_fallback(
     those checks, and an operator still learns the incident happened.
     """
 
+    fallback_follows = minimal_summary != detailed_summary
     recorded = _capture(
         session_factory,
         config=config,
@@ -470,17 +484,16 @@ def _capture_with_minimal_fallback(
         occurred_at=occurred_at,
         recorder=recorder,
         # Refusing the detailed summary is the case this function exists for,
-        # so it is never the final word; only the minimal retry below is.
+        # so it is never the final word; only the minimal retry below is. It
+        # logs "detailed summary refused"; "failed open" is left to the retry,
+        # which is the only attempt whose failure loses the incident. With no
+        # distinct minimal summary this attempt is the last one, and it logs
+        # "failed open" -- still without raising, as it always has.
         strict_final=False,
+        fallback_follows=fallback_follows,
     )
-    if recorded is not None or minimal_summary == detailed_summary:
+    if recorded is not None or not fallback_follows:
         return recorded
-    logger.warning(
-        "Runtime incident detailed summary refused; retrying minimal: "
-        "type=%s source=%s",
-        incident_type,
-        source_kind,
-    )
     return _capture(
         session_factory,
         config=config,
@@ -1289,9 +1302,12 @@ def capture_management_recovery_timeout(
             strategy_instance_id=_safe_label(strategy_instance_id),
             lifecycle_id=int(target_lifecycle_id),
             effective_action=_safe_label(effective_action),
-            impact=_safe_label(
-                f"blocked_after_{int(timeout_minutes)}_minutes_freeze_released"
-            ),
+            # Minutes in their own integer field, for the reason given in
+            # ``capture_source_deletion_exit_stuck``: welded into this label
+            # they made a 41-character mixed-class token the opaque-secret
+            # scan refused, so the detailed summary was never recorded.
+            impact="blocked_after_timeout_freeze_released",
+            timeout_minutes=int(timeout_minutes),
         ),
         minimal_summary=_summary(**fixed),
         occurred_at=occurred_at,

@@ -153,6 +153,7 @@ def test_a_recovered_recognition_case_says_the_message_was_recognised_later(stor
     "code,fragment",
     [
         ("mimo_authoritative_failed", "权威模型调用失败"),
+        ("mimo_authoritative_failed_exhausted", "重试已耗尽"),
         ("authoritative_gap_recovery_expired", "补识别窗口"),
         ("authoritative_failed", "识别失败"),
         ("context_resolution_failed", "上下文解析失败"),

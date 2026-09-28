@@ -192,6 +192,30 @@ _SUMMARY_FIELDS = frozenset(
         # ``deadline_at``, which is that a number belongs in its own field.
         "release_reason",
         "timeout_minutes",
+        # 2026-09-28, the same refusal a fourth time: the detailed summaries of
+        # these adapters named fields nobody had admitted, so every one was
+        # recorded with only its minimal fallback -- 15 recognition-failure
+        # rows lost ``failure_point`` and the exchange adoption lost which
+        # orders it adopted. Each value is an integer, a fixed yes/no label,
+        # or a string through ``_safe_label`` / ``_safe_sentence``, and the
+        # scan below still runs over the assembled JSON. A test now records
+        # every adapter's detailed summary, so the next unadmitted field
+        # fails there instead of going quiet in production.
+        "failure_point",
+        "instrument_id",
+        "adopted_order_ids",
+        "adopted_count",
+        "old_order_id",
+        "new_order_id",
+        "order_id",
+        "path",
+        "first_ever",
+        "shadow_only",
+        "strategy_instance_id",
+        "lifecycle_id",
+        "effective_action",
+        "candidate_count",
+        "candidates",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(

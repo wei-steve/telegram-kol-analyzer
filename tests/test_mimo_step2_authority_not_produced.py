@@ -41,12 +41,15 @@ from telegram_kol_research.message_processing_worker import (
 )
 from telegram_kol_research.models import RawMessage, RuntimeIncident
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
+from telegram_kol_research import recognition_failure_attribution
 from telegram_kol_research.recognition_failure_attribution import (
     ALERTED_REASONS,
     AUTHORITY_NOT_PRODUCED_REASONS,
+    AUTHORITY_NOT_PRODUCED_REWRITERS,
     AUTHORITY_NOT_PRODUCED_WRITERS,
     GAP_RECOVERY_EXPIRED,
     MIMO_AUTHORITATIVE_FAILED,
+    MIMO_AUTHORITATIVE_FAILED_EXHAUSTED,
 )
 from telegram_kol_research.telegram_live_listener import _enqueue_processing_jobs
 
@@ -68,6 +71,14 @@ def test_the_two_step18_reasons_are_alerted():
     assert GAP_RECOVERY_EXPIRED == "authoritative_gap_recovery_expired"
     assert MIMO_AUTHORITATIVE_FAILED in ALERTED_REASONS
     assert GAP_RECOVERY_EXPIRED in ALERTED_REASONS
+
+
+def test_the_exhausted_rewrite_is_still_no_decision_produced():
+    """2026-09-28: the worker's rewrite must not take a message off the books."""
+
+    assert MIMO_AUTHORITATIVE_FAILED_EXHAUSTED == "mimo_authoritative_failed_exhausted"
+    assert MIMO_AUTHORITATIVE_FAILED_EXHAUSTED in AUTHORITY_NOT_PRODUCED_REASONS
+    assert MIMO_AUTHORITATIVE_FAILED_EXHAUSTED in ALERTED_REASONS
 
 
 # --------------------------------------------------------------------------
@@ -158,15 +169,25 @@ def test_every_writer_of_a_missing_decision_is_registered_and_alerted():
     # still caught.
     assert set(literal_sites) <= set(AUTHORITY_NOT_PRODUCED_WRITERS)
 
-    assert set(AUTHORITY_NOT_PRODUCED_WRITERS.values()) == AUTHORITY_NOT_PRODUCED_REASONS
+    assert (
+        set(AUTHORITY_NOT_PRODUCED_WRITERS.values())
+        | set(AUTHORITY_NOT_PRODUCED_REWRITERS.values())
+    ) == AUTHORITY_NOT_PRODUCED_REASONS
     assert AUTHORITY_NOT_PRODUCED_REASONS <= ALERTED_REASONS
 
-    # The registry names a reason; the writer's module must actually record it.
-    for writer, reason in AUTHORITY_NOT_PRODUCED_WRITERS.items():
-        module = writer.split(".", 1)[0]
-        assert f'"{reason}"' in (SRC / f"{module}.py").read_text(encoding="utf-8"), (
-            writer
-        )
+    # The registry names a reason; the writer's module must actually record it,
+    # as a literal or through the constant that module owns.
+    constant_names = {
+        value: name
+        for name, value in vars(recognition_failure_attribution).items()
+        if name.isupper() and isinstance(value, str)
+    }
+    registered = {**AUTHORITY_NOT_PRODUCED_WRITERS, **AUTHORITY_NOT_PRODUCED_REWRITERS}
+    for writer, reason in registered.items():
+        module, function = writer.split(".", 1)
+        text = (SRC / f"{module}.py").read_text(encoding="utf-8")
+        assert f"def {function}(" in text, writer
+        assert f'"{reason}"' in text or constant_names[reason] in text, writer
 
 
 # --------------------------------------------------------------------------
