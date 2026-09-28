@@ -181,3 +181,48 @@ AGENTS.md 的 L2 目标是「一个连续 30 分钟窗口，含至少 5 条真�
 记录下来」处理。**建议在白天活跃时段（日均 150–300 条）补一次 30 分钟窗口**，
 把租约样本数补到 5 条以上，再认为 L2 完全满足。在此之前这批标记为
 `deployed / observation_partial`，不标 `completed`。
+
+## 白天补充观察窗（2026-09-28，北京时间 09:07:53 – 10:17:02，HEAD `9363a6c8`）
+
+**状态：`deployed / observation_partial` → `completed`。** L2 的两项指标（连续 ≥30 分钟、窗口内 ≥5 条真实消息）
+在同一个窗口内同时达成，全部健康检查通过。
+
+| | |
+|---|---|
+| 生产 HEAD | `9363a6c8f9347b716bb754cca7aa73c5b6c74073`（全窗口未变，未重新计窗） |
+| 窗口 | 2026-09-28 09:07:53 → 10:17:02 +0800，连续 69 分钟，69 个采样点（每分钟一次） |
+| 基线 | `raw_message_id` = 19467（窗口内新消息为 id > 19467） |
+| 方式 | 服务器后台只读脚本（`sqlite3 -readonly` + `journalctl` + `systemctl is-active`），不写库、不重启、不改配置 |
+| 证据 | 服务器 `/root/semantic-retirement-observation-day.log`（24383 字节，sha256 `63f6496c…bcca6`） |
+
+| 指标 | 结果 |
+|---|---|
+| 三服务（worker / web / ingest） | 全程 `active` |
+| Traceback | **0** |
+| 日志提及 `semantic`（兼容告警除外） | **0** |
+| `dropped unknown stage 'semantic_review'` 兼容告警 | 单列计数，窗口内 11 条；是 web 进程每次加载配置时的预期告警（§3、设计稿保留的行为），不算异常 |
+| 错误行（`ERROR`/`CRITICAL`） | 69 个采样点里只有 1 条（09:44:48）。它其实是一条 WARNING，`error=` 字样被匹配到了：`runtime_incident_adapters` 捕获运行时事件时按 fail-open 失败（`protection_adopted_from_exchange`，`RuntimeIncidentBoundsError`），与本批无关 |
+| 卡住 >10min 的消息处理作业（`message_processing_jobs` claimed） | **全程 0** |
+| 卡住 >10min 的执行认领（`execution_running`） | **全程 0** |
+| `execution_running` | 开窗 / 结窗全库各数一次都是 **0**；每分钟采样（最近 3000 条消息的索引范围）全程 **0** |
+| 窗口内新消息 | **5 条**（19468–19472） |
+| 租约走完 | **5 / 5**：作业 `succeeded`、`claim_token IS NULL`、`completed_at` 已写；识别决策 `comparison_status=completed`、`comparison_claim_token IS NULL` |
+
+每条消息都能在采样里看到先 `claimed / token 有`、下一个采样点变成 `succeeded / token 空 / completed`
+（例：19468 在 09:16:54 显示 claimed，到 09:17:54 已 succeeded）。也就是说，认领 → 完成 → 释放
+这一整个周期是被实际观察到的，而不是只看了终态。
+
+### 过程中的一次重新计窗（如实记录）
+
+窗口原定北京时间 09:00:00 开窗。第 1 个采样点（09:01）记到 `semantic=2`，查证后发现两条都是 web 进程
+（pid 2437614 / 2437638）加载配置时打出的上述兼容告警。近 24 小时里，除这条告警之外提及 `semantic`
+的日志行为 0 条。脚本原先把它算作异常，这样该窗口永远不可能判 PASS，所以 09:07:53 手工中止，
+改为单独计数这条告警、其余 `semantic` 行仍算异常，再重新开窗。中止说明写在证据日志里，
+09:00–09:07 的 7 个采样点也保留在日志中，除这条告警外全部正常。
+
+### 查询约束
+
+全程没有对生产库做全表扫描：每分钟的查询都走 `raw_messages.id`、
+`message_processing_jobs.raw_message_id`、`recognition_decisions.raw_message_id` 三个索引，
+范围限定在窗口基线附近。全库 `execution_running` 计数只在开窗、结窗各做一次，
+`recognition_decisions` 约 1.9 万行。监视进程在满足条件后自行退出，脚本已删除，日志保留。
