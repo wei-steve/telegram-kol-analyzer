@@ -672,6 +672,39 @@ def resting_entry_attached_stop_order_ids(
     return frozenset(found)
 
 
+def pending_row_trade_unit_pos_ids(
+    session, *, venue: str = "deepcoin", rows: Iterable[Any]
+) -> dict[str, str]:
+    """Of these pending TPSL rows, ``order_id -> the one posId its ``TU``s agree on``.
+
+    Same private facts as :func:`resting_entry_attached_stop_order_ids`
+    (:func:`_trade_unit_values`, :func:`_sole_position_trade_unit`), exposed so
+    a reader of the pending table that is not excluding a resting entry's own
+    stop can still narrow an otherwise-unowned row to the one position its own
+    ``TriggerOrder`` frames name, instead of treating it as evidence against
+    every position. An order with no frame, or with frames that disagree, is
+    left out: "unknown" is not "here".
+    """
+
+    result: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if native_tpsl_row_order_types(dict(row)) != {"TPSL"}:
+            continue
+        normalized = normalize_native_tpsl(dict(row))
+        if normalized is None:
+            continue
+        order_id = str(normalized.ord_id or "").strip()
+        if not order_id:
+            continue
+        trade_units = _trade_unit_values(session, venue=venue, order_id=order_id)
+        tu_pos_id = _sole_position_trade_unit(trade_units)
+        if tu_pos_id:
+            result[order_id] = tu_pos_id
+    return result
+
+
 def resting_entry_stop_owners(
     session, *, venue: str = "deepcoin"
 ) -> dict[tuple[str, str, str, str], int]:

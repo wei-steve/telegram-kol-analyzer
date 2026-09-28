@@ -58,7 +58,9 @@ from telegram_kol_research.protection_authority import (
     FREEZE_POSITION_NOT_VERIFIED,
     evaluate_cancel_precheck,
     ledger_drift,
+    pending_row_trade_unit_pos_ids,
     resolve_protection_authority,
+    resting_entry_attached_stop_order_ids,
     summarize_authority,
 )
 from telegram_kol_research.protection_ledger import (
@@ -166,11 +168,27 @@ def compare_position_protection(
         for row in ledger_rows
         if str(row.order_id or "").strip()
     }
+    normalized_pending_rows = [dict(row) for row in (pending_rows or [])]
+    # "Legacy" here means "what production's own matcher call does today", not
+    # "the matcher's original global-boolean shape". Production callers now
+    # pass the same two narrowing facts (audit fixes design section 1), so the
+    # comparison this module exists for -- legacy vs the phase-6 chain --
+    # stays meaningful: it is still asking whether the chain and the matcher
+    # production actually runs agree, not comparing the chain against a
+    # version of the matcher nothing calls anymore.
+    legacy_excluded_order_ids = resting_entry_attached_stop_order_ids(
+        session, rows=normalized_pending_rows
+    )
+    legacy_order_trade_unit_pos_ids = pending_row_trade_unit_pos_ids(
+        session, rows=normalized_pending_rows
+    )
     legacy = match_position_protection(
         [dict(row) for row in all_positions],
-        [dict(row) for row in (pending_rows or [])],
+        normalized_pending_rows,
         evidence_available=pending_rows is not None,
         exact_order_position_ids=exact_order_position_ids,
+        excluded_order_ids=legacy_excluded_order_ids,
+        order_trade_unit_pos_ids=legacy_order_trade_unit_pos_ids,
     ).by_pos_id.get(pos_id)
     legacy_status = legacy.status if legacy is not None else "absent"
     legacy_order_ids = tuple(legacy.order_ids) if legacy is not None else ()

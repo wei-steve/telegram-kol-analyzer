@@ -374,6 +374,19 @@ def test_a_resting_entrys_stop_is_counted_as_stepped_over_not_as_a_freeze(tmp_pa
 
     A freeze count of zero has two causes -- the exclusion worked, or no entry
     was resting -- and only this counter tells them apart.
+
+    Before the 2026-09-28 audit fix (design section 1), the legacy matcher
+    had no way to exclude a resting entry leg's own attached stop, so this
+    same fixture used to produce ``VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS``:
+    the chain named the position's protection while the legacy matcher froze
+    the whole instrument. Production's own matcher call is narrowed the same
+    way the chain always was (``match_position_protection``'s
+    ``excluded_order_ids``/``order_trade_unit_pos_ids``), and this shadow
+    module's "legacy" call was updated to match what production now actually
+    does -- otherwise it would compare the chain against a matcher shape
+    nothing calls anymore. So the two now agree here; the counter this test
+    exists to distinguish from a plain ``chain_frozen`` of zero is
+    ``VERDICT_AGREED``, not ``VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS``.
     """
 
     from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -429,12 +442,13 @@ def test_a_resting_entrys_stop_is_counted_as_stepped_over_not_as_a_freeze(tmp_pa
 
     assert result["excluded_pending_entry_stops"] == 1
     assert result["counts_by_verdict"][VERDICT_CHAIN_FROZEN] == 0
-    # And this is where the new chain beats the old matcher: the same resting
-    # entry's stop makes the legacy matcher call the whole instrument
-    # ambiguous, while the chain steps over it and still names the position's
-    # own stop.
-    assert result["counts_by_verdict"][VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS] == 1
+    # Production's matcher call now excludes the resting entry's own stop too
+    # (audit fix, design section 1), so the chain and the legacy matcher agree
+    # here instead of the legacy matcher freezing the whole instrument.
+    assert result["counts_by_verdict"][VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS] == 0
+    assert result["counts_by_verdict"][VERDICT_AGREED] == 1
     row = _shadow_rows(session_factory)[0]
+    assert row.reason == VERDICT_AGREED
     assert "entry-stop-98" in row.after_json
 
 

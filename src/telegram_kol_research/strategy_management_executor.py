@@ -65,6 +65,10 @@ from telegram_kol_research.protection_attribution import (
     normalize_protection_snapshot_rows,
     snapshot_protection_rows,
 )
+from telegram_kol_research.protection_authority import (
+    pending_row_trade_unit_pos_ids,
+    resting_entry_attached_stop_order_ids,
+)
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.management_cancel_precheck_shadow import (
     PATH_AFTER_REPLACEMENT,
@@ -669,10 +673,17 @@ def reserve_break_even_market_actions(
             exact_order_position_ids = _exact_order_position_ids(
                 ledger_rows_by_pos_id
             )
+            excluded_order_ids, order_trade_unit_pos_ids = (
+                _protection_matcher_narrowing_inputs(
+                    session_factory, pending=pending
+                )
+            )
             matches = match_position_protection(
                 live_positions,
                 pending,
                 exact_order_position_ids=exact_order_position_ids,
+                excluded_order_ids=excluded_order_ids,
+                order_trade_unit_pos_ids=order_trade_unit_pos_ids,
             )
             protection_rows = {}
             seen_order_ids: set[str] = set()
@@ -706,7 +717,7 @@ def reserve_break_even_market_actions(
                     # protection this system cannot name, which is a different
                     # problem with a different fix.
                     unattributed = _unattributed_exchange_tpsl_order_ids(
-                        pending, exact_order_position_ids
+                        pending, exact_order_position_ids, excluded_order_ids
                     )
                     if unattributed:
                         raise ManagementBatchExecutionError(
@@ -3361,12 +3372,17 @@ def _preflight_exact_protection_rows(
     ledger_rows_by_pos_id = _ledger_rows_by_pos_id(
         session_factory, [leg.pos_id for leg in batch.legs]
     )
+    excluded_order_ids, order_trade_unit_pos_ids = (
+        _protection_matcher_narrowing_inputs(session_factory, pending=pending)
+    )
     matches = match_position_protection(
         live_positions,
         pending,
         exact_order_position_ids=_exact_order_position_ids(
             ledger_rows_by_pos_id
         ),
+        excluded_order_ids=excluded_order_ids,
+        order_trade_unit_pos_ids=order_trade_unit_pos_ids,
     )
     seen_ids: set[str] = set()
     current_rows_by_pos_id: dict[str, list[dict[str, Any]]] = {}
@@ -3489,17 +3505,23 @@ def _remaining_size_after_partial_close(leg: Any) -> Decimal | None:
 
 
 def _unattributed_exchange_tpsl_order_ids(
-    pending, exact_order_position_ids
+    pending, exact_order_position_ids, excluded_order_ids=frozenset()
 ) -> list[str]:
     """TPSL orders the venue is holding that no ledger row can place.
 
     Read-only and deliberately narrow: it names order ids for a person, and
     nothing acts on the answer. ``Conditional`` rows are pending entries and are
-    not protection, so they are excluded.
+    not protection, so they are excluded. ``excluded_order_ids`` (a resting
+    entry leg's own attached stop) is excluded too, so the error names only
+    rows that are genuinely unknown, not ones the matcher already accounted
+    for.
     """
 
     from telegram_kol_research.native_tpsl import native_tpsl_row_order_types
 
+    excluded_order_ids = frozenset(
+        str(order_id) for order_id in (excluded_order_ids or ())
+    )
     unattributed: list[str] = []
     for row in pending or []:
         if not isinstance(row, dict):
@@ -3509,9 +3531,37 @@ def _unattributed_exchange_tpsl_order_ids(
         order_id = str(
             row.get("ordId") or row.get("orderId") or row.get("order_id") or ""
         ).strip()
-        if order_id and order_id not in (exact_order_position_ids or {}):
+        if (
+            order_id
+            and order_id not in (exact_order_position_ids or {})
+            and order_id not in excluded_order_ids
+        ):
             unattributed.append(order_id)
     return sorted(unattributed)
+
+
+def _protection_matcher_narrowing_inputs(
+    session_factory: sessionmaker, *, pending: list[dict[str, Any]]
+) -> tuple[frozenset[str], dict[str, str]]:
+    """The two facts that narrow ``match_position_protection`` for pending rows.
+
+    Computed from the same ``pending`` snapshot the caller already fetched:
+    ``excluded_order_ids`` is a resting entry leg's own attached stop (it
+    protects no position yet, so it is neither claimed nor treated as
+    evidence against any position), and ``order_trade_unit_pos_ids`` narrows
+    any other unowned row to the one posId its own ``TriggerOrder`` frames
+    agree on. Both reuse the exact rules ``protection_authority`` already
+    applies to the same rows in ``trigger_backup_stop_executor``.
+    """
+
+    with session_factory() as session:
+        excluded_order_ids = resting_entry_attached_stop_order_ids(
+            session, rows=pending
+        )
+        order_trade_unit_pos_ids = pending_row_trade_unit_pos_ids(
+            session, rows=pending
+        )
+    return excluded_order_ids, order_trade_unit_pos_ids
 
 
 def _ledger_rows_by_pos_id(

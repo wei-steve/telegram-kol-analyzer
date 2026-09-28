@@ -251,7 +251,11 @@ from telegram_kol_research.deepcoin_trigger_rows import (
     order_id_or_none,
 )
 from telegram_kol_research.protection_attribution import match_position_protection
-from telegram_kol_research.protection_authority import resting_entry_stop_owners
+from telegram_kol_research.protection_authority import (
+    pending_row_trade_unit_pos_ids,
+    resting_entry_attached_stop_order_ids,
+    resting_entry_stop_owners,
+)
 from telegram_kol_research.protection_ledger import (
     ACTIVE_OWNERSHIP_STATUSES,
     build_account_protection_ownership,
@@ -2182,11 +2186,19 @@ def _load_deepcoin_live_position_rows(
         )
         if unattributed_protection_rows is not None:
             unattributed_protection_rows.extend(pending_unattributed_rows)
+        display_excluded_order_ids = resting_entry_attached_stop_order_ids(
+            session, rows=tpsl_orders
+        )
+        display_order_trade_unit_pos_ids = pending_row_trade_unit_pos_ids(
+            session, rows=tpsl_orders
+        )
         protection_match = match_position_protection(
             active_positions,
             tpsl_orders,
             evidence_available=tpsl_evidence_available,
             exact_order_position_ids=exact_order_position_ids,
+            excluded_order_ids=display_excluded_order_ids,
+            order_trade_unit_pos_ids=display_order_trade_unit_pos_ids,
         )
         lifecycle_candidates_by_binding_id: dict[int, list[StrategyLifecycle]] = {}
         if binding_ids:

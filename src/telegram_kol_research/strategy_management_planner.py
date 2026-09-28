@@ -59,6 +59,10 @@ from telegram_kol_research.protection_attribution import (
     match_position_protection,
     snapshot_protection_rows,
 )
+from telegram_kol_research.protection_authority import (
+    pending_row_trade_unit_pos_ids,
+    resting_entry_attached_stop_order_ids,
+)
 from telegram_kol_research.protection_ledger import (
     load_account_protection_ownership,
     list_verified_account_ledger_rows,
@@ -937,11 +941,20 @@ def _plan_strategy_management_batch_locked(
             for row in rows
             if str(row.order_id or "").strip()
         }
+        with session_factory() as session:
+            excluded_order_ids = resting_entry_attached_stop_order_ids(
+                session, rows=tpsl_orders
+            )
+            order_trade_unit_pos_ids = pending_row_trade_unit_pos_ids(
+                session, rows=tpsl_orders
+            )
         matches = match_position_protection(
             live_positions,
             tpsl_orders,
             evidence_available=True,
             exact_order_position_ids=exact_order_position_ids,
+            excluded_order_ids=excluded_order_ids,
+            order_trade_unit_pos_ids=order_trade_unit_pos_ids,
         )
         global_protection_order_id_counts = _protection_order_id_counts(
             tpsl_orders

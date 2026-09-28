@@ -47,6 +47,7 @@ from telegram_kol_research.position_authority_lock import (
 )
 from telegram_kol_research.execution_events import list_execution_events
 from telegram_kol_research.models import (
+    DeepcoinWsEvent,
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionBackupStopOrder,
@@ -905,6 +906,137 @@ def test_break_even_market_reservation_persists_mixed_per_position_actions(
     assert client.quote_reads == ["BTC-USDT-SWAP"]
     assert client.pending_reads == 1
     assert client.call_log == []
+
+
+def test_r1a_resting_entry_stop_no_longer_freezes_ledger_owned_positions(
+    tmp_path,
+):
+    """R1-a: executor-level replay of the 2026-09-28 13:44Z incident shape.
+
+    陈哥's break-even batch failed with
+    ``protection_rows_unattributed_on_exchange`` because 大漂亮's two resting
+    limit entry legs' own attached stops were pending TPSL rows the ledger
+    could not place, and the old matcher froze every ledger-owned position on
+    the account for it. The extra unowned row here is deliberately the
+    *same* ``posSide`` as the batch's own positions (``short``): the
+    production incident happened to have unrelated sides, which
+    ``match_position_protection``'s side-narrowing alone already resolves
+    regardless of whether this call site is wired to exclude resting-entry
+    stops. Same-side is the case that only the exclusion wiring
+    (``resting_entry_attached_stop_order_ids`` /
+    ``pending_row_trade_unit_pos_ids``, design section 1.3 step 3) can
+    resolve, so this is the shape that actually exercises this call site's
+    wiring. Before the fix (verified by temporarily reverting this call
+    site's wiring) this raised ``protection_rows_unattributed_on_exchange``;
+    after the fix the row is excluded and the batch reaches its per-position
+    decisions exactly as the unaffected baseline above does.
+    """
+
+    from telegram_kol_research.execution_bindings import (
+        ExecutionBindingRecord,
+        ExecutionOrderLegRecord,
+        upsert_execution_binding,
+        upsert_execution_order_leg,
+    )
+    from telegram_kol_research.strategy_management_executor import (
+        reserve_break_even_market_actions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    transition_batch(
+        session_factory,
+        batch.id,
+        expected_statuses={"ready"},
+        new_status="executing",
+        transitioned_at=NOW,
+    )
+    batch = load_management_batch(session_factory, batch.id)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    # A wholly unrelated binding -- 大漂亮's -- whose own resting entry leg is
+    # the source of the unowned pending row. It must not share 陈哥's binding:
+    # `_require_exact_entry_legs` checks every entry leg on *that* binding.
+    unrelated_binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="dapiaoliang",
+            chat_id=200,
+            message_id=388,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            margin_mode="cross",
+            position_mode="split",
+            status="active",
+            strategy_instance_id="deepcoin:200:388:BTC:short",
+        ),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=unrelated_binding_id,
+            leg_index=9,
+            purpose="entry",
+            order_kind="limit",
+            strategy_instance_id="deepcoin:200:388:BTC:short",
+            venue="deepcoin",
+            status="pending",
+            attribution_status="unassigned",
+            order_id="entry-99",
+            request={
+                "instId": "BTC-USDT-SWAP",
+                "posSide": "short",
+                "ordType": "limit",
+                "px": "83810.0",
+                "sz": "4.0",
+                "slTriggerPx": "86700.0",
+                "tdMode": "cross",
+                "mrgPosition": "split",
+                "side": "sell",
+            },
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            DeepcoinWsEvent(
+                venue="deepcoin",
+                channel="TriggerOrder",
+                action="push",
+                order_sys_id="entry-stop-98",
+                trade_unit_id="default",
+                received_at=NOW,
+                received_ms=1,
+                raw_payload="{}",
+                payload_hash="hash-entry-stop-98",
+            )
+        )
+        session.commit()
+    # The venue is already holding the resting entry leg's own attached stop
+    # as a pending TPSL row, exactly the shape 大漂亮's binding 388 produced.
+    client.pending.append(
+        {
+            "ordId": "entry-stop-98",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": "86700.0",
+            "sz": "4.0",
+            "cTime": "1",
+        }
+    )
+
+    decision = reserve_break_even_market_actions(
+        session_factory,
+        batch=batch,
+        deepcoin_client=client,
+        observed_at=NOW,
+    )
+
+    assert [(row["pos_id"], row["action"]) for row in decision.decisions] == [
+        ("pos-1", "full_exit"),
+        ("pos-2", "set_break_even"),
+    ]
 
 
 @pytest.fixture(autouse=True)

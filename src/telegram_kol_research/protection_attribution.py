@@ -4,13 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Collection, Mapping
 
 from telegram_kol_research.deepcoin_trigger_rows import (
     any_trigger_price_including_entry_attached,
     stop_trigger_price,
     take_profit_trigger_price,
 )
+from telegram_kol_research.native_tpsl import protection_order_position_sides
+
+#: ``protection_order_position_sides`` only translates ``buy``/``sell``
+#: aliases to ``long``/``short``; any other value (one-way-mode "net", "both",
+#: an unrecognized string, a typo) passes through unchanged. Side-based
+#: narrowing may only compare *this* set of values -- treating an unknown
+#: value as "provably the other side" would be fail-open, not fail-closed.
+_KNOWN_SIDES = frozenset({"long", "short"})
 
 
 @dataclass(slots=True)
@@ -177,6 +185,7 @@ def _nonzero_text(value: Any) -> str | None:
 @dataclass(frozen=True, slots=True)
 class _Position:
     pos_id: str
+    pos_side: str = ""
 
 
 def match_position_protection(
@@ -185,11 +194,44 @@ def match_position_protection(
     *,
     evidence_available: bool = True,
     exact_order_position_ids: dict[str, str] | None = None,
+    excluded_order_ids: Collection[str] = frozenset(),
+    order_trade_unit_pos_ids: Mapping[str, str] | None = None,
 ) -> ProtectionMatchResult:
     """Match TPSL rows only through the canonical ``ordId → posId`` ledger.
 
     Exchange position IDs are validation evidence, not an ownership source.
     Price, size, instrument, side and timestamps never establish ownership.
+
+    A TPSL row the ledger cannot place is not automatically silence about
+    every position: it is narrowed, in order of how much it proves, before
+    falling back to freezing everyone.
+
+    * ``excluded_order_ids`` -- rows to skip entirely, before ownership is
+      even asked. A resting (unfilled) limit entry leg's own attached stop
+      belongs here (``protection_authority.resting_entry_attached_stop_order_ids``):
+      it protects no position today, so it is neither this position's
+      protection nor evidence against any other position's.
+    * ``order_trade_unit_pos_ids`` -- ``order_id -> the one posId its
+      ``TriggerOrder`` ``TU`` frames agree on`` (the same fact
+      ``protection_authority._trade_unit_values`` /
+      ``_sole_position_trade_unit`` compute). When present, only that
+      position is frozen by the row; every other position is unaffected.
+    * Otherwise, when the row carries exactly one ``posSide`` and it is a
+      recognized ``long``/``short`` value, only positions on that side are
+      frozen -- a position on the provably *other* side cannot be what this
+      row protects. A position is frozen anyway when its own side is not a
+      recognized ``long``/``short`` value (unknown, one-way-mode ``net``,
+      ``both``, a typo): it can never be proven to be the other side, so it
+      cannot be ruled out (fail-closed).
+    * Only when none of the above applies (no trade-unit fact, and the row's
+      side is not a single recognized ``long``/``short`` value -- zero sides,
+      more than one, or something this venue never returns for a real
+      position side) does the row fall back to freezing every position with
+      ledger rows, exactly as before this narrowing existed.
+
+    This stays fail-closed in every branch: a row is never assumed to be
+    *not* a given position's protection, only narrowed to positions it
+    plausibly could be.
     """
 
     parsed_positions = [_parse_position(row) for row in positions]
@@ -206,8 +248,20 @@ def match_position_protection(
         row.pos_id: [] for row in parsed_positions
     }
     exact_order_position_ids = exact_order_position_ids or {}
+    excluded_order_ids = frozenset(
+        str(order_id) for order_id in (excluded_order_ids or ())
+    )
+    order_trade_unit_pos_ids = dict(order_trade_unit_pos_ids or {})
     conflicting_pos_ids: set[str] = set()
-    unowned_order_present = False
+
+    # Per-position ambiguity, replacing the old account-wide boolean. A
+    # position that appears here is frozen, regardless of which order caused
+    # it; the recorded evidence is only for display/debugging.
+    ambiguous_pos_ids: dict[str, dict[str, object]] = {}
+    # Set only when a row carries no narrowing fact at all -- the original,
+    # unnarrowed fallback that freezes every ledger-owned position.
+    all_positions_ambiguous_evidence: dict[str, object] | None = None
+
     for order in tpsl_orders:
         if str(order.get("triggerOrderType") or "TPSL").upper() != "TPSL":
             continue
@@ -222,9 +276,51 @@ def match_position_protection(
             "triggerOrderId",
             "id",
         )
+        if order_id and order_id in excluded_order_ids:
+            continue
         ledger_pos_id = exact_order_position_ids.get(order_id or "")
         if ledger_pos_id is None:
-            unowned_order_present = True
+            tu_pos_id = order_trade_unit_pos_ids.get(order_id or "")
+            if tu_pos_id:
+                if tu_pos_id in positions_by_id:
+                    ambiguous_pos_ids.setdefault(
+                        tu_pos_id,
+                        {
+                            "match": "unowned_order_trade_unit_points_here",
+                            "pos_id": tu_pos_id,
+                        },
+                    )
+                continue
+            sides = protection_order_position_sides(order)
+            side = next(iter(sides)) if len(sides) == 1 else None
+            if side in _KNOWN_SIDES:
+                for candidate in parsed_positions:
+                    # A position's own side only rules it out when it is
+                    # itself a known long/short: an unrecognized or
+                    # one-way-mode value ("net", "both", empty, a typo) can
+                    # be either side, so it is never provably the *other*
+                    # side and stays frozen (fail-closed).
+                    if (
+                        candidate.pos_side in _KNOWN_SIDES
+                        and candidate.pos_side != side
+                    ):
+                        continue
+                    ambiguous_pos_ids.setdefault(
+                        candidate.pos_id,
+                        {
+                            "match": "unowned_order_same_side_present",
+                            "side": side,
+                        },
+                    )
+                continue
+            # No single, recognizable long/short side on the row itself
+            # (zero sides, more than one, or a value this venue never
+            # returns for a real position side) -- narrowing by side is not
+            # possible, so fail closed exactly as before this narrowing
+            # existed.
+            all_positions_ambiguous_evidence = {
+                "match": "global_unowned_order_present"
+            }
             continue
         if ledger_pos_id not in positions_by_id:
             continue
@@ -250,10 +346,14 @@ def match_position_protection(
             )
             continue
         if rows:
-            if unowned_order_present:
+            ambiguity = (
+                all_positions_ambiguous_evidence
+                or ambiguous_pos_ids.get(pos_id)
+            )
+            if ambiguity is not None:
                 by_pos_id[pos_id] = PositionProtection(
                     status="present_but_ambiguous",
-                    evidence={"match": "global_unowned_order_present"},
+                    evidence=ambiguity,
                 )
                 continue
             by_pos_id[pos_id] = _verified_protection(
@@ -271,7 +371,9 @@ def _parse_position(row: dict[str, Any]) -> _Position | None:
     pos_id = _first_text(row, "posId", "pos_id", "id")
     if not pos_id:
         return None
-    return _Position(pos_id=pos_id)
+    sides = protection_order_position_sides(row)
+    pos_side = next(iter(sides)) if len(sides) == 1 else ""
+    return _Position(pos_id=pos_id, pos_side=pos_side)
 
 
 def _verified_protection(
