@@ -521,7 +521,29 @@ def _management_fraction(
     return None
 
 
+#: Joins the raw message text and the model's ``observed_text`` into the one
+#: authoritative current-message text (``message_recognition.
+#: _authoritative_current_message_text``). The newlines keep every line-based
+#: reader seeing two separate lines, as the former plain "\n" join did; the
+#: U+2029 PARAGRAPH SEPARATOR between them is a hard boundary for percent/verb
+#: binding. #17936 "止盈70%保留底仓…QQ:…\n止盈70%…": the only digits between
+#: the raw part's 保留 and the observed part's 70% were the QQ number, which
+#: is scrubbed, so without this boundary the retained verb claimed that 70%.
+AUTHORITATIVE_TEXT_PART_SEPARATOR = "\n \n"
+_TEXT_PART_BOUNDARY = " "
+
+
 def _percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
+    # Each part of an authoritative raw+observed text is read on its own: a
+    # verb in one part never claims a percent in the other. Splitting happens
+    # before scrubbing so a contact span can never blank the boundary.
+    values: list[float] = []
+    for part in str(text or "").split(_TEXT_PART_BOUNDARY):
+        values.extend(_part_percentage_values(part, verbs, source=source))
+    return values
+
+
+def _part_percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
     # Keep the entire percentage token, including signs/malformed content.
     # The old nondigit prefix swallowed '-' and silently discarded >100%.
     values = []
@@ -541,8 +563,7 @@ def _percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
         if not _percent_belongs_to_verb(clause):
             # The verb sits in an earlier sentence (or an earlier comma
             # chunk that already carried its own number), so this percent
-            # is not its quantity: "剩余…83200！\n…减50%" across the raw
-            # text / observed_text join, or "出局！…收益370％".
+            # is not its quantity: "剩余…83200！…减50%" or "出局！…收益370％".
             previous_quantity = False
             continue
         previous_quantity = True
@@ -559,9 +580,10 @@ def _percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
     return values
 
 
-# Sentence boundaries and clause commas. An ASCII comma between two digits
-# is a number separator ("减仓1,5%"), not a clause break, so it never splits.
-_CLAUSE_BREAK = re.compile(r"[\n。！!？?；;‼，]|(?<!\d),|,(?!\d)")
+# Sentence boundaries, clause commas and the enumeration comma "、"
+# ("平仓价78,136.4、盈利+136.13%"). An ASCII comma between two digits is a
+# number separator ("减仓1,5%"), not a clause break, so it never splits.
+_CLAUSE_BREAK = re.compile(r"[\n。！!？?；;‼，、]|(?<!\d),|,(?!\d)")
 
 
 def _percent_belongs_to_verb(clause: str) -> bool:

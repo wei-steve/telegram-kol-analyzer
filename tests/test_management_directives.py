@@ -699,6 +699,109 @@ def test_r2e_ordinary_wording_keeps_its_fraction(text, expected) -> None:
     assert result.fraction == pytest.approx(expected)
 
 
+def test_r2g_17936_join_is_a_hard_boundary_even_when_only_a_qq_number_sits_between() -> None:
+    from telegram_kol_research.management_directives import (
+        AUTHORITATIVE_TEXT_PART_SEPARATOR,
+    )
+    from telegram_kol_research.management_fraction_gate import (
+        validate_management_fraction_payload,
+    )
+
+    raw = "一对一指导ZEC多单止盈70%保留底仓做成本保护。\n@Tarderfengge QQ:158241758"
+    observed = "一对一指导ZEC多单止盈70%保留底仓做成本保护。"
+    event = {
+        "event_type": "position_update",
+        "management_action": "partial_take_profit, move_stop_to_protect",
+    }
+    combined = _r2_combined(raw, observed)
+    assert combined == raw + AUTHORITATIVE_TEXT_PART_SEPARATOR + observed
+
+    validate_management_fraction_payload({"lifecycle_event": event}, combined)
+    directive = resolve_management_directive(text=combined, lifecycle_event=event)
+    # Same answer as the raw text alone gave before any of this: "保留底仓" is a
+    # tail-retention term, and that branch precedes the percent branch and
+    # closes DEFAULT_TAIL_CLOSE_FRACTION (0.8) rather than the stated 止盈70%.
+    # Pre-existing semantics, not changed here.
+    raw_only = resolve_management_directive(text=raw, lifecycle_event=event)
+    assert (directive.intent, directive.fraction, directive.reason_code) == (
+        raw_only.intent,
+        raw_only.fraction,
+        raw_only.reason_code,
+    ) == ("partial_take_profit", DEFAULT_TAIL_CLOSE_FRACTION, "tail_retention")
+
+
+def test_r2g_a_verb_never_claims_a_percent_across_the_join() -> None:
+    combined = _r2_combined("保留仓位", "止盈70%")
+    # Before the boundary, 保留 claimed 70% as a retained share (0.3 close),
+    # contradicting 止盈70% (0.7 close) -> management_fraction_ambiguous.
+    assert management_directives_module._retained_percentage_values(combined) == []
+    assert management_directives_module._close_percentage_values(combined) == [0.7]
+    result = resolve_management_directive(
+        text=combined, lifecycle_event={"management_action": "partial_take_profit"}
+    )
+    assert result.fraction == 0.7
+
+
+@pytest.mark.parametrize("raw", ["减仓\n150%", "减仓；比例120%", "保留\n-20%"])
+def test_r2g_malformed_content_inside_one_part_is_still_rejected(raw) -> None:
+    from telegram_kol_research.management_fraction_gate import (
+        validate_management_fraction_payload,
+    )
+
+    event = {"management_action": "partial_take_profit"}
+    for text in (raw, _r2_combined(raw, "BTC多单"), _r2_combined("BTC多单", raw)):
+        with pytest.raises(ValueError, match="management_fraction_invalid"):
+            resolve_management_directive(text=text, lifecycle_event=event)
+        with pytest.raises(ValueError, match="management_fraction_invalid"):
+            validate_management_fraction_payload({"lifecycle_event": event}, text)
+
+
+def test_r2g_contact_scrubbing_cannot_blank_the_join() -> None:
+    from telegram_kol_research.contact_digit_scrubbing import (
+        scrub_contact_identifiers,
+    )
+    from telegram_kol_research.management_directives import (
+        AUTHORITATIVE_TEXT_PART_SEPARATOR,
+    )
+
+    combined = "保留仓位 QQ:" + AUTHORITATIVE_TEXT_PART_SEPARATOR + "158241758 止盈70%"
+    # Whatever the scrubber does to the whole string, the binding split
+    # happens before it, so the verb in part one cannot reach part two.
+    scrub_contact_identifiers(combined)
+    assert management_directives_module._retained_percentage_values(combined) == []
+    result = resolve_management_directive(
+        text=combined, lifecycle_event={"management_action": "partial_take_profit"}
+    )
+    assert result.fraction == 0.7
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("平仓价78,136.4、盈利+136.13%", None),  # number before 、 -> unbound
+        ("减仓、20%", 0.2),  # nothing numeric before 、 -> still binds
+    ],
+)
+def test_r2g_enumeration_comma_is_a_clause_break(text, expected) -> None:
+    result = resolve_management_directive(
+        text=text,
+        lifecycle_event={"event_type": "exit_full", "management_action": "exit_full"}
+        if expected is None
+        else {"management_action": "partial_take_profit"},
+    )
+    if expected is None:
+        assert result.fraction != 1.3613
+    else:
+        assert result.fraction == expected
+
+
+def test_r2g_enumeration_comma_with_no_number_keeps_invalid_content_rejected() -> None:
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(
+            text="减仓、150%", lifecycle_event={"management_action": "partial_take_profit"}
+        )
+
+
 def test_r2f_add_position_wording_is_still_risk_increasing() -> None:
     result = resolve_management_directive(
         text="可以加仓同等仓位",

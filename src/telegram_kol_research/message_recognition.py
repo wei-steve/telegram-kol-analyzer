@@ -74,6 +74,7 @@ from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
 from telegram_kol_research.management_directives import (
+    AUTHORITATIVE_TEXT_PART_SEPARATOR,
     FULL_EXIT_ACTIONS,
     ManagementFractionInvalid,
     build_management_instruction_contract,
@@ -1623,7 +1624,11 @@ def _authoritative_current_message_text(
     input_reading = input_reading if isinstance(input_reading, Mapping) else {}
     observed_text = str(input_reading.get("observed_text") or "").strip()
     parts = [str(raw_text or "").strip(), observed_text]
-    return "\n".join(dict.fromkeys(part for part in parts if part))
+    # A hard boundary for percent/verb binding between the two parts, while
+    # line-based readers still see a line break (2026-09-28 audit, #17936).
+    return AUTHORITATIVE_TEXT_PART_SEPARATOR.join(
+        dict.fromkeys(part for part in parts if part)
+    )
 
 
 def _management_action_for_exit_downgrade(

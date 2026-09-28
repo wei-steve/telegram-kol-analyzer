@@ -243,7 +243,7 @@ def test_authoritative_current_message_text_excludes_model_reasons() -> None:
             "input_reading": {"observed_text": "保护成本"},
             "lifecycle_event": {"reason": "全平"},
         },
-    ) == "继续持有\n保护成本"
+    ) == "继续持有\n \n保护成本"
 
 
 def test_normalize_management_intent_extracts_explicit_management_fraction():

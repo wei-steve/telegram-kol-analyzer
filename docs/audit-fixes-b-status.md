@@ -8,7 +8,7 @@
 
 | 问题 | 状态 | 提交 |
 |---|---|---|
-| 2 比例错配 + 「加仓后」 | 完成（本地测试） | 见 git log「audit fix 2」 |
+| 2 比例错配 + 「加仓后」 | 完成（本地测试） | 见 git log「audit fix 2」「audit fix 2b」 |
 | 3 告警送达 | 完成（本地测试） | 见 git log「audit fix 3」 |
 | 4 模糊止损修饰词 | 完成（本地测试） | 见 git log「audit fix 4」 |
 
@@ -28,6 +28,43 @@
   - 残留缺口：「全部出局！持仓收益高达370％」这种动词和百分数之间**没有任何数字**的写法仍会被拒
     （与修复前相同）。生产样本里没有见到这种形态；如需覆盖，要先决定怎样区分它和 `减仓；比例120%`。
 - 测试：`tests/test_management_directives.py` 中 `test_r2a_*`…`test_r2f_*`；修复前 6 个失败、修复后全部通过。
+
+### 问题 2 补充（审阅后第二个提交，「audit fix 2b」）
+
+- 审阅发现 #17936（陈哥群，auto_trade）仍被拼接误拒：原文「…止盈70%保留底仓…\n@Tarderfengge QQ:158241758」
+  拼上 observed_text「…止盈70%保留底仓…」，原文里的「保留」绑到复述里的 70%，中间唯一的数字是 QQ 号，
+  被 `scrub_contact_identifiers` 抹掉，所以「中间块含数字」规则看不到。
+- 修法：拼接处做成**硬边界**，与数字规则无关。
+  - `management_directives.AUTHORITATIVE_TEXT_PART_SEPARATOR = "\n \n"`（换行 + U+2029 段落分隔符 + 换行）；
+    `message_recognition._authoritative_current_message_text` 改用它拼接。
+  - `_percentage_values` 先按 U+2029 切成各部分、**再**逐部分清洗联系方式并提取（`previous_quantity` 每部分重置），
+    所以联系方式清洗不可能抹掉边界，一部分里的动词也不可能认领另一部分的百分数。
+  - `_CLAUSE_BREAK` 加入「、」：`平仓价78,136.4、盈利+136.13%` 前一块带数字 → 不绑定；`减仓、150%` 前一块无数字 → 仍然拒绝。
+- 拼接文字的全部消费者（已逐个核对，U+2029 两侧仍各有一个换行，按行读取的逻辑看到的仍是换行）：
+  - `management_fraction_gate.validate_management_fraction_payload`、`resolve_management_directive`（在
+    `_apply_lifecycle_event_decision`、`_apply_deterministic_management_scope_if_matched`、多目标准入 / 校验、
+    `_attribute_unapplied_lifecycle_event` 里）：本修复的目标。
+  - `_exit_decision_looks_like_management_update` / `_management_action_for_exit_downgrade` / `_should_move_stop_to_protect`
+    / `text_names_market_entry`：只做关键词包含判断，不受影响。
+  - `_extract_explicit_stop_loss_from_management_text`：正则 `[^0-9]{0,20}` / `{0,8}` / `{0,12}` 窗口，U+2029 与原来的
+    `\n` 一样能被跨过，但拼接处现在多 2 个字符，跨拼接处的匹配窗口相应缩短 2 个字符（只影响「止损」在一部分末尾、价格在
+    另一部分开头这种本就不该成立的配对）。
+  - `_text_contains_explicit_stop_value`：前 32 / 后 16 字符的来源窗口，同理只在跨拼接处少看 2 个字符。
+  - `build_management_instruction_contract(current_message_text=…)`：写进合同 JSON 并参与合同指纹。指纹只和
+    **同一行存的 JSON** 比对（`strategy_management_batches` 两处），不会用文字重算，所以新旧行各自自洽；只是
+    raw 与 observed_text 不同的消息，新写入合同里的 `current_message_text` 多了 U+2029。`management_stop_price_gate`
+    对它只判断非空。`strategy_management_planner` 构造合同用的是 `raw_message.text`，不经过拼接。
+  - `json.dumps(ensure_ascii=False)` / SQLite 可以原样存取 U+2029。
+  - 原始消息自身若含 U+2029（罕见），也会被当成边界切开，只影响百分数绑定。
+- #17936 实际结果（设计稿没写，审阅者预期 0.3）：拼接文字现在通过比例校验；`resolve_management_directive` 对
+  原文、复述、拼接文字**都**返回 `partial_take_profit`、比例 **0.8**、`reason_code=tail_retention`。原因：「保留底仓」是
+  `_TAIL_TERMS` 里的尾仓词，这个分支在百分数分支之前，固定按 `DEFAULT_TAIL_CLOSE_FRACTION`（0.8）平仓，
+  不看「止盈70%」。基线 `f2846c41` 上原文单独也是 0.8，属既有语义，本分支未改；KOL 原意更可能是平 70%，
+  是否让明确百分数优先于尾仓默认值需要另行裁定。
+- 测试（`tests/test_management_directives.py`）：`test_r2g_17936_*`、`test_r2g_a_verb_never_claims_a_percent_across_the_join`、
+  `test_r2g_malformed_content_inside_one_part_is_still_rejected`（含原文单独 `减仓\n150%`）、
+  `test_r2g_contact_scrubbing_cannot_blank_the_join`、`test_r2g_enumeration_comma_*`；
+  `tests/test_message_recognition.py::test_authoritative_current_message_text_excludes_model_reasons` 的期望拼接串随之更新。
 
 ## 问题 3
 
