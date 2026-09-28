@@ -6,7 +6,7 @@
   `8c588272c595ff1d2483e462bb16e5df26aae7fc8583c4b40621d747967bf94f`，2026-09-28 17:57Z 取，
   查完已删除）；值守状态库 `/var/lib/telegram-kol-oncall/state.db` 只读查询；
   `/etc/telegram-kol-worker.env` 只读了告警类型相关的三个键。生产库本身没有查询，没有交易所调用。
-- 状态：**已批准（2026-09-28，用户：第 6 节全部按推荐，Q3a 选 A）**；实施完成，候选见第 7 节，待调度会话部署。
+- 状态：**已批准（2026-09-28，用户：第 6 节全部按推荐，Q3a 选 A）**；已部署 `0bcb894e`（2026-09-28 21:44Z），L2 观察窗口通过，见第 8 节。
 
 ## 0. 结论速览
 
@@ -241,3 +241,17 @@ SELECT id, notification_status FROM runtime_incidents WHERE id IN (2239,2241,224
 ```
 
 之后 `tg-deploy <候选 sha>`，再 `systemctl restart telegram-kol-oncall.service`，观察窗口按第 5 节。
+
+## 8. 部署与观察（2026-09-28）
+
+- 候选 rebase 到 `origin/main` = `42e5ba3d`（值守补救修正，只改 `oncall_remediation*`，无冲突）→ `0bcb894e9280d273e145eb44e99d24d14c6870a7`，全量 10317 passed / 4 skipped / 0 failed。
+- 部署前检查：生产 `2402773f`，无执行中的管理批次；5 个 pending 合约均为 09-23～09-25 的挂单入场，非时效操作。
+- Q3a：8 行 `pending → suppressed`（前 8 pending，changes=8，后 8 suppressed）。
+- 候选确认是 `2402773f` 与 `origin/main` 的后代 → 推 `claude/agitated-sammet-1bfa8d` → `tg-deploy`（21:44Z，worker/web/ingest active）→ 单独重启 `telegram-kol-oncall`（active）→ 推 `origin/main`（无 `-f`）→ OFFENDERS 自测 FAIL/PASS 各一，判定 PASS。
+- 回滚点：`tg-deploy 2402773f873f55ff2366ee0a7deea4421ff94baf`，之后重启 `telegram-kol-oncall`。
+- 实时正向核对（交易所 GET + 只读库）：大漂亮 BTC 空 `1001125407523145` 旧逻辑 `present_but_ambiguous`，新逻辑 `verified`（止盈 81800 / 80200）；腿 2 自带止损 `1001125407523252` 被识别为挂单入场腿止损排除。
+- L2 窗口：只读监视 `/root/observe-audit-fixes.sh`，证据 `/var/lib/telegram-kol-evidence/20260928-audit-fixes/`。
+  21:45:03Z → 23:30:15Z 连续 105 分钟，106 个样本全部健康、0 次重置，7 条真实消息（1 个群），
+  服务 / HEAD / submit_unknown / critical 均正常，保护类拦截 0、比例告警未送达 0。
+- 局限：窗口内没有管理批次、没有比例或几何拒绝，四个修复的**正向执行路径还没有真实样本**；问题 1 只有上面的实时匹配核对。首个大漂亮 / 米娅类管理消息出现时应复核。
+- 执行器原始报错串（如 `protection_rows_unattributed_on_exchange`）不落任何可查询列（批次 184 最终 `recovery_timeout`），监视脚本因此把所有保护 / 恢复类 blocked 批次都算不健康。是否把该报错落库另议。
