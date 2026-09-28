@@ -828,3 +828,98 @@ def test_final_draft_without_contract_tick_is_indeterminate():
     assert result.status == "indeterminate"
     assert result.reason_code == "entry_price_geometry_required_value_missing"
     assert result.offending_field == "price_tick"
+
+
+# --- 2026-09-28 audit fixes, problem 4: fuzzy wording around one stop price ---
+# #19639: the stop field held exactly one price, 2520, but "下方一点" /
+# "小幅跌破…一点" were not field labels, so the whole strategy was refused as
+# ambiguous. User ruling: the stop is X itself, no buffer.
+
+_R4_ETH_LONG = {
+    "side": "long",
+    "entry_text": "2540-2553附近",
+    "take_profit_text": "2620附近/2700附近/2790",
+    "symbol": "ETH-USDT-SWAP",
+}
+
+
+@pytest.mark.parametrize(
+    "stop_loss_text",
+    [
+        "2520下方一点",
+        "小幅跌破2520一点",
+        "跌破2520",
+        "2520下方",
+        "2520以下",
+        "有效跌破2520",
+        "2520之下少许",
+        "2520左右",
+        "止损2520下方一点",
+    ],
+)
+def test_r4a_19639_fuzzy_long_stop_takes_the_single_price(stop_loss_text):
+    result = validate_candidate_entry_price_geometry(
+        stop_loss_text=stop_loss_text, **_R4_ETH_LONG
+    )
+
+    assert result.status == "valid", result
+    assert Decimal(result.normalized_stop_loss) == Decimal("2520")
+
+
+@pytest.mark.parametrize(
+    "stop_loss_text", ["突破86700一点", "86700上方一点", "涨破86700", "站上86700以上"]
+)
+def test_r4b_fuzzy_short_stop_is_symmetric(stop_loss_text):
+    result = validate_candidate_entry_price_geometry(
+        side="short",
+        entry_text="86000-86300",
+        stop_loss_text=stop_loss_text,
+        take_profit_text="85500/85000",
+        symbol="BTC-USDT-SWAP",
+    )
+
+    assert result.status == "valid", result
+    assert Decimal(result.normalized_stop_loss) == Decimal("86700")
+
+
+@pytest.mark.parametrize(
+    "stop_loss_text",
+    ["跌破2520或2510", "跌破2520 20个点", "跌破前低", "跌破2520/2510", "入场价下方30点"],
+)
+def test_r4c_fuzzy_stop_still_refuses_two_prices_relative_or_no_price(stop_loss_text):
+    result = validate_candidate_entry_price_geometry(
+        stop_loss_text=stop_loss_text, **_R4_ETH_LONG
+    )
+
+    assert not result.passed
+    assert result.reason_code == "entry_price_geometry_ambiguous"
+    assert result.offending_field == "stop_loss"
+
+
+def test_r4c_fuzzy_long_stop_above_the_entry_low_is_on_the_wrong_side():
+    result = validate_candidate_entry_price_geometry(
+        stop_loss_text="2560下方一点", **_R4_ETH_LONG
+    )
+
+    assert result.status == "invalid"
+    assert result.reason_code == "entry_price_geometry_stop_side_invalid"
+    assert result.offending_field == "stop_loss"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("entry_text", "2540-2553下方一点"),
+        ("entry_text", "跌破2553"),
+        ("take_profit_text", "2620上方一点"),
+        ("take_profit_text", "突破2700"),
+    ],
+)
+def test_r4c_fuzzy_qualifiers_do_not_widen_entry_or_take_profit_labels(field, value):
+    payload = dict(_R4_ETH_LONG, stop_loss_text="2520")
+    payload[field] = value
+
+    result = validate_candidate_entry_price_geometry(**payload)
+
+    assert not result.passed
+    assert result.reason_code == "entry_price_geometry_ambiguous"

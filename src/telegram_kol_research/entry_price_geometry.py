@@ -121,6 +121,16 @@ _FIELD_LABELS = {
         re.IGNORECASE,
     ),
 }
+#: Fuzzy wording around a single stop price -- "小幅跌破2520一点", "2520下方一点",
+#: "突破86700一点" (#19639, 2026-09-28). Stop field only: the entry and
+#: take-profit label sets are not widened. The stop is the one price X itself,
+#: no buffer (user ruling); which side of the entry X must sit on is still
+#: enforced by the geometry check, and two prices, relative wording ("20个点")
+#: or no number at all are still refused by the checks around this one.
+_FUZZY_STOP_QUALIFIERS_RE = re.compile(
+    r"跌破|突破|涨破|破位|站上|有效|小幅|下方|上方|以下|以上|之下|之上|"
+    r"一点|一些|少许|左右|上下"
+)
 _ABSOLUTE_CURRENCY_RE = re.compile(
     r"\$|(?<![a-z])(?:usdt|usd|u)(?![a-z])|美元",
     re.IGNORECASE,
@@ -663,6 +673,8 @@ def _proves_absolute_candidate_field(
     if label_pattern is None:
         return False
     text = label_pattern.sub(" ", text)
+    if field == "stop_loss":
+        text = _FUZZY_STOP_QUALIFIERS_RE.sub(" ", text)
     return not _FIELD_SEPARATORS_RE.sub("", text).strip()
 
 

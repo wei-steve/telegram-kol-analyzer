@@ -10,7 +10,7 @@
 |---|---|---|
 | 2 比例错配 + 「加仓后」 | 完成（本地测试） | 见 git log「audit fix 2」 |
 | 3 告警送达 | 完成（本地测试） | 见 git log「audit fix 3」 |
-| 4 模糊止损修饰词 | 未开始 | |
+| 4 模糊止损修饰词 | 完成（本地测试） | 见 git log「audit fix 4」 |
 
 ## 问题 2
 
@@ -49,3 +49,18 @@
 - 测试：`tests/test_system_operator_bot.py::test_r3a_*`（2 个），`tests/test_oncall_alerts.py::test_r3b_*`（2 个）、
   `test_r3c_*`（1 个）；修复前全部失败、修复后通过。
 - 部署提醒（设计稿第 5 节）：值守代码有改动，部署后要单独重启 `telegram-kol-oncall.service`。
+
+## 问题 4
+
+- `entry_price_geometry`：新增 `_FUZZY_STOP_QUALIFIERS_RE`（跌破 突破 涨破 破位 站上 有效 小幅 下方 上方 以下 以上
+  之下 之上 一点 一些 少许 左右 上下），只在 `_proves_absolute_candidate_field(field="stop_loss")` 里、字段标签剥离之后使用。
+  `entry_prices` / `take_profit` 的标签集合没有变（有测试钉住）。止损取抽出的唯一价 X，不加缓冲。
+- 仍拒绝：两个价格（`跌破2520或2510`、`跌破2520/2510`）、相对写法（`跌破2520 20个点`、`入场价下方30点`，由既有相对表达检测拦下）、
+  无数字（`跌破前低`）；多单 `2560下方一点` → `entry_price_geometry_stop_side_invalid`。
+- 调用方核对：`validate_candidate_entry_price_geometry` 的调用方只有 `auto_trade_execution`（两处）、`trading_decision`、
+  `recovery_scan`，都走这一个函数。下游不再用别的解析器**校验**止损文字：下单草稿
+  `deepcoin_order_builder._parse_optional_price` 用同一个 `extract_normalized_prices` 取第一个价（得 2520）；
+  `lifecycle_monitor._parse_single_float` / `message_recognition._parse_single_float` 取文字里第一个数字（同样 2520），
+  只是取值不是校验；`validate_order_draft_price_geometry` 用草稿里已经是数字的止损。
+- 未改任何识别提示词。
+- 测试：`tests/test_entry_price_geometry.py` 中 `test_r4a_*`、`test_r4b_*`、`test_r4c_*`；修复前 14 个失败（R4-c 的拒绝用例修复前后都通过）。
