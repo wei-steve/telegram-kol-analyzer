@@ -464,22 +464,48 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+#: 3a (design §3.3): the diagnostic used to record only how many targets a
+#: rejected response named, not what they were, so the "the model wrote the
+#: lifecycle id where a thread_id belonged" theory on 陈哥's raw 19490 could
+#: not be checked against the data -- 5 of its 7 context calls were
+#: ``target_outside_candidate_set`` and every rejected id is gone. Capped so a
+#: pathological response cannot inflate a small diagnostic column.
+_REJECTED_TARGET_ID_DIAGNOSTIC_LIMIT = 8
+
+
 def _rejected_response_diagnostic(
     payload: Mapping[str, Any],
     *,
     error_class: str,
+    allowed_thread_ids: set[int] | None = None,
+    candidate_lifecycle_ids: set[int] | None = None,
 ) -> str:
     decision = str(payload.get("decision") or "")
     targets = payload.get("target_thread_ids")
-    return _canonical_json(
-        {
-            "decision": decision if decision in DECISIONS else None,
-            "error_class": error_class,
-            "target_thread_count": (
-                len(targets) if isinstance(targets, list) else None
-            ),
-        }
-    )
+    diagnostic: dict[str, Any] = {
+        "decision": decision if decision in DECISIONS else None,
+        "error_class": error_class,
+        "target_thread_count": (
+            len(targets) if isinstance(targets, list) else None
+        ),
+    }
+    if error_class == "target_outside_candidate_set" and isinstance(targets, list):
+        allowed = allowed_thread_ids or set()
+        rejected: list[int] = []
+        for item in targets:
+            try:
+                value = int(item)
+            except (TypeError, ValueError):
+                continue
+            if value not in allowed:
+                rejected.append(value)
+        rejected = rejected[:_REJECTED_TARGET_ID_DIAGNOSTIC_LIMIT]
+        candidates = candidate_lifecycle_ids or set()
+        diagnostic["rejected_target_ids"] = rejected
+        diagnostic["rejected_ids_matching_candidate_lifecycle"] = [
+            value for value in rejected if value in candidates
+        ]
+    return _canonical_json(diagnostic)
 
 
 def _collect_ids(value: Any, key_names: set[str]) -> set[int]:
@@ -945,6 +971,13 @@ def resolve_contextual_strategy(
         request_payload.get("candidate_strategy_threads"),
         {"thread_id", "strategy_thread_id"},
     )
+    #: 3a: candidates' own lifecycle ids, so a rejected target that is really a
+    #: lifecycle id mistaken for a thread_id can be told apart from one that
+    #: matches nothing at all (design §3.1's "most likely" theory on raw 19490).
+    candidate_lifecycle_ids = _collect_ids(
+        request_payload.get("candidate_strategy_threads"),
+        {"lifecycle_id", "current_lifecycle_id"},
+    )
     allowed_message_ids = _collect_ids(
         {
             "current": request_payload.get("current_message"),
@@ -1178,6 +1211,8 @@ def resolve_contextual_strategy(
                     _rejected_response_diagnostic(
                         decoded,
                         error_class=failure.code,
+                        allowed_thread_ids=allowed_thread_ids,
+                        candidate_lifecycle_ids=candidate_lifecycle_ids,
                     )
                     if decoded is not None
                     else None

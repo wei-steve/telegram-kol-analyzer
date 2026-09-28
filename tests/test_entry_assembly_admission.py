@@ -791,6 +791,13 @@ def _persist_neighbor_evidence_and_decision(
         # test_exhausted_recognition_unblocks_entry.py.
         ("skipped", "mimo_authoritative_failed_exhausted", True),
         ("deferred", "source_message_deletion_hold", True),
+        # 2026-09-28 chen-btc-repost design §3.3, 3d: a context-resolution
+        # failure whose exact target was already proven dead and flat. Unlike
+        # the exhausted-failure row above, a decision *was* produced here (do
+        # nothing), so it releases immediately like ``mimo_no_action`` rather
+        # than falling back to the "could this be my cancellation" fail-closed
+        # reasoning that only applies to an unreadable neighbour.
+        ("skipped", "target_terminal_noop", False),
     ],
 )
 def test_neighbor_terminal_decision_releases_completed_lifecycle_evidence(

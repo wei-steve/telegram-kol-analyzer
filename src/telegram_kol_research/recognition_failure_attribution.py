@@ -90,6 +90,24 @@ GAP_RECOVERY_EXPIRED = "authoritative_gap_recovery_expired"
 #: every reporting consumer below.
 MIMO_AUTHORITATIVE_FAILED_EXHAUSTED = "mimo_authoritative_failed_exhausted"
 
+#: 2026-09-28 chen-btc-repost design (docs/plans/2026-09-28-chen-btc-expired-
+#: repost-and-queue-block-design.md §3.3, 3d). Context resolution failed
+#: outright (contract failure such as ``target_outside_candidate_set``, or a
+#: network exhaustion) on 陈哥's raw 19490, a撤销 that named lifecycle 1327
+#: exactly and risk-reduced it, but 1327 was already ``expired`` with no
+#: exchange leg ever placed -- nothing was left to cancel. Unlike
+#: ``MIMO_AUTHORITATIVE_FAILED[_EXHAUSTED]`` this is not "no decision was
+#: produced": a decision *was* produced (do nothing), it is just produced by a
+#: narrow admission check rather than by the model. Kept out of
+#: ``AUTHORITY_NOT_PRODUCED_REASONS`` for that reason, and out of
+#: ``ALERTED_REASONS`` below because the check that assigns it only fires when
+#: the target is provably dead and already flat -- see
+#: ``authoritative_recognition._context_resolution_failure_terminal_noop_target``
+#: for the exact conditions. A real instruction on a still-live target (raw
+#: 17972 "止损改为2600", raw 18501 "全部仓位止盈出局") never reaches this reason
+#: and keeps failing loudly through ``MIMO_AUTHORITATIVE_FAILED``.
+TARGET_TERMINAL_NOOP = "target_terminal_noop"
+
 #: Every reason meaning "no authoritative decision was produced".
 #:
 #: A narrowing that reads as reasonable can silently exclude the one case that

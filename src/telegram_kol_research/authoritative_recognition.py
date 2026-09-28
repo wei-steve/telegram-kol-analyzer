@@ -159,6 +159,17 @@ class AuthoritativeAssessment:
     authoritative_generation: str | None = None
     context_resolution: ContextResolutionDecision | None = None
     context_resolution_triggers: tuple[str, ...] = ()
+    #: 2026-09-28 chen-btc-repost design §3.3, 3d. Set only when context
+    #: resolution failed and
+    #: ``_context_resolution_failure_terminal_noop_target`` proved the exact
+    #: target it named is already dead and flat, to the lifecycle id it
+    #: proved that about. Forces automation to ``skipped`` /
+    #: ``TARGET_TERMINAL_NOOP`` ahead of the generic "no decision" and
+    #: "lifecycle event did not apply" checks, so this one benign shape gets
+    #: its own reason instead of either the retried
+    #: ``mimo_authoritative_failed`` or the unrelated ``no_actionable_intent``
+    #: bucket.
+    context_resolution_terminal_noop_target_lifecycle_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -609,6 +620,89 @@ def _candidate_has_unsettled_exchange_leg(candidate: StrategyThreadCandidate) ->
         or candidate.pending_entry_leg_ids
         or candidate.uncertain_entry_leg_ids
     )
+
+
+def _context_resolution_failure_terminal_noop_target(
+    mimo: MimoAuthoritativeResult,
+    candidates: Sequence[StrategyThreadCandidate],
+) -> int | None:
+    """Exact, dead, flat target of a first pass that context resolution never confirmed.
+
+    2026-09-28 chen-btc-repost design §3.3, 3d. Context resolution failed
+    outright on 陈哥's raw 19490 -- five of its seven calls raised
+    ``target_outside_candidate_set`` -- and the failure was retried five times
+    over ten minutes, blocking every later message in the chat (the corrected
+    entry 19491 among them) behind it. Retrying bought nothing: 19490's first
+    pass already named its target exactly, the event was a cancellation (risk-
+    reducing, not a fresh order), and the target -- lifecycle 1327 -- was
+    already ``expired`` with no exchange leg ever placed. There was nothing
+    left to cancel, so no further attempt at resolving it could have changed
+    anything.
+
+    Returns the target lifecycle id only when every one of these holds, so
+    that a real instruction on a live position (raw 17972 "止损改为2600", raw
+    18501 "全部仓位止盈出局") is untouched and keeps failing loudly:
+
+    * the first pass's ``lifecycle_event`` is risk-reducing, by event type or
+      management action (``entry_assembly_admission._RISK_REDUCING_EVENT_TYPES``
+      / ``_RISK_REDUCING_ACTIONS`` -- reused, not duplicated, so this and the
+      admission barrier's own "may this exhausted blocker be cancelling the
+      entry behind it" check can never disagree about what counts as risk-
+      reducing);
+    * it names exactly one exact target lifecycle, whether through
+      ``lifecycle_event.target_lifecycle_id`` or a ``message_classes`` element
+      with ``target.resolution == "exact"``
+      (``entry_assembly_admission._target_lifecycle_ids`` reads both, the same
+      schema as this module's own ``mimo.payload``);
+    * that lifecycle is one of the message's own candidates, and its status is
+      not in ``entry_assembly_admission._LIVE_LIFECYCLE_STATUSES`` (i.e. it is
+      already ``expired``/``exited``/``cancelled``/``invalidated``) -- a target
+      this module cannot see among the candidates, or one that is still live,
+      leaves the question open and this returns ``None``;
+    * that candidate has no unsettled exchange leg
+      (``_candidate_has_unsettled_exchange_leg`` above).
+
+    A lazy import of the three admission constants and helper avoids a module
+    cycle: ``entry_assembly_admission`` -> ``message_evidence`` ->
+    ``authoritative_recognition`` already exists (see the lazy import of
+    ``_run_entry_assembly_wakeups`` elsewhere in this module), so a top-level
+    import here would close it the other way.
+    """
+
+    from telegram_kol_research.entry_assembly_admission import (
+        _LIVE_LIFECYCLE_STATUSES,
+        _RISK_REDUCING_ACTIONS,
+        _RISK_REDUCING_EVENT_TYPES,
+        _target_lifecycle_ids,
+    )
+
+    payload = mimo.payload if isinstance(mimo.payload, Mapping) else {}
+    lifecycle = payload.get("lifecycle_event")
+    lifecycle = lifecycle if isinstance(lifecycle, Mapping) else {}
+    event_type = str(lifecycle.get("event_type") or "").strip().lower()
+    management_action = str(lifecycle.get("management_action") or "").strip().lower()
+    if (
+        event_type not in _RISK_REDUCING_EVENT_TYPES
+        and management_action not in _RISK_REDUCING_ACTIONS
+    ):
+        return None
+    exact_target_ids = _target_lifecycle_ids(dict(payload))
+    if len(exact_target_ids) != 1:
+        return None
+    target_lifecycle_id = next(iter(exact_target_ids))
+    matching = [
+        candidate
+        for candidate in candidates
+        if int(candidate.lifecycle_id) == target_lifecycle_id
+    ]
+    if len(matching) != 1:
+        return None
+    candidate = matching[0]
+    if candidate.status in _LIVE_LIFECYCLE_STATUSES:
+        return None
+    if _candidate_has_unsettled_exchange_leg(candidate):
+        return None
+    return target_lifecycle_id
 
 
 def _resolved_mimo_result(
@@ -1301,6 +1395,7 @@ def assess_message_authoritatively(
             )
     context_decision = None
     context_triggers: tuple[str, ...] = ()
+    terminal_noop_target_lifecycle_id: int | None = None
     # The two gates that decide the contextual second pass are otherwise
     # memory-only, which left the Web card unable to tell "never ran" from
     # "ran and changed nothing". The default stands for the case where the
@@ -1410,6 +1505,53 @@ def assess_message_authoritatively(
                     decision=context_decision,
                     candidates=candidates,
                 )
+            except ContextResolutionError:
+                # 3d: before falling back to the retried "context resolution
+                # failed" outcome, ask whether there is anything left to
+                # resolve at all. 陈哥's raw 19490 named lifecycle 1327 exactly
+                # and asked to cancel it; 1327 was already expired and flat, so
+                # five more retries of the same failing call could not have
+                # produced a different answer.
+                noop_target = _context_resolution_failure_terminal_noop_target(
+                    mimo, candidates
+                )
+                if noop_target is not None:
+                    terminal_noop_target_lifecycle_id = noop_target
+                    logger.info(
+                        "context resolution failure terminal no-op "
+                        "raw_message_id=%s target_lifecycle_id=%s",
+                        raw_message_id,
+                        noop_target,
+                    )
+                    neutral_payload = dict(mimo.payload)
+                    neutral_payload["_context_resolution_terminal_noop"] = {
+                        "target_lifecycle_id": noop_target,
+                        "first_pass": {
+                            "recognition_result": str(
+                                mimo.payload.get("recognition_result") or ""
+                            ),
+                            "lifecycle_event": mimo.payload.get("lifecycle_event"),
+                            "strategy": mimo.payload.get("strategy"),
+                        },
+                    }
+                    neutral_payload.update(
+                        recognition_result="非策略",
+                        reason=(
+                            "context resolution failed; exact target lifecycle "
+                            "already terminal with no unsettled exchange leg "
+                            "(2026-09-28 chen-btc-repost design 3d)"
+                        ),
+                        strategy={},
+                        lifecycle_event={"event_type": "none", "confidence": 0.0},
+                    )
+                    mimo = replace(mimo, payload=neutral_payload, status="非策略")
+                else:
+                    mimo = replace(
+                        mimo,
+                        payload={},
+                        status="识别失败",
+                        error_message="context resolution failed",
+                    )
             except Exception:
                 mimo = replace(
                     mimo,
@@ -1476,6 +1618,9 @@ def assess_message_authoritatively(
         ),
         context_resolution=context_decision,
         context_resolution_triggers=context_triggers,
+        context_resolution_terminal_noop_target_lifecycle_id=(
+            terminal_noop_target_lifecycle_id
+        ),
     )
 
 
@@ -2499,6 +2644,14 @@ def _run_legacy_authoritative_execution(
             "status": "skipped",
             "reason": "mimo_authoritative_failed",
         }
+    elif assessment.context_resolution_terminal_noop_target_lifecycle_id is not None:
+        # 3d: context resolution failed, but the exact target it named is
+        # already dead and flat -- there is nothing left for a retry to
+        # resolve. Takes priority over ``_lifecycle_not_applied_reason`` so
+        # this benign shape gets its own reason instead of the unrelated
+        # ``no_actionable_intent`` bucket the neutralised payload would
+        # otherwise produce.
+        automation = {"status": "skipped", "reason": recognition_attribution.TARGET_TERMINAL_NOOP}
     elif _lifecycle_not_applied_reason(recognition) is not None:
         automation = {
             "status": "skipped",
@@ -2596,6 +2749,15 @@ def _run_leased_authoritative_execution(
                 reason_code=barrier.reason,
                 evidence_refs=(),
                 public_result=automation,
+            )
+        elif assessment.context_resolution_terminal_noop_target_lifecycle_id is not None:
+            # 3d, mirrors the legacy path above: a failed context resolution
+            # whose exact target is already dead and flat gets its own
+            # benign reason ahead of ``_lifecycle_not_applied_reason``.
+            automation = {"status": "skipped", "reason": recognition_attribution.TARGET_TERMINAL_NOOP}
+            boundary = ExecutionBoundaryOutcome(
+                "completed", "not_started", "skipped",
+                recognition_attribution.TARGET_TERMINAL_NOOP, (), automation
             )
         elif _lifecycle_not_applied_reason(recognition) is not None:
             reason_code = _lifecycle_not_applied_reason(recognition)
