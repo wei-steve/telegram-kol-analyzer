@@ -86,6 +86,9 @@ class GateDCheck:
     reason_code: str | None
 
 
+_REASON_CODE_RE = re.compile(r"[a-z][a-z0-9_]{2,127}")
+
+
 def _extract_reasons_from_blob(blob: str | None) -> set[str]:
     """Pull every ``"reason"``/``"reason_code"`` value out of a JSON blob.
 
@@ -107,6 +110,17 @@ def _extract_reasons_from_blob(blob: str | None) -> set[str]:
             value = payload.get(key)
             if value:
                 reasons.add(str(value))
+        # ManagementBatchExecutionError is recorded as {"message": "<code>:<detail>",
+        # "type": ...} (raw 19598: "protection_rows_unattributed_on_exchange:
+        # <pos>:<orders>"). The leading reason code is the part to match; the
+        # detail after the first ":" is identifiers, never part of a code.
+        message = payload.get("message")
+        if message:
+            code = str(message).split(":", 1)[0].strip()
+            if _REASON_CODE_RE.fullmatch(code):
+                reasons.add(code)
+            else:
+                reasons.add(str(message))
     if not reasons:
         reasons.add(str(blob))
     return reasons

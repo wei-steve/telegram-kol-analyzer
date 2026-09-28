@@ -702,7 +702,10 @@ def test_management_stop_action_conflict_shape_is_refused_with_zero_writes(tmp_p
         # today -- see the implementer's final report -- so in practice this
         # branch is not the one that runs; kept as the spec-sanctioned
         # alternative ("在 A7 或 apply 内部任一处被拒都算").
-        assert "management_stop_action_conflict" in str(computed.refusal_reason)
+        # Since the A6c intent guard (raw 19598 review), the break-even-with-
+        # explicit-price shape is refused at G-A: the remediation re-derives
+        # adjust_stop_loss while the candidate means break-even.
+        assert computed.refusal_reason == "intent_diverges_from_main_chain"
     else:
         assert computed.state == "proposed", computed.refusal_reason
         step1_token = computed.keyboard[0][1].split(":")[-1]

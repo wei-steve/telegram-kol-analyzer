@@ -32,6 +32,7 @@ from telegram_kol_research.config import OncallRemediationConfig
 from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     MessageInstructionItem,
     OncallRemediationAudit,
     OncallRemediationControl,
@@ -41,8 +42,10 @@ from telegram_kol_research.models import (
     RuntimeIncident,
     RuntimeIncidentAffectedMessage,
     SignalCandidate,
+    PositionMutationIntent,
     Source,
     StrategyManagementBatch,
+    StrategyManagementLeg,
 )
 from telegram_kol_research.oncall_remediation_auto import (
     AutoHealthInputs,
@@ -400,6 +403,8 @@ _REFUSAL_REASON_ZH: dict[str, str] = {
     "cooldown": "同一仓位冷却中，请稍后再试",
     "daily_execution_cap": "今日补救执行次数已达上限",
     "daily_proposal_cap": "今日提案消息已达上限",
+    "intent_diverges_from_main_chain": "补救重算出的动作与主链路识别的动作不一致（例如保本被算成调止损），不补救",
+    "intent_unverifiable": "无法确认主链路的原意，不补救",
     "plan_changed": "计划已变化（多为同币种有新成交或挂撤单），本次未执行；可发送 /fix 加本提案号重新生成提案",
     "expired": "提案已过期",
     "state_changed": "提案状态已变化",
@@ -708,6 +713,90 @@ class _GateAResult:
     raw_message: RawMessage | None = None
 
 
+# A6c: the remediation planner re-derives the intent from the message text
+# (resolve_management_directive); the main chain acts on the authoritative
+# recognition decision. They can disagree -- raw 19598 "上移止损83000附近做好成本
+# 保护" was move_stop_to_break_even on the main chain (strategy price 83150 by
+# the user's rule) but adjust_stop_loss -> 83000 in the remediation plan,
+# because management_directives.py returns adjust_stop_loss for a
+# position_update carrying an explicit price before it ever checks for a
+# break-even clause. A remediation must repeat what the main chain meant to
+# do, so the action kind has to match it; anything else is refused.
+_FULL_EXIT_TOKENS = frozenset({"exit_full", "full_exit", "close_position"})
+_PARTIAL_TOKENS = frozenset({"exit_partial", "partial_exit", "partial_take_profit"})
+_BREAK_EVEN_TOKENS = frozenset(
+    {"move_stop_to_break_even", "move_stop_to_protect", "breakeven", "break_even"}
+)
+_STOP_ADJUST_TOKENS = frozenset({"adjust_stop_loss", "risk_update", "adjust_position_tpsl"})
+
+
+def _intents_allowed_by_candidate(candidate: SignalCandidate) -> frozenset[str] | None:
+    """The remediation action kinds the authoritative candidate can mean.
+
+    ``None`` = the candidate's management_action cannot be mapped (refuse:
+    intent unverifiable). Combined actions such as
+    ``partial_take_profit,move_stop_to_protect`` mean partial_then_break_even,
+    which is not a whitelisted remediation, so they map to nothing.
+    """
+
+    tokens = {
+        token.strip().lower()
+        for token in str(candidate.management_action or "").split(",")
+        if token.strip()
+    }
+    if not tokens:
+        if str(candidate.event_type or "") == "close_signal":
+            return frozenset({"full_exit"})
+        return None
+    if tokens & _FULL_EXIT_TOKENS:
+        return frozenset({"full_exit"}) if tokens <= _FULL_EXIT_TOKENS else frozenset()
+    has_partial = bool(tokens & _PARTIAL_TOKENS)
+    has_break_even = bool(tokens & _BREAK_EVEN_TOKENS)
+    has_stop = bool(tokens & _STOP_ADJUST_TOKENS)
+    if has_partial and not (has_break_even or has_stop):
+        return frozenset({"partial_take_profit"})
+    if has_partial:
+        return frozenset()
+    if has_break_even:
+        return frozenset({"move_stop_to_break_even"})
+    if has_stop:
+        return frozenset({"adjust_stop_loss"})
+    return None
+
+
+def _main_chain_intent_refusal(
+    session_factory: sessionmaker, *, action: PositionRemediationAction
+) -> str | None:
+    candidate_id = action.evidence.get("candidate_id")
+    with session_factory() as session:
+        batches = (
+            session.query(StrategyManagementBatch.intent, StrategyManagementBatch.recognition_generation)
+            .filter(
+                StrategyManagementBatch.raw_message_id == int(action.raw_message_id),
+                StrategyManagementBatch.target_lifecycle_id == int(action.lifecycle_id),
+            )
+            .all()
+        )
+        main_chain_intents = {
+            str(intent)
+            for intent, generation in batches
+            if intent and not str(generation or "").startswith("remediation:")
+        }
+        if main_chain_intents and main_chain_intents != {action.action_kind}:
+            return "intent_diverges_from_main_chain"
+        candidate = (
+            session.get(SignalCandidate, int(candidate_id)) if candidate_id is not None else None
+        )
+        if candidate is None:
+            return "intent_unverifiable"
+        allowed = _intents_allowed_by_candidate(candidate)
+    if allowed is None:
+        return "intent_unverifiable"
+    if action.action_kind not in allowed:
+        return "intent_diverges_from_main_chain"
+    return None
+
+
 def _run_gate_a(
     session_factory: sessionmaker,
     *,
@@ -818,6 +907,10 @@ def _run_gate_a(
             scope=scope,
             plan=plan,
         )
+
+    intent_refusal = _main_chain_intent_refusal(session_factory, action=action)
+    if intent_refusal is not None:
+        return _GateAResult(ok=False, reason=intent_refusal, check="A6c", scope=scope, plan=plan)
 
     instruction_item_id = action.evidence.get("instruction_item_id")
     if instruction_item_id is not None:
@@ -1939,20 +2032,80 @@ def execute_proposal(
 def _classify_apply_exception(
     session_factory: sessionmaker, *, raw_message_id: int, executing_at: datetime
 ) -> str:
-    """failed if no live batch was ever produced for this message since the
-    execution started; uncertain if one exists (it may have been submitted)."""
+    """Settle an apply() exception as failed or uncertain (spec 8.1).
+
+    ``failed`` means nothing can have reached the exchange: either no batch
+    was ever promoted to live for this message since execution started, or
+    the promoted batch ended ``blocked`` and there is **no write evidence**
+    at all in the execution window -- no leg carrying a request or exchange
+    order id, no position mutation intent, no execution event with a request
+    body for the batch's binding. That is the shape of an executor preflight
+    refusal (e.g. ``protection_rows_unattributed_on_exchange``, raw 19598),
+    which must not trip the auto suspension. Anything else -- a batch in any
+    other state, or any write evidence, or evidence that cannot be read --
+    is ``uncertain``.
+    """
 
     with session_factory() as session:
-        row = (
-            session.query(StrategyManagementBatch.id)
+        batches = (
+            session.query(StrategyManagementBatch)
             .filter(
                 StrategyManagementBatch.raw_message_id == raw_message_id,
                 StrategyManagementBatch.execution_mode == "live",
                 StrategyManagementBatch.updated_at >= executing_at,
             )
-            .first()
+            .all()
         )
-        return "uncertain" if row is not None else "failed"
+        if not batches:
+            return "failed"
+        for batch in batches:
+            if str(batch.status) not in _BATCH_FAILURE_STATUSES:
+                return "uncertain"
+            try:
+                if _batch_has_write_evidence(session, batch=batch, since=executing_at):
+                    return "uncertain"
+            except Exception:  # noqa: BLE001 - unreadable evidence is not "no evidence"
+                return "uncertain"
+        return "failed"
+
+
+def _batch_has_write_evidence(session, *, batch, since: datetime) -> bool:
+    leg_written = (
+        session.query(StrategyManagementLeg.id)
+        .filter(
+            StrategyManagementLeg.management_batch_id == int(batch.id),
+            (
+                StrategyManagementLeg.request_json.is_not(None)
+                | StrategyManagementLeg.exchange_order_id.is_not(None)
+            ),
+        )
+        .first()
+    )
+    if leg_written is not None:
+        return True
+    binding_id = batch.execution_binding_id
+    if binding_id is None:
+        return True  # cannot bound the search: assume a write may have happened
+    intent = (
+        session.query(PositionMutationIntent.id)
+        .filter(
+            PositionMutationIntent.execution_binding_id == int(binding_id),
+            PositionMutationIntent.created_at >= since,
+        )
+        .first()
+    )
+    if intent is not None:
+        return True
+    event = (
+        session.query(ExecutionEvent.id)
+        .filter(
+            ExecutionEvent.execution_binding_id == int(binding_id),
+            ExecutionEvent.created_at >= since,
+            ExecutionEvent.request_json.is_not(None),
+        )
+        .first()
+    )
+    return event is not None
 
 
 _BATCH_SUCCESS_STATUSES = frozenset({"succeeded", "resolved"})
