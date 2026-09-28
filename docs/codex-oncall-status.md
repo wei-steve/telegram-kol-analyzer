@@ -1358,6 +1358,20 @@ auto_trade_switches: untouched
 2. `_classify_apply_exception`：apply 在提升为 live 之后抛错时，应再看批次状态——`blocked` 且无任何 leg 提交 / 无 mutation intent → `failed`，而不是一律 `uncertain`；否则执行器预检类拒绝会误触自动暂停。
 3. D1 读原因时也应识别 `error_json.message` 里的原因码前缀（本条是 `protection_rows_unattributed_on_exchange`，本就不在白名单，结论不变，但当前是靠「没有 reason 键 → 整段不匹配」碰巧挡住的）。
 
+#### 9.4.7.2 P2 待办的修正（2026-09-28，分支 `claude/oncall-remediation-intent-guard`，**未部署**）
+
+候选 `8d8cf6b8`（基于 `origin/main` `f8f060ac`），全量 **10257 passed / 4 skipped / 0 failed**（1000 s）。只改补救代码（`oncall_remediation.py`、`oncall_remediation_auto.py`）与测试，未碰执行器 / `management_directives.py` / 保护归属模块。
+
+1. **A6c 意图一致**：补救动作必须等于同消息同目标的主链路批次 `intent`（排除 `remediation:` 批次），且在源候选 `management_action` 映射出的允许集合内；
+   不一致 → `intent_diverges_from_main_chain`，映射不出 → `intent_unverifiable`。G-C 重跑 G-A 时再查一次。
+   **19598 回放**：保本 + 明确价 → 拒绝，提案文本里不出现 83000。17813 形状的回放同样改为在 G-A 被此规则拒绝。
+   （选择「拒绝」而非「改取策略价 83150」：后者要让补救计划器改用候选的权威动作重算，会碰主链路的意图解析，另议。）
+2. **提升后的失败判定**：批次已 live、状态 `blocked`、且执行时间窗内零写入证据（leg 无请求体 / 订单号、无 mutation intent、无带请求体的执行事件）→ `failed`；
+   其他状态、有任一写入证据、或证据读取出错 → `uncertain`。
+3. **D1**：从 `error_json.message` 取冒号前的原因码（形如 `[a-z][a-z0-9_]*`），自由文本仍整段参与匹配（不会误放行）。
+
+新增 `tests/test_oncall_remediation_intent_guard.py`（25 条）。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
