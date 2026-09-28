@@ -1,16 +1,22 @@
+{% set timeline_scope = timeline_scope or 'group' %}
+{% set is_timeline = timeline_scope == 'all' %}
 <section
   class="panel messages-panel"
   data-messages-panel
   data-layout-scroll-panel
+  data-message-scope="{{ timeline_scope }}"
   data-chat-id="{{ selected_chat_id or 0 }}"
   data-latest-message-id="{{ messages[0].message_id if messages else 0 }}"
+  {% if is_timeline %}data-latest-raw-message-id="{{ latest_raw_message_id if latest_raw_message_id is defined and latest_raw_message_id is not none else (messages[0].raw_message_id if messages else 0) }}"{% endif %}
   data-message-page-size="{{ message_page_size }}"
 >
   <div class="messages-panel-header" data-message-sticky-header>
     <div class="message-sync-meta">
+      {% if not is_timeline %}
       <span>
         最后入库时间：{{ selected_group.last_posted_at.strftime('%Y-%m-%d %H:%M') if selected_group and selected_group.last_posted_at else '暂无数据' }}
       </span>
+      {% endif %}
       <span>
         数据库最新消息时间：{{ database_latest_message_at.strftime('%Y-%m-%d %H:%M') if database_latest_message_at else '暂无数据' }}
       </span>
@@ -32,7 +38,7 @@
         data-new-messages-button
         title="Show newest messages"
         hidden
-      >↑</button>
+      >{% if is_timeline %}有新消息 ↑{% else %}↑{% endif %}</button>
       {% if not live_listener_enabled and live_listener_status_reason and not live_listener_delegated %}
         <span>{{ live_listener_status_reason }}</span>
         {% if session_lock_owner_pid %}
@@ -45,6 +51,7 @@
         {% endif %}
       {% endif %}
     </div>
+    {% if not is_timeline %}
     <details class="message-filter-panel" data-message-filter-panel>
       <summary>筛选</summary>
       <form class="message-filters" data-message-filters>
@@ -72,6 +79,7 @@
         </div>
       </form>
     </details>
+    {% endif %}
     <div class="message-list-controls" data-message-list-controls>
       <button type="button" class="secondary-button" data-message-list-expand-all>展开全部</button>
       <button type="button" class="secondary-button" data-message-list-default>恢复默认</button>
@@ -257,9 +265,20 @@
         data-message-classes-violation="{{ 'true' if message_classes_violations else 'false' }}"
         data-message-class-names="{{ message_class_names | join(',') }}"
         data-message-class-resolutions="{{ message_classes | map(attribute='target') | select | map(attribute='resolution') | select | join(',') if message_classes else '' }}"
+        {% if is_timeline %}data-chat-id="{{ message.chat_id }}"{% endif %}
       >
         <header class="message-card-header">
           <div class="message-heading-main">
+            {% if is_timeline %}
+              <button
+                type="button"
+                class="message-group-badge"
+                data-message-group-jump
+                data-chat-id="{{ message.chat_id }}"
+                style="--group-hue: {{ (message.chat_id * 47) % 360 }}"
+                title="在群组页查看"
+              >{{ (group_names or {}).get(message.chat_id) or ('群 ' ~ message.chat_id) }}</button>
+            {% endif %}
             <span class="message-sender-name">{{ message.sender_name or "Unknown" }}</span>
             <span class="message-posted-at">{{ message.posted_at.strftime('%Y-%m-%d %H:%M') if message.posted_at else '' }}</span>
             <div class="message-collapsed-ai-summary" data-message-collapsed-ai-summary>
@@ -817,8 +836,19 @@
   </div>
 
   {% set next_before_message_id = messages[-1].message_id if messages else None %}
+  {% set next_before_raw_message_id = messages[-1].raw_message_id if messages else None %}
   <div class="message-list-footer" data-message-list-footer>
-    {% if has_more and next_before_message_id %}
+    {% if is_timeline %}
+      {% if has_more and next_before_raw_message_id %}
+        <button
+          type="button"
+          data-load-more
+          data-before-raw-message-id="{{ next_before_raw_message_id }}"
+        >
+          加载更多
+        </button>
+      {% endif %}
+    {% elif has_more and next_before_message_id %}
       <button
         type="button"
         data-load-more

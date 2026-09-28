@@ -1,0 +1,22 @@
+{# ── Cross-group activity timeline shell ──
+   Header + workflow filter nav + the shared _messages.html card list, in
+   timeline mode (show_group_name / timeline_scope set by the caller). #}
+<div class="strategy-detail-shell">
+  <div class="detail-header">
+    <div class="detail-header-info">
+      <h2>全部群组动态</h2>
+    </div>
+  </div>
+
+  <nav class="message-workflow-filters" aria-label="消息筛选">
+    <button type="button" class="is-active" data-message-workflow-filter="all">全部</button>
+    <button type="button" data-message-workflow-filter="recognized">已识别策略</button>
+    <button type="button" data-message-workflow-filter="unrecognized">未识别</button>
+    <button type="button" data-message-workflow-filter="media">图片消息</button>
+    <button type="button" data-message-workflow-filter="abnormal">异常</button>
+  </nav>
+
+  <div class="detail-lower">
+    {% include "_messages.html" %}
+  </div>
+</div>

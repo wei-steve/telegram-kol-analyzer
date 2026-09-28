@@ -3385,6 +3385,41 @@ body {
   line-height: 1.25;
 }
 
+/* Cross-group activity timeline: the group badge is the primary grouping cue
+   (color is secondary -- the text always carries the group name). */
+.message-group-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0 6px 2px 0;
+  padding: 2px 9px;
+  border: 1px solid hsl(var(--group-hue, 210), 55%, 55%);
+  border-radius: 999px;
+  background: hsl(var(--group-hue, 210), 55%, 22%);
+  color: hsl(var(--group-hue, 210), 90%, 90%);
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 45vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.message-group-badge:hover,
+.message-group-badge:focus-visible {
+  background: hsl(var(--group-hue, 210), 60%, 30%);
+  outline: none;
+}
+
+@media (max-width: 640px) {
+  .message-group-badge {
+    max-width: 60vw;
+    font-size: 0.68rem;
+  }
+}
+
 .message-posted-at {
   color: #94a3b8;
   font-size: 0.72rem;

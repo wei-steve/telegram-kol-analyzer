@@ -163,6 +163,44 @@ function getMessagePanel() {
   return document.querySelector('[data-messages-panel]');
 }
 
+// The groups panel's [data-messages-panel] precedes the activity panel's in
+// DOM order, so getMessagePanel() (first-match) always resolves to the
+// groups one. Activity-scoped code must look inside its own panel instead.
+function getActivityDetailPanel() {
+  return document.querySelector('[data-workbench-panel="activity"] [data-detail-panel]');
+}
+
+function getActivityMessagesPanel() {
+  return document.querySelector('[data-workbench-panel="activity"] [data-messages-panel]');
+}
+
+function buildActivityMessagesUrl(beforeRawMessageId) {
+  return `/activity/messages?before_raw_message_id=${beforeRawMessageId}`;
+}
+
+async function loadActivityTimelinePanel() {
+  const detailPanel = getActivityDetailPanel();
+  if (!detailPanel) return false;
+  const html = await fetchWorkbenchHtml('/activity/timeline');
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const fragment = doc.querySelector('.strategy-detail-shell');
+  if (!fragment) throw new Error('动态页返回内容不完整');
+  detailPanel.innerHTML = '';
+  detailPanel.appendChild(fragment);
+  bindWorkflowFilters();
+  bindMessagePanelControls(getActivityMessagesPanel());
+  reapplyCachedMonitorStatus();
+  return true;
+}
+
+async function refreshActivityTimelinePanel({ scrollToTop = false } = {}) {
+  const loaded = await loadActivityTimelinePanel();
+  if (loaded && scrollToTop) {
+    scrollMessagePanelToTop(getActivityMessagesPanel());
+  }
+  return loaded;
+}
+
 function getMessageFilterState(panel = getMessagePanel()) {
   const filterForm = panel ? panel.querySelector('[data-message-filters]') : null;
   if (!panel || !filterForm) {
@@ -325,7 +363,14 @@ function updateMessageInsightView(panel) {
     const contextPart = triggerSummary
       ? `上下文调用 ${contextCalls}（${triggerSummary}）`
       : `上下文调用 ${contextCalls}`;
-    stats.textContent = `已加载 ${cards.length} 条：识别成功 ${recognized} · 平均置信度 ${averageConfidence} · ${contextPart} · 需关注 ${attention} · 已标注 ${labeled} 条`;
+    let loadedPrefix = `已加载 ${cards.length} 条：`;
+    if (panel.dataset.messageScope === 'all') {
+      const distinctChatIds = new Set(
+        cards.map((card) => card.dataset.chatId).filter(Boolean),
+      );
+      loadedPrefix = `已加载 ${cards.length} 条（来自 ${distinctChatIds.size} 个群）：`;
+    }
+    stats.textContent = `${loadedPrefix}识别成功 ${recognized} · 平均置信度 ${averageConfidence} · ${contextPart} · 需关注 ${attention} · 已标注 ${labeled} 条`;
   }
 }
 
@@ -926,20 +971,35 @@ async function loadMoreMessages(panel) {
   const loadMoreButton = panel?.querySelector('[data-load-more]');
   if (!loadMoreButton || loadMoreButton.dataset.loading === 'true') return;
 
-  const { chatId, searchText, senderName } = getMessageFilterState(panel);
-  const beforeMessageId = Number(loadMoreButton.dataset.beforeMessageId || '0');
-  if (!chatId || !beforeMessageId) return;
+  const isTimeline = panel.dataset.messageScope === 'all';
+  let chatId = 0;
+  let fetchNextPanel;
+  if (isTimeline) {
+    const beforeRawMessageId = Number(loadMoreButton.dataset.beforeRawMessageId || '0');
+    if (!beforeRawMessageId) return;
+    fetchNextPanel = async () => {
+      const html = await fetchWorkbenchHtml(buildActivityMessagesUrl(beforeRawMessageId));
+      return new DOMParser().parseFromString(html, 'text/html').querySelector('[data-messages-panel]');
+    };
+  } else {
+    const filterState = getMessageFilterState(panel);
+    chatId = filterState.chatId;
+    const beforeMessageId = Number(loadMoreButton.dataset.beforeMessageId || '0');
+    if (!chatId || !beforeMessageId) return;
+    fetchNextPanel = () => fetchMessagePanel(chatId, {
+      beforeMessageId,
+      searchText: filterState.searchText,
+      senderName: filterState.senderName,
+    });
+  }
 
   loadMoreButton.dataset.loading = 'true';
   loadMoreButton.disabled = true;
   loadMoreButton.textContent = '加载中…';
   try {
-    const nextPanel = await fetchMessagePanel(chatId, {
-      beforeMessageId,
-      searchText,
-      senderName,
-    });
-    if (!panel.isConnected || Number(panel.dataset.chatId || '0') !== chatId) return;
+    const nextPanel = await fetchNextPanel();
+    if (!panel.isConnected) return;
+    if (!isTimeline && Number(panel.dataset.chatId || '0') !== chatId) return;
 
     const nextList = nextPanel?.querySelector('[data-message-list]');
     const currentList = panel.querySelector('[data-message-list]');
@@ -968,10 +1028,20 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   bindMessageInsightControls(panel);
   bindRecognitionLabelControls(panel);
 
+  const isTimelinePanel = panel.dataset.messageScope === 'all';
   const scrollContainer = getMessageScrollContainer(panel);
   if (scrollContainer && scrollContainer.dataset.messageScrollBound !== 'true') {
     scrollContainer.dataset.messageScrollBound = 'true';
     scrollContainer.addEventListener('scroll', () => {
+      // hasDeferredMessageRefresh is the single-group deferred-refresh flag;
+      // the timeline panel has its own new-message signal (compared against
+      // data-latest-raw-message-id in refreshFromDatabaseChanges) and must
+      // never trigger refreshCurrentGroupPanel, which targets the *groups*
+      // panel's detail container.
+      if (isTimelinePanel) {
+        if (isMessagePanelAtTop(panel)) setNewMessagesButtonVisible(panel, false);
+        return;
+      }
       if (isMessagePanelAtTop(panel) && hasDeferredMessageRefresh) {
         hasDeferredMessageRefresh = false;
         setNewMessagesButtonVisible(panel, false);
@@ -1005,19 +1075,36 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
     newMessagesButton.addEventListener('click', async () => {
       newMessagesButton.disabled = true;
       try {
-        hasDeferredMessageRefresh = false;
-        setNewMessagesButtonVisible(panel, false);
-        await refreshCurrentGroupPanel({
-          force: true,
-          scrollToTopAfterRefresh: true,
-          showStatus: false,
-        });
-        await refreshGroupList();
+        if (isTimelinePanel) {
+          setNewMessagesButtonVisible(panel, false);
+          await refreshActivityTimelinePanel({ scrollToTop: true });
+        } else {
+          hasDeferredMessageRefresh = false;
+          setNewMessagesButtonVisible(panel, false);
+          await refreshCurrentGroupPanel({
+            force: true,
+            scrollToTopAfterRefresh: true,
+            showStatus: false,
+          });
+          await refreshGroupList();
+        }
       } finally {
         newMessagesButton.disabled = false;
       }
     });
   }
+
+  panel.querySelectorAll('[data-message-group-jump]').forEach((button) => {
+    if (button.dataset.groupJumpBound === 'true') return;
+    button.dataset.groupJumpBound = 'true';
+    button.addEventListener('click', async () => {
+      const chatId = Number(button.dataset.chatId || '0');
+      setWorkbenchView('groups');
+      await ensureWorkbenchViewLoaded('groups');
+      const link = chatId ? document.querySelector(`[data-group-link][data-chat-id="${chatId}"]`) : null;
+      if (link) link.click();
+    });
+  });
 
   panel.querySelectorAll('[data-message-card-toggle]').forEach((button) => {
     if (button.dataset.messageCardToggleBound === 'true') {
@@ -1159,7 +1246,11 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
         if (status) {
           status.textContent = `识别完成：${payload.status}`;
         }
-        await refreshSelectedGroupPanel();
+        if (isTimelinePanel) {
+          await refreshActivityTimelinePanel();
+        } else {
+          await refreshSelectedGroupPanel();
+        }
       } catch {
         if (status) {
           status.textContent = '识别失败，请检查服务状态。';
@@ -1240,9 +1331,10 @@ function bindGroupLinks() {
       hasDeferredMessageRefresh = false;
       const filterInput = document.querySelector('[data-strategy-filter-input]');
       const filter = filterInput ? filterInput.value : 'holding';
-      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView === 'activity'
-        ? 'activity'
-        : 'groups';
+      // Clicking a group always targets the groups view destination now: the
+      // activity timeline is a global cross-group view, unaffected by which
+      // group is selected on the groups page.
+      const activeView = 'groups';
       const detailPanel = getDetailPanelForWorkbenchView(activeView);
       const strategyPanel = document.querySelector('[data-strategy-panel]');
       const detailPromise = activeView === 'groups'
@@ -1416,7 +1508,9 @@ function bindGroupPromptEditor() {
 }
 
 function workbenchLoadKey(view) {
-  if (view === 'activity' || view === 'groups' || view === 'management-batches') {
+  // Activity is the global cross-group timeline now -- it does not depend on
+  // which group is selected, so it always shares the 'global' key.
+  if (view === 'groups' || view === 'management-batches') {
     return String(getSelectedChatId() || 0);
   }
   return 'global';
@@ -1453,16 +1547,9 @@ function showWorkbenchLoadError(view, error, retryLoader = null) {
 }
 
 function showActivityBootstrapError(error) {
-  showWorkbenchLoadError('activity', error, retryActivityAfterGroups);
-}
-
-async function retryActivityAfterGroups() {
-  const groupsLoaded = await ensureWorkbenchViewLoaded('groups', { force: true });
-  if (!groupsLoaded || !getSelectedChatId()) {
-    showActivityBootstrapError(new Error('群组加载失败或暂无可用群组'));
-    return false;
-  }
-  return ensureWorkbenchViewLoaded('activity', { force: true });
+  // The activity timeline is global now -- it no longer bootstraps through
+  // the groups view, so retrying it just reloads /activity/timeline itself.
+  showWorkbenchLoadError('activity', error, () => ensureWorkbenchViewLoaded('activity', { force: true }));
 }
 
 function showDashboardPanelLoadError(tab, error) {
@@ -2124,13 +2211,9 @@ async function ensureWorkbenchViewLoaded(view, options = {}) {
     } else if (view === 'groups') {
       loaded = await loadGroupsPanel();
     } else if (view === 'activity') {
-      const groupsLoaded = await ensureWorkbenchViewLoaded('groups');
-      if (!groupsLoaded || !getSelectedChatId()) {
-        showActivityBootstrapError(new Error('群组加载失败或暂无可用群组'));
-        if (container) container.setAttribute('aria-busy', 'false');
-        return false;
-      }
-      loaded = await loadSelectedGroupDestination(view);
+      // Global cross-group timeline: no dependency on the groups view or the
+      // selected group (see docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md).
+      loaded = await loadActivityTimelinePanel();
     } else if (view === 'more') {
       await loadMorePanel();
     }
@@ -4927,6 +5010,28 @@ function hasNewerSelectedMessage(snapshot, previousSnapshot) {
   return currentMessageId > previousMessageId || currentRawMessageId > previousRawMessageId;
 }
 
+// Baseline is the timeline panel's own data-latest-raw-message-id (set from
+// max(id) when /activity/timeline was rendered -- see
+// load_latest_raw_message_id in web_queries.py), never the newest *loaded*
+// card: reconcile can back-fill a late message with a larger id but an
+// older posted_at, so the newest-loaded card's id can already be behind
+// max(id) right after a fresh load. Runs on every poll where the activity
+// view is showing, independent of whether the global snapshot just changed,
+// so switching into the activity view later still reflects messages that
+// arrived while the user was elsewhere. Uses only the already-fetched
+// snapshot -- no extra request.
+function checkActivityTimelineFreshness(snapshot) {
+  const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
+  if (activeView !== 'activity') return;
+  const timelinePanel = getActivityMessagesPanel();
+  if (!timelinePanel) return;
+  const latestKnown = Number(timelinePanel.dataset.latestRawMessageId || '0');
+  const latestGlobal = Number(snapshot?.global?.raw_message_id || 0);
+  if (latestGlobal > latestKnown) {
+    setNewMessagesButtonVisible(timelinePanel, true);
+  }
+}
+
 async function refreshFromDatabaseChanges() {
   let snapshot = null;
   try {
@@ -4937,6 +5042,7 @@ async function refreshFromDatabaseChanges() {
 
   if (!latestFreshnessSnapshot) {
     latestFreshnessSnapshot = snapshot;
+    checkActivityTimelineFreshness(snapshot);
     return;
   }
 
@@ -4946,6 +5052,8 @@ async function refreshFromDatabaseChanges() {
     snapshotKey(snapshot, 'selected') !== snapshotKey(latestFreshnessSnapshot, 'selected');
   const selectedHasNewerMessage = hasNewerSelectedMessage(snapshot, latestFreshnessSnapshot);
   latestFreshnessSnapshot = snapshot;
+
+  checkActivityTimelineFreshness(snapshot);
 
   if (globalChanged || selectedChanged) {
     noteStrategyRecordChanges();

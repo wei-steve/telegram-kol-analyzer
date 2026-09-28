@@ -495,6 +495,153 @@ def load_group_message_page(
         )
 
 
+def load_timeline_message_page(
+    session_factory: sessionmaker,
+    *,
+    page_size: int,
+    before_raw_message_id: int | None = None,
+    include_recognition_labels: bool = False,
+    model_labels: Mapping[str, str] | None = None,
+) -> tuple[list[dict[str, object | None]], bool]:
+    """Load one cross-group timeline page ordered by (posted_at DESC, id DESC).
+
+    Unlike ``load_group_message_page`` this is not scoped to a single
+    ``chat_id``: it walks ``raw_messages`` globally, newest first, using the
+    global auto-increment primary key ``id`` (not the per-chat
+    ``message_id``) as the tie-breaker, since ``message_id`` numbering is
+    private to each chat and cannot arbitrate order across chats.
+
+    The cursor is a single ``raw_messages.id``. The server looks up that
+    row's ``posted_at`` and continues strictly before it in
+    ``(posted_at DESC, id DESC)`` order. If the cursor row no longer exists
+    (e.g. retention cleanup), this returns an empty page with
+    ``has_more=False`` rather than raising.
+    """
+
+    with session_factory() as session:
+        if before_raw_message_id is None:
+            # First page: no WHERE clause needed. SQLite sorts NULL
+            # posted_at last on a DESC index walk, so this already puts the
+            # NULL tail after every dated row without a second query.
+            raw_messages = (
+                session.query(RawMessage)
+                .order_by(RawMessage.posted_at.desc(), RawMessage.id.desc())
+                .limit(page_size + 1)
+                .all()
+            )
+        else:
+            cursor_row = (
+                session.query(RawMessage.posted_at)
+                .filter(RawMessage.id == before_raw_message_id)
+                .first()
+            )
+            if cursor_row is None:
+                return ([], False)
+            cursor_posted_at = cursor_row[0]
+            if cursor_posted_at is None:
+                # The cursor itself is in the NULL-posted_at tail: continue
+                # only within that tail, ordered by id desc.
+                raw_messages = (
+                    session.query(RawMessage)
+                    .filter(
+                        RawMessage.posted_at.is_(None),
+                        RawMessage.id < before_raw_message_id,
+                    )
+                    .order_by(RawMessage.id.desc())
+                    .limit(page_size + 1)
+                    .all()
+                )
+            else:
+                # Deliberately NOT one OR'd query here (e.g.
+                # `posted_at < ? OR (posted_at = ? AND id < ?)`). SQLite's
+                # query planner fixes the plan at *prepare* time, before
+                # parameter values are bound -- and the app always executes
+                # through SQLAlchemy with bound `?` parameters, never
+                # literal SQL. Verified directly (capturing the real SQL and
+                # parameters this function sends to the DBAPI cursor, then
+                # running EXPLAIN QUERY PLAN against that exact
+                # statement+params): with an OR across the posted_at
+                # equality/inequality branches, SQLite cannot estimate
+                # selectivity for the unbound `?` values and falls back to
+                # `SCAN ... USING INDEX ix_raw_messages_posted_at` -- an
+                # ordered walk from the newest row, so a deep page visits
+                # O(offset) index entries. Confirmed at the sqlite3 CLI with
+                # literal values substituted in, that same OR'd query *does*
+                # show `SEARCH ... (posted_at<?)` -- but that is not what
+                # this function ever actually runs, so it is not the number
+                # that matters.
+                #
+                # Splitting into two single-condition queries instead keeps
+                # each one a plain equality-or-inequality range that SQLite
+                # always turns into an index SEARCH regardless of binding:
+                # first the remainder of the cursor's own (posted_at, id)
+                # bucket (posted_at == cursor AND id < cursor_id, ordered by
+                # id desc), then -- only once that bucket is exhausted on
+                # this page -- older rows (posted_at < cursor, ordered
+                # normally). The NULL tail is appended last of all, only
+                # once the older-rows query also runs dry.
+                same_bucket_rows = (
+                    session.query(RawMessage)
+                    .filter(
+                        RawMessage.posted_at == cursor_posted_at,
+                        RawMessage.id < before_raw_message_id,
+                    )
+                    .order_by(RawMessage.id.desc())
+                    .limit(page_size + 1)
+                    .all()
+                )
+                raw_messages = same_bucket_rows
+                if len(raw_messages) < page_size + 1:
+                    remaining = page_size + 1 - len(raw_messages)
+                    older_rows = (
+                        session.query(RawMessage)
+                        .filter(RawMessage.posted_at < cursor_posted_at)
+                        .order_by(RawMessage.posted_at.desc(), RawMessage.id.desc())
+                        .limit(remaining)
+                        .all()
+                    )
+                    raw_messages = raw_messages + older_rows
+                if len(raw_messages) < page_size + 1:
+                    # Dated rows (bucket + older) ran out on this page: this
+                    # is the only place the NULL tail can start, so append
+                    # it (a cheap point query -- production has 0 such rows).
+                    remaining = page_size + 1 - len(raw_messages)
+                    null_tail = (
+                        session.query(RawMessage)
+                        .filter(RawMessage.posted_at.is_(None))
+                        .order_by(RawMessage.id.desc())
+                        .limit(remaining)
+                        .all()
+                    )
+                    raw_messages = raw_messages + null_tail
+
+        has_more = len(raw_messages) > page_size
+        return (
+            _serialize_raw_messages(
+                session,
+                raw_messages[:page_size],
+                include_recognition_labels=include_recognition_labels,
+                model_labels=model_labels,
+            ),
+            has_more,
+        )
+
+
+def load_latest_raw_message_id(session_factory: sessionmaker) -> int:
+    """Return ``max(raw_messages.id)``, or 0 if the table is empty.
+
+    Used as the cross-group activity timeline's "new message" baseline
+    instead of the newest-loaded card's id: reconcile can back-fill a
+    late-arriving message with a larger ``id`` but an older ``posted_at``,
+    so ``messages[0].raw_message_id`` right after a fresh load can already
+    be behind ``max(id)``. This is a direct rowid lookup on the integer
+    primary key (SQLite resolves it via a seek, not a table scan).
+    """
+
+    with session_factory() as session:
+        return int(session.query(func.max(RawMessage.id)).scalar() or 0)
+
+
 def load_selected_messages(
     session_factory: sessionmaker,
     *,

@@ -364,6 +364,8 @@ from telegram_kol_research.web_queries import (
     load_group_messages,
     load_group_rows,
     load_home_event_rows,
+    load_latest_raw_message_id,
+    load_timeline_message_page,
     list_execution_strategy_overview,
     load_lifecycle_counts,
     load_lifecycle_counts_by_chat_id,
@@ -1817,6 +1819,30 @@ def _group_label_by_chat_id(group_config: GroupConfig) -> dict[int, str]:
         for item in group_config.groups
         if item.chat_id is not None
     }
+
+
+def _timeline_group_names_by_chat_id(
+    group_config: GroupConfig,
+    group_labels_by_title: dict[str, str] | None = None,
+) -> dict[int, str]:
+    """Build a display-name map for the cross-group activity timeline.
+
+    Purely in-memory from ``group_config`` -- no DB aggregate query. Mirrors
+    the label resolution ``load_group_rows`` applies to a *configured* group:
+    ``custom_group_label`` or ``chat_title``, mapped through
+    ``group_labels_by_title`` (raw title -> display label). A chat with rows
+    in ``raw_messages`` but no matching entry here falls back to
+    ``f"群 {chat_id}"`` in the template.
+    """
+
+    label_map = group_labels_by_title or {}
+    names: dict[int, str] = {}
+    for item in group_config.groups:
+        if item.chat_id is None:
+            continue
+        raw_title = item.custom_group_label or item.chat_title
+        names[int(item.chat_id)] = label_map.get(raw_title, raw_title)
+    return names
 
 
 def _strategy_record_api_sort_key(record: dict[str, object]) -> tuple[int, float, int]:
@@ -10575,6 +10601,97 @@ def create_web_app(
             "text_provider": _provider_config_response(config.text_provider),
             "image_provider": _provider_config_response(config.image_provider),
         }
+
+    def _activity_page_context(
+        *,
+        messages: list[dict[str, object | None]],
+        has_more: bool,
+        timeline_scope: str = "all",
+        latest_raw_message_id: int | None = None,
+    ) -> dict[str, object]:
+        """Shared template context for the cross-group activity timeline.
+
+        Read-only; mirrors the fields ``/groups/{chat_id}/messages`` passes,
+        minus the single-group filter fields it doesn't need.
+        """
+        monitor_status = build_monitor_status()
+        freshness = load_database_freshness(
+            app.state.session_factory,
+            now=app.state.now_provider(),
+        )
+        group_names = _timeline_group_names_by_chat_id(
+            app.state.group_config, app.state.group_labels_by_title
+        )
+        return {
+            "messages": messages,
+            "has_more": has_more,
+            "message_page_size": MESSAGE_PAGE_SIZE,
+            "selected_chat_id": 0,
+            "selected_group": None,
+            "search_text": "",
+            "sender_name": "",
+            "before_message_id": None,
+            "show_group_name": True,
+            "timeline_scope": timeline_scope,
+            "group_names": group_names,
+            "latest_raw_message_id": latest_raw_message_id,
+            "live_listener_enabled": monitor_status["state"] == "monitoring",
+            "monitor_status": monitor_status,
+            "live_listener_status_reason": app.state.live_listener_status_reason,
+            "live_listener_delegated": app.state.live_listener_delegated,
+            "database_latest_message_at": freshness["latest_message_at"],
+            "database_stale_hours": freshness["stale_hours"],
+            "refresh_mode_label": (
+                "实时监听 + SSE"
+                if monitor_status["state"] == "monitoring"
+                else "仅本地快照"
+            ),
+        }
+
+    @app.get("/activity/timeline")
+    def activity_timeline(request: Request):
+        """Cross-group activity timeline shell: header + first page of cards.
+
+        Read-only; shows every chat with rows in ``raw_messages``, newest
+        first by (posted_at, id) -- see
+        docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md.
+        """
+        messages, has_more = load_timeline_message_page(
+            app.state.session_factory,
+            page_size=MESSAGE_PAGE_SIZE,
+            include_recognition_labels=app.state.runtime_role in {"all", "web"},
+            model_labels=_ai_model_labels(app.state.ai_recognition_config_path),
+        )
+        latest_raw_message_id = load_latest_raw_message_id(app.state.session_factory)
+        return templates.TemplateResponse(
+            request,
+            "_activity_timeline.html",
+            _activity_page_context(
+                messages=messages,
+                has_more=has_more,
+                latest_raw_message_id=latest_raw_message_id,
+            ),
+        )
+
+    @app.get("/activity/messages")
+    def activity_messages(request: Request, before_raw_message_id: int | None = None):
+        """Next cross-group timeline page (load-more).
+
+        Same fragment shape as ``/groups/{chat_id}/messages``: renders
+        ``_messages.html`` directly for the caller to splice into the list.
+        """
+        messages, has_more = load_timeline_message_page(
+            app.state.session_factory,
+            page_size=MESSAGE_PAGE_SIZE,
+            before_raw_message_id=before_raw_message_id,
+            include_recognition_labels=app.state.runtime_role in {"all", "web"},
+            model_labels=_ai_model_labels(app.state.ai_recognition_config_path),
+        )
+        return templates.TemplateResponse(
+            request,
+            "_messages.html",
+            _activity_page_context(messages=messages, has_more=has_more),
+        )
 
     @app.get("/groups/{chat_id}/messages")
     def group_messages(

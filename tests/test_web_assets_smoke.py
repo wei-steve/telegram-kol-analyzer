@@ -142,7 +142,11 @@ def test_management_batch_assets_only_load_read_only_api(tmp_path):
     assert "view === 'management-batches'" in js
     assert "group-context-success" in js
     assert "ensureWorkbenchViewLoaded('management-batches', { force: true })" in js
-    assert "view === 'activity' || view === 'groups' || view === 'management-batches'" in js
+    # 2026-09-28: workbenchLoadKey('activity') became a fixed 'global' key
+    # since the activity view is now a cross-group timeline, not scoped to
+    # the selected group -- see
+    # docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md.
+    assert "view === 'groups' || view === 'management-batches'" in js
     assert "method: 'POST'" not in management_slice
     assert "management-batch-card" in css
     for forbidden in ("retryManagementBatch", "closeManagementBatch", "cancelManagementBatch"):
@@ -1955,13 +1959,21 @@ def test_workbench_loader_returns_explicit_success_for_every_path(tmp_path):
 
 
 def test_activity_and_settings_failures_keep_a_visible_retry_surface(tmp_path):
+    # 2026-09-28: the activity view became a global cross-group timeline that
+    # no longer bootstraps through the groups view (see
+    # docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md). The old
+    # assertions here encoded the retired bootstrap chain -- a dedicated
+    # retryActivityAfterGroups() that reloaded 'groups' first and only then
+    # 'activity', and an ensureWorkbenchViewLoaded('activity') branch that
+    # bailed out via `if (!groupsLoaded || !getSelectedChatId())`. Both are
+    # gone: retrying activity now just reloads /activity/timeline directly.
     js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
         "/static/app.js"
     ).text
 
-    activity_start = js.index("async function retryActivityAfterGroups")
-    activity_end = js.index("\nasync function ", activity_start + 1)
-    activity_retry = js[activity_start:activity_end]
+    activity_error_start = js.index("function showActivityBootstrapError")
+    activity_error_end = js.index("\nfunction ", activity_error_start + 1)
+    activity_error_block = js[activity_error_start:activity_error_end]
     ensure_start = js.index("async function ensureWorkbenchViewLoaded")
     ensure_end = js.index("\nasync function focusRequestedPosition", ensure_start)
     ensure_block = js[ensure_start:ensure_end]
@@ -1972,10 +1984,12 @@ def test_activity_and_settings_failures_keep_a_visible_retry_surface(tmp_path):
     bind_end = js.index("\nfunction bindWorkbenchNavigation", bind_start)
     bind_block = js[bind_start:bind_end]
 
-    assert "ensureWorkbenchViewLoaded('groups', { force: true })" in activity_retry
-    assert "ensureWorkbenchViewLoaded('activity', { force: true })" in activity_retry
+    assert "async function retryActivityAfterGroups" not in js
+    assert "ensureWorkbenchViewLoaded('activity', { force: true })" in activity_error_block
+    assert "showWorkbenchLoadError('activity'" in activity_error_block
+    assert "loaded = await loadActivityTimelinePanel();" in ensure_block
+    assert "if (!groupsLoaded || !getSelectedChatId())" not in ensure_block
     assert "showActivityBootstrapError" in ensure_block
-    assert "if (!groupsLoaded || !getSelectedChatId())" in ensure_block
     assert "const moreLoaded = await ensureWorkbenchViewLoaded('more')" in settings_block
     assert "const targetPanel = document.querySelector" in settings_block
     assert "if (!moreLoaded || !targetPanel)" in settings_block
@@ -2040,7 +2054,14 @@ def test_app_js_does_not_cache_stale_group_destination_as_loaded(tmp_path):
     assert visible_block.count("return true") >= 2
     assert "committed = await loadVisibleGroupDestination" in selected_block
     assert "if (!committed) return false" in selected_block
-    assert "loaded = await loadSelectedGroupDestination(view)" in ensure_block
+    # 2026-09-28: the 'activity' branch used to be
+    # `loaded = await loadSelectedGroupDestination(view)` (it bootstrapped
+    # through the selected group). Activity is now a global cross-group
+    # timeline with its own loader, loadActivityTimelinePanel(), but the same
+    # "don't cache a failed load as loaded" guard still applies via the
+    # shared `if (!loaded)` check below -- see
+    # docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md.
+    assert "loaded = await loadActivityTimelinePanel();" in ensure_block
     assert "if (!loaded)" in ensure_block
 
 
@@ -2103,7 +2124,14 @@ def test_app_js_routes_group_detail_updates_to_the_active_workbench_panel(tmp_pa
     group_link_start = js.index("function bindGroupLinks")
     group_link_end = js.index("\nasync function ", group_link_start + 1)
     group_link_block = js[group_link_start:group_link_end]
-    assert "activeView = document.querySelector" in group_link_block
+    # 2026-09-28: clicking a group used to target whichever of 'groups' /
+    # 'activity' was on screen (`activeView = document.querySelector(...) ===
+    # 'activity' ? 'activity' : 'groups'`). Activity is now a global
+    # cross-group timeline unaffected by group selection, so this always
+    # targets 'groups' -- see
+    # docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md.
+    assert "const activeView = 'groups';" in group_link_block
+    assert "activeView = document.querySelector" not in group_link_block
     assert "const detailPanel = getDetailPanelForWorkbenchView(activeView);" in group_link_block
     assert "document.querySelector('[data-detail-panel]')" not in group_link_block
 
@@ -2247,3 +2275,74 @@ def test_live_action_confirmation_clears_stale_return_value_before_opening(tmp_p
     assert response.status_code == 200
     assert "dialog.returnValue = '';" in response.text
     assert response.text.index("dialog.returnValue = '';") < response.text.index("dialog.showModal();")
+
+
+def test_activity_timeline_js_uses_its_own_panel_and_scope_aware_paging(tmp_path):
+    """The 2026-09-28 cross-group timeline design (see
+    docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md) requires
+    activity-scoped code to look inside its own [data-messages-panel]
+    (getMessagePanel() resolves to the *groups* panel's, since it precedes
+    the activity one in DOM order), to page via /activity/messages using
+    before_raw_message_id (not the single-group before_message_id), and to
+    show a per-group count in the stats line.
+    """
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    assert "function getActivityMessagesPanel" in js
+    assert "[data-workbench-panel=\"activity\"] [data-messages-panel]" in js
+
+    load_more_start = js.index("async function loadMoreMessages")
+    load_more_end = js.index("\nfunction bindMessagePanelControls", load_more_start)
+    load_more_block = js[load_more_start:load_more_end]
+    assert "panel.dataset.messageScope === 'all'" in load_more_block
+    assert "buildActivityMessagesUrl(beforeRawMessageId)" in load_more_block
+    assert "loadMoreButton.dataset.beforeRawMessageId" in load_more_block
+
+    insight_start = js.index("function updateMessageInsightView")
+    insight_end = js.index("\nfunction ", insight_start + 1)
+    insight_block = js[insight_start:insight_end]
+    assert "来自 ${distinctChatIds.size} 个群" in insight_block
+
+
+def test_activity_timeline_freshness_check_runs_every_poll_not_only_on_global_change(tmp_path):
+    """Review finding (2026-09-28): the new-message hint must be evaluated
+    on every refreshFromDatabaseChanges() poll while the activity view is
+    showing, not only inside `if (globalChanged)` -- otherwise a message
+    that arrives while the user is on another view never surfaces the
+    button after switching to 动态. checkActivityTimelineFreshness() must
+    also use the panel's own data-latest-raw-message-id baseline (set from
+    max(id) server-side, not the newest *loaded* card) so a reconcile
+    back-fill (larger id, older posted_at) doesn't make the button appear
+    and never clear.
+    """
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+    assert "function checkActivityTimelineFreshness" in js
+    check_start = js.index("function checkActivityTimelineFreshness")
+    check_end = js.index("\nasync function refreshFromDatabaseChanges", check_start)
+    check_block = js[check_start:check_end]
+    assert "getActivityMessagesPanel()" in check_block
+    assert "timelinePanel.dataset.latestRawMessageId" in check_block
+    assert "snapshot?.global?.raw_message_id" in check_block
+    assert "setNewMessagesButtonVisible(timelinePanel, true)" in check_block
+
+    refresh_start = js.index("async function refreshFromDatabaseChanges")
+    refresh_end = js.index("\nfunction connectLiveUpdates", refresh_start)
+    refresh_block = js[refresh_start:refresh_end]
+    # Called once when the baseline snapshot is first captured, and again on
+    # every later poll -- never gated behind `if (globalChanged)`.
+    assert refresh_block.count("checkActivityTimelineFreshness(snapshot)") == 2
+    global_changed_start = refresh_block.index("if (globalChanged) {")
+    global_changed_end = refresh_block.index("\n  }", global_changed_start)
+    global_changed_block = refresh_block[global_changed_start:global_changed_end]
+    assert "checkActivityTimelineFreshness" not in global_changed_block
+
+
+# Route-level coverage for the max(id) baseline (not messages[0]'s id) lives
+# in tests/test_web_activity_timeline.py::
+# test_activity_timeline_new_message_baseline_is_max_id_not_newest_loaded_card,
+# alongside load_latest_raw_message_id()'s own EXPLAIN-plan tests.
