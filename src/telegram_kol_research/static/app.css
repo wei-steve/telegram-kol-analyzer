@@ -3405,6 +3405,10 @@ body {
   max-width: 45vw;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* .message-heading-main is a grid: keep the badge its own width, on its
+     own row, so the collapsed two-column layout (time | summary) is intact. */
+  justify-self: start;
+  grid-column: 1 / -1;
 }
 
 .message-group-badge:hover,

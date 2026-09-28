@@ -1,7 +1,7 @@
 # 「动态」页改为跨群时间线 — 设计稿
 
 日期：2026-09-28（调研于 2026-09-27，生产 HEAD 4ff0d43c）
-状态：**待用户确认**（确认前不写代码）
+状态：用户 2026-09-28 确认第 7 节全部采用推荐项；已实施，候选待部署
 风险级别：L1（只读页面改动，不碰识别 / 执行 / 交易所；无 schema 变更）
 
 ## 1. 现状（读代码得到的事实）
@@ -57,6 +57,8 @@ SEARCH raw_messages USING COVERING INDEX ix_raw_messages_posted_at (posted_at<?)
 - 能不排序的原因：`ix_raw_messages_posted_at` 是单列索引，SQLite 的普通索引隐含带 rowid，而 `id` 就是 rowid，所以 `(posted_at, id)` 的顺序索引里已经有了。对照组：沿用 `message_id` 当平局裁决会出现 `USE TEMP B-TREE FOR LAST TERM OF ORDER BY`——这是改用 `id` 的第二个理由。
 - 生产 `posted_at IS NULL` 的行数为 0（按索引点查得到），游标不需要处理 NULL。代码里仍对 NULL 行做兜底：它们排在最后，并且不能作为游标。
 - 生产没有 `sqlite_stat1`，计划不受统计信息漂移影响。
+
+**实施中的更正（2026-09-28，已在生产只读复核）**：上面的计划是在 sqlite3 命令行里用**字面值**跑出来的，结论对应用本身不成立。应用经 SQLAlchemy 执行，传的是**绑定参数** `?`；SQLite 在 prepare 阶段就定下计划，这时还看不到参数值。用 `.parameter set` 绑定参数后，同一条 `posted_at < ?1 OR (posted_at = ?2 AND id < ?3)` 在生产上是 `SCAN raw_messages USING COVERING INDEX ix_raw_messages_posted_at`：从最新一行按索引顺序往下走，翻得越深走得越多。所以实现把翻页拆成两条单条件查询：先取游标所在时刻内剩余的行（`posted_at = ? AND id < ?`，计划为 `SEARCH ... (posted_at=? AND rowid<?)`），不够一页再取更早的行（`posted_at < ?`，计划为 `SEARCH ... (posted_at<?)`），最后才补 `posted_at IS NULL` 的尾巴。测试拦截点是应用真正发给数据库驱动的 SQL 和参数，不是字面值版本。子代理先把 OR 形式放回去，确认这条测试会失败，再恢复修复。
 
 **不需要新索引，没有 schema 变更。** 实现时加一条测试：对真实编译出的 SQL 跑 `EXPLAIN QUERY PLAN`，断言走 `ix_raw_messages_posted_at`、没有裸 `SCAN raw_messages`、没有 `TEMP B-TREE`，防止以后有人改排序键时悄悄退化成全表扫描。
 
