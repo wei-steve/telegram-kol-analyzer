@@ -797,7 +797,12 @@ _FUTURE_TAKE_PROFIT_LEVEL_RE = re.compile(
     r"([0-9]+(?:\.\d+)?)附近[^0-9%％]{0,8}止盈"
     r"|到([0-9]+(?:\.\d+)?)[^0-9%％]{0,8}止盈"
     r"|([0-9]+(?:\.\d+)?)位置[^0-9%％]{0,8}止盈"
-    r"|([0-9]+(?:\.\d+)?)止盈"
+    # The bare form has no qualifier of its own, so it must not read an
+    # ordinal ("第1止盈位到了") or a take-profit-stage label ("TP1止盈") as a
+    # price: 2026-09-29 coordinator review, both would otherwise plan a
+    # legitimate immediate partial close as a "future level" and the planner
+    # guardrail would wrongly block it (>0.3% from any real price).
+    r"|(?<![第A-Za-z])([0-9]+(?:\.\d+)?)止盈"
 )
 #: Q5/7.1: these say "reduce now", so a future-level match beside one of them
 #: is not this guardrail's business -- ordinary planning handles it.

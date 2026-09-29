@@ -5297,6 +5297,210 @@ def test_raw_15402_signature_number_keeps_its_own_high_severity_disposition(
 # --- 2026-09-29 Mia design, M2 guardrail (Q5/7.1): future price level -----
 
 
+class _TickerDeepcoin(_ReadOnlyDeepcoin):
+    """Like ``_ReadOnlyDeepcoin`` but with a controllable ticker quote.
+
+    ``_ReadOnlyDeepcoin.get_ticker_quote`` deliberately raises, because
+    ordinary planning must never read a volatile ticker. The M2 guardrail is
+    the one narrow exception (2026-09-29 coordinator review): it reads price
+    only after it has already found a future level in the message text, so
+    a real quote is needed here to replay both sides of that check through
+    the actual planner.
+    """
+
+    def __init__(self, positions, *, tpsl_orders=None, ticker_price):
+        super().__init__(positions, tpsl_orders=tpsl_orders)
+        self._ticker_price = ticker_price
+
+    def get_ticker_quote(self, *, inst_id):
+        self.ticker_reads.append(inst_id)
+        return {
+            "price": self._ticker_price,
+            "price_field": "last",
+            "instrument_id": inst_id,
+            "observed_at": PLANNED_AT.isoformat(),
+        }
+
+
+#: #19670 real production text (大漂亮, BTC 空单, 2026-09-29 01:16Z), used
+#: unchanged by both guardrail-replay tests below -- only the ticker price
+#: differs between them.
+_M2_19670_TEXT = (
+    "\U0001f9db‍♂️分析师—#Nick "
+    "空单已经入场，最高上冲84300附近，"
+    "有入场可以继续轻仓持有，"
+    "82500附近可以止盈30%先 @Tarderfengge QQ:158241758"
+)
+
+
+def _persist_19670_fixture(session_factory):
+    """The #19670 shape with complete, verified protection already in place.
+
+    Shared by both guardrail-replay tests so the only difference between
+    them is the ticker price -- matching the ARCHITECTURE.md #6 rule that a
+    gate-passing claim needs the same fixture with just the deciding
+    condition flipped.
+    """
+
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=0.3,
+        side="short",
+        pos_ids=("pos-b",),
+        management_text=_M2_19670_TEXT,
+    )
+    _persist_open_protection_incident(session_factory, binding_id=binding_id)
+    _persist_complete_current_protection(
+        session_factory, binding_id=binding_id, side="short", size="10"
+    )
+    return raw_id, lifecycle_id, binding_id
+
+
+def test_m2_guardrail_19670_real_replay_blocks_when_price_is_84000(
+    monkeypatch, tmp_path
+):
+    """#19670 real replay: current price 84000, >0.3% from the named 82500.
+
+    Unlike the unavailable-ticker test below, this uses a real quote so the
+    deviation arithmetic itself is exercised end to end through the actual
+    planner, not just the pure function.
+    """
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _lifecycle_id, _binding_id = _persist_19670_fixture(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+    client = _TickerDeepcoin(
+        [_position("pos-b", size="10", avg_px="84000", side="short")],
+        tpsl_orders=_complete_current_tpsl(side="short", size="10"),
+        ticker_price="84000",
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "partial_take_profit_future_level"
+    assert client.write_calls == []
+    assert client.ticker_reads == ["BTC-USDT-SWAP"]
+    with session_factory() as session:
+        from telegram_kol_research.models import RuntimeIncident
+
+        incidents = (
+            session.query(RuntimeIncident)
+            .filter_by(
+                incident_type=(
+                    "management_partial_take_profit_future_level_blocked"
+                )
+            )
+            .all()
+        )
+    assert len(incidents) == 1
+    incident = incidents[0]
+    assert incident.severity == "high"
+    summary = json.loads(incident.redacted_summary)
+    assert summary["raw_message_id"] == raw_id
+    assert summary["operation"] == f"raw_message_{raw_id}"
+    assert summary["reason_code"] == "partial_take_profit_future_level"
+
+
+def test_m2_guardrail_19670_real_replay_allows_when_price_is_82550(
+    monkeypatch, tmp_path
+):
+    """Same fixture as the blocking test above; only the ticker price moves.
+
+    82550 is within 0.3% of the named 82500 (deviation ~0.06%), so the
+    guardrail must not fire and planning must proceed to a ready batch with
+    the ordinary partial-take-profit fields.
+    """
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _lifecycle_id, _binding_id = _persist_19670_fixture(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+    client = _TickerDeepcoin(
+        [_position("pos-b", size="10", avg_px="84000", side="short")],
+        tpsl_orders=_complete_current_tpsl(side="short", size="10"),
+        ticker_price="82550",
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.batch.intent == "partial_take_profit"
+    assert result.batch.effective_action == "partial_close"
+    assert result.batch.legs[0].planned_close_size == "3"
+    assert client.ticker_reads == ["BTC-USDT-SWAP"]
+    with session_factory() as session:
+        from telegram_kol_research.models import RuntimeIncident
+
+        incidents = (
+            session.query(RuntimeIncident)
+            .filter_by(
+                incident_type=(
+                    "management_partial_take_profit_future_level_blocked"
+                )
+            )
+            .all()
+        )
+    assert incidents == []
+
+
+def test_m2_guardrail_pure_function_treats_a_ten_times_off_level_as_not_a_price():
+    """2026-09-29 coordinator review: a >10x-off bare number is not a price.
+
+    Same construction as the pure-function tolerance test below; only the
+    message and the ticker price differ. A bare "1止盈50%" (no ordinal, no
+    stage label, so it still matches the bare branch) next to a market at
+    84000 is off by ten thousand times -- management_price_plausibility's
+    own threshold -- so the guardrail must stand aside rather than block a
+    legitimate partial close over a stray number.
+    """
+
+    planner = _planner()
+
+    class _Identity:
+        def __init__(self, raw_message, lifecycle):
+            self.raw_message = raw_message
+            self.lifecycle = lifecycle
+
+    class _RawMessage:
+        text = "1止瘀50%"
+
+    class _Lifecycle:
+        symbol = "BTC"
+
+    class _MarketTicker:
+        def get_ticker_quote(self, *, inst_id):
+            return {"price": "84000"}
+
+    def refuse_any_session():
+        raise AssertionError("must not persist a batch when the guardrail allows")
+
+    result = planner._reject_partial_take_profit_future_level(
+        refuse_any_session,
+        identity=_Identity(_RawMessage(), _Lifecycle()),
+        raw_message_id=1,
+        deepcoin_client=_MarketTicker(),
+        planned_at=PLANNED_AT,
+        execution_mode="live",
+    )
+    assert result is None
+
+
 def test_m2_guardrail_blocks_a_future_level_partial_take_profit(monkeypatch, tmp_path):
     """#19670 shape, replayed through the real planner.
 

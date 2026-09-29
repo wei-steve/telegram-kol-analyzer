@@ -108,6 +108,7 @@ from telegram_kol_research.management_add_position_rejection import (
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.management_price_plausibility import (
     dispose_pending_break_even_prices,
+    price_is_implausible,
     record_price_disposed,
     record_price_implausible,
     sanitize_management_prices,
@@ -2777,6 +2778,13 @@ def _reject_partial_take_profit_future_level(
                 current_price = parsed
         except (InvalidOperation, TypeError, ValueError):
             current_price = None
+    if current_price is not None and price_is_implausible(level, current_price):
+        # 2026-09-29 coordinator review: a bare-number match more than 10x
+        # away from the market (management_price_plausibility's own
+        # threshold) is not a price at all -- a stray count or id the regex
+        # still let through -- so this guardrail has nothing to check and
+        # must not block a legitimate immediate close over it.
+        return None
     deviation_pct: str | None = None
     within_tolerance = False
     if current_price is not None:
@@ -2813,6 +2821,8 @@ def _reject_partial_take_profit_future_level(
             {
                 "component": "strategy_management_planner",
                 "reason_code": "partial_take_profit_future_level",
+                "raw_message_id": int(raw_message_id),
+                "operation": f"raw_message_{int(raw_message_id)}",
             }
         ),
         occurred_at=planned_at,

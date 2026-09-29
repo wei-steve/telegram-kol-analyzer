@@ -1197,3 +1197,20 @@ def test_m2_guardrail_negative_profit_points_is_reduce_now() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "第1止盈位到了，止盈50%",
+        "TP1止盈50%",
+        "第一止盈位到了，止盈50%",
+    ],
+)
+def test_m2_guardrail_negative_ordinal_or_stage_label_is_not_a_bare_price(text) -> None:
+    # 2026-09-29 coordinator review: the bare-number branch has no qualifier
+    # of its own, so an ordinal ("第1") or a take-profit-stage label ("TP1")
+    # must not be read as a price -- both would otherwise plan a legitimate
+    # immediate partial close as a "future level" and get blocked by the
+    # planner guardrail for being >0.3% from any real price.
+    assert future_take_profit_level(text) is None
+
+
