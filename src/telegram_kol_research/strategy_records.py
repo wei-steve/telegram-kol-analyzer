@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 from types import MappingProxyType
-from typing import Iterable
+from typing import Collection, Iterable
 from urllib.parse import urlencode
 
 from sqlalchemy import and_, case, exists, func, or_, select
@@ -258,6 +258,123 @@ ATTENTION_LABELS = MappingProxyType(
         "take_profit_convergence_conflicted": ("warning", "分段止盈需人工复核"),
     }
 )
+
+POSITIONS_HREF = "/?view=positions"
+TRACK_ONLY_LABEL = "仅跟踪，不下单"
+# Reasons that only describe the Deepcoin snapshot being unreadable. They are
+# surfaced as a page banner, never as something the user can act on.
+NON_ACTIONABLE_ATTENTION_CODES = frozenset({"exchange_unavailable"})
+_POSITION_ATTRIBUTION_CODES = frozenset(
+    {"unattributed_position", "attribution_ambiguous", "attribution_conflict"}
+)
+_TAKE_PROFIT_MANAGEMENT_CODES = frozenset(
+    {
+        "management_unconfirmed",
+        "management_blocked",
+        "management_execution_drift",
+        "protection_mismatch",
+        "take_profit_convergence_unknown",
+        "take_profit_convergence_conflicted",
+    }
+)
+_RECOGNITION_ATTENTION_CODES = frozenset(
+    {"recognition_failed", "recognition_evidence_missing", "recognition_disagreement"}
+)
+
+
+def is_finished_lifecycle_state(state: object) -> bool:
+    return str(state or "").strip().lower() in FINISHED_LIFECYCLE_STATUSES
+
+
+def actionable_attention_reasons(
+    reasons: Iterable[dict[str, object]],
+    *,
+    lifecycle_state: object,
+    has_live_position: bool,
+) -> list[dict[str, object]]:
+    """Reasons the user can still act on right now.
+
+    ``attention_reasons`` stays the full history.  A finished strategy with no
+    live position has nothing left to act on, whatever it once tripped over.
+    """
+
+    if is_finished_lifecycle_state(lifecycle_state) and not has_live_position:
+        return []
+    return [
+        reason
+        for reason in reasons
+        if str(reason.get("code") or "") not in NON_ACTIONABLE_ATTENTION_CODES
+    ]
+
+
+def _action_for_reason(
+    reason: dict[str, object],
+    *,
+    lifecycle_state: str,
+    has_live_position: bool,
+) -> dict[str, object]:
+    code = str(reason.get("code") or "")
+    href_positions = POSITIONS_HREF
+    if code == "missing_stop":
+        text, href = "需要你：给这个仓位补止损，或手动平仓", href_positions
+    elif code == "unattributed_position":
+        text, href = (
+            "需要你：确认这是不是你手动开的仓；不是就去持仓页处理",
+            href_positions,
+        )
+    elif code in {"attribution_conflict", "attribution_ambiguous", "binding_without_lifecycle"}:
+        text, href = "需要你：去持仓页确认这个仓位属于哪条策略", href_positions
+    elif code in _TAKE_PROFIT_MANAGEMENT_CODES and has_live_position:
+        text, href = (
+            "需要你：在 Deepcoin 看一下止盈止损单是否挂着，和卡片列的价位对一下",
+            href_positions,
+        )
+    elif code in {"entered_without_binding", "position_missing"}:
+        text, href = (
+            "需要你：去 Deepcoin 看是否真有这个仓位；没有就不用管，系统会在策略过期后自动收掉",
+            href_positions,
+        )
+    elif lifecycle_state == "pending_entry" and code in _RECOGNITION_ATTENTION_CODES:
+        text, href = "需要你：看一眼原消息，判断要不要手动跟；系统不会替你下单", None
+    elif lifecycle_state == "pending_entry" and code == "execution_failed":
+        text, href = "需要你：看失败原因；多数不用管，想跟就手动下", None
+    else:
+        text, href = "需要你：打开详情核对", None
+    return {
+        "code": code,
+        "severity": str(reason.get("severity") or ""),
+        "label": str(reason.get("label") or ""),
+        "action_text": text,
+        "action_href": href,
+    }
+
+
+def compute_action_required(
+    record: dict[str, object],
+) -> dict[str, object] | None:
+    """The single most severe thing the user can still do for this record."""
+
+    reasons = record.get("attention_reasons")
+    reasons = reasons if isinstance(reasons, list) else []
+    has_live = bool(
+        record.get("binding_live")
+        or record.get("real_position") is not None
+        or record.get("real_positions")
+    )
+    lifecycle_state = str(record.get("lifecycle_state") or "").strip().lower()
+    actionable = actionable_attention_reasons(
+        reasons, lifecycle_state=lifecycle_state, has_live_position=has_live
+    )
+    if not actionable:
+        return None
+    top = min(
+        actionable,
+        key=lambda item: ATTENTION_SEVERITY_RANK.get(str(item.get("severity")), 3),
+    )
+    return _action_for_reason(
+        top, lifecycle_state=lifecycle_state, has_live_position=has_live
+    )
+
 
 _FAILED_RECOGNITION_STATUSES = frozenset(
     {"failed", "failure", "error", "识别失败"}
@@ -2260,8 +2377,14 @@ def load_strategy_record_summaries(
     live_binding_only: bool = False,
     limit: int | None = 100,
     now: datetime | None = None,
+    auto_trade_chat_ids: Collection[int] | None = None,
 ) -> list[dict[str, object]]:
-    """Return batched strategy summaries without mutating trading state."""
+    """Return batched strategy summaries without mutating trading state.
+
+    ``auto_trade_chat_ids`` lists the chats whose current trading mode places
+    orders.  ``None`` keeps the historical behaviour (every chat trades); a
+    collection makes ``entered_without_binding`` apply only to those chats.
+    """
 
     if filter_name not in {
         "needs_attention",
@@ -2269,6 +2392,7 @@ def load_strategy_record_summaries(
         "executing",
         "pending_entry",
         "finished",
+        "other",
     }:
         raise ValueError(f"unsupported strategy record filter: {filter_name}")
     if limit is not None and limit <= 0:
@@ -2289,6 +2413,12 @@ def load_strategy_record_summaries(
         elif filter_name == "executing":
             lifecycle_query = lifecycle_query.filter(
                 StrategyLifecycle.lifecycle_status == "entered"
+            )
+        elif filter_name == "other":
+            lifecycle_query = lifecycle_query.filter(
+                func.coalesce(StrategyLifecycle.lifecycle_status, "").not_in(
+                    FINISHED_LIFECYCLE_STATUSES | {"entered", "pending_entry"}
+                )
             )
         binding_scope_predicates = [
             ExecutionBinding.id == StrategyLifecycle.execution_binding_id
@@ -2332,18 +2462,21 @@ def load_strategy_record_summaries(
             )
         if filter_name == "needs_attention":
             lifecycle_query, severity_expression, latest_expression = (
-                _attention_lifecycle_query(lifecycle_query)
+                _attention_lifecycle_query(
+                    lifecycle_query, auto_trade_chat_ids=auto_trade_chat_ids
+                )
             )
             lifecycle_query = lifecycle_query.order_by(
                 severity_expression,
                 latest_expression.desc(),
                 StrategyLifecycle.id.desc(),
             )
-        elif filter_name in {"executing", "pending_entry", "finished"}:
+        elif filter_name in {"executing", "pending_entry", "finished", "other"}:
             lifecycle_query, severity_expression, latest_expression = (
                 _attention_lifecycle_query(
                     lifecycle_query,
                     only_attention=False,
+                    auto_trade_chat_ids=auto_trade_chat_ids,
                 )
             )
             lifecycle_query = lifecycle_query.order_by(
@@ -2621,14 +2754,26 @@ def load_strategy_record_summaries(
             events=lifecycle_events,
             management_batches=batches,
             take_profit_convergences=take_profit_convergences_by_binding_id.get(int(binding.id), []) if binding else [],
+            auto_trade_chat_ids=auto_trade_chat_ids,
         )
         attention = min(
             attention_reasons,
             key=lambda item: ATTENTION_SEVERITY_RANK[str(item["severity"])],
             default=None,
         )
-        if filter_name == "needs_attention" and attention is None:
+        binding_live = _is_live_binding(binding)
+        if filter_name == "needs_attention" and not actionable_attention_reasons(
+            attention_reasons,
+            lifecycle_state=lifecycle.lifecycle_status,
+            has_live_position=binding_live,
+        ):
             continue
+        track_only = (
+            auto_trade_chat_ids is not None
+            and int(lifecycle.chat_id) not in auto_trade_chat_ids
+            and str(lifecycle.lifecycle_status or "").lower() == "entered"
+            and not binding_live
+        )
 
         latest_changed_at = _latest_timestamp(
             lifecycle,
@@ -2696,6 +2841,9 @@ def load_strategy_record_summaries(
                 "attention": attention,
                 "attention_reasons": attention_reasons,
                 "latest_changed_at": latest_changed_at,
+                "signal_at": _as_utc(lifecycle.signal_at),
+                "binding_live": binding_live,
+                "track_only": track_only,
                 "detail_href": f"/strategy-records/{int(lifecycle.id)}",
             }
         )
@@ -2716,35 +2864,25 @@ def count_strategy_records(
     session_factory,
     *,
     chat_id: int | None = None,
+    auto_trade_chat_ids: Collection[int] | None = None,
 ) -> dict[str, int]:
-    """Count lifecycle-backed records without materializing projection rows."""
+    """Count lifecycle-backed records without materializing projection rows.
+
+    These are the SQL-only counts.  ``needs_attention`` here cannot see the
+    exchange snapshot, and the status buckets cannot see real positions; the
+    web layer adjusts both from the enriched records so every count equals the
+    number of cards its filter pages through.
+    """
 
     with session_factory() as session:
         base = session.query(StrategyLifecycle)
         if chat_id is not None:
             base = base.filter(StrategyLifecycle.chat_id == chat_id)
         all_count = base.count()
-        attention_query, _severity, _latest = _attention_lifecycle_query(base)
+        attention_query, _severity, _latest = _attention_lifecycle_query(
+            base, auto_trade_chat_ids=auto_trade_chat_ids
+        )
         needs_attention_count = attention_query.with_entities(
-            func.count(func.distinct(StrategyLifecycle.id))
-        ).scalar() or 0
-        base_exchange_applicable = or_(
-            StrategyLifecycle.execution_binding_id.is_(None),
-            exists().where(
-                ExecutionBinding.id == StrategyLifecycle.execution_binding_id,
-                func.lower(func.trim(func.coalesce(ExecutionBinding.venue, "")))
-                == "deepcoin",
-            ),
-        )
-        joined_exchange_applicable = or_(
-            StrategyLifecycle.execution_binding_id.is_(None),
-            func.lower(func.trim(func.coalesce(ExecutionBinding.venue, "")))
-            == "deepcoin",
-        )
-        exchange_applicable_count = base.filter(base_exchange_applicable).count()
-        attention_exchange_applicable_count = attention_query.filter(
-            joined_exchange_applicable
-        ).with_entities(
             func.count(func.distinct(StrategyLifecycle.id))
         ).scalar() or 0
         state_counts = dict(
@@ -2756,22 +2894,19 @@ def count_strategy_records(
             .all()
         )
 
-    normalized = {
-        str(state or "").strip().lower(): int(count)
-        for state, count in state_counts.items()
-    }
+    normalized: dict[str, int] = defaultdict(int)
+    for state, count in state_counts.items():
+        normalized[str(state or "").strip().lower()] += int(count)
+    executing = normalized.get("entered", 0)
+    pending = normalized.get("pending_entry", 0)
+    finished = sum(normalized.get(state, 0) for state in FINISHED_LIFECYCLE_STATUSES)
     return {
         "all": int(all_count),
         "needs_attention": int(needs_attention_count),
-        "executing": normalized.get("entered", 0),
-        "pending_entry": normalized.get("pending_entry", 0),
-        "finished": sum(
-            normalized.get(state, 0) for state in FINISHED_LIFECYCLE_STATUSES
-        ),
-        "_exchange_applicable": int(exchange_applicable_count),
-        "_attention_exchange_applicable": int(
-            attention_exchange_applicable_count
-        ),
+        "executing": executing,
+        "pending_entry": pending,
+        "finished": finished,
+        "other": int(all_count) - executing - pending - finished,
     }
 
 
@@ -2950,6 +3085,8 @@ def enrich_strategy_records_with_exchange(
                     positions=unmatched_positions,
                 )
             )
+    for record in enriched:
+        record["action_required"] = compute_action_required(record)
     return enriched
 
 
@@ -3280,7 +3417,12 @@ def _add_exchange_attention(
     )
 
 
-def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
+def _attention_lifecycle_query(
+    lifecycle_query,
+    *,
+    only_attention: bool = True,
+    auto_trade_chat_ids: Collection[int] | None = None,
+):
     """Add SQL attention predicates so filtering happens before ``LIMIT``."""
 
     lifecycle_query = (
@@ -3331,6 +3473,15 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
         StrategyLifecycle.lifecycle_status == "entered",
         ~binding_is_live,
     )
+    if auto_trade_chat_ids is not None:
+        # notify_only groups never place orders: an entered strategy without a
+        # position is by design there, not an attention reason.
+        entered_without_binding = and_(
+            entered_without_binding,
+            StrategyLifecycle.chat_id.in_(
+                [int(chat_id) for chat_id in auto_trade_chat_ids]
+            ),
+        )
     missing_stop = and_(
         StrategyLifecycle.lifecycle_status == "entered",
         binding_is_live,
@@ -3408,7 +3559,15 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
         func.coalesce(latest_management_at, epoch),
     )
     if only_attention:
+        # A finished strategy with no live binding has nothing left to act on.
+        still_actionable = or_(
+            func.coalesce(StrategyLifecycle.lifecycle_status, "").not_in(
+                FINISHED_LIFECYCLE_STATUSES
+            ),
+            binding_is_live,
+        )
         lifecycle_query = lifecycle_query.filter(
+            still_actionable,
             or_(
                 critical,
                 management_unconfirmed,
@@ -3416,7 +3575,7 @@ def _attention_lifecycle_query(lifecycle_query, *, only_attention: bool = True):
                 take_profit_unknown,
                 take_profit_conflicted,
                 recognition_disagreement,
-            )
+            ),
         )
     return lifecycle_query, severity_expression, latest_expression
 
@@ -3469,6 +3628,7 @@ def _attention_reasons(
     events: list[ExecutionEvent],
     management_batches: list[StrategyManagementBatch],
     take_profit_convergences: list[TriggerTakeProfitConvergence] = (),
+    auto_trade_chat_ids: Collection[int] | None = None,
 ) -> list[dict[str, str]]:
     codes: list[str] = []
     if (
@@ -3490,7 +3650,14 @@ def _attention_reasons(
         codes.append("recognition_disagreement")
 
     binding_is_live = _is_live_binding(binding)
-    if lifecycle.lifecycle_status == "entered" and not binding_is_live:
+    if (
+        lifecycle.lifecycle_status == "entered"
+        and not binding_is_live
+        and (
+            auto_trade_chat_ids is None
+            or int(lifecycle.chat_id) in auto_trade_chat_ids
+        )
+    ):
         codes.append("entered_without_binding")
     if (
         lifecycle.lifecycle_status == "entered"

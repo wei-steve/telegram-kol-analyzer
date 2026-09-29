@@ -281,6 +281,7 @@ from telegram_kol_research.source_message_deletion_worker import (
 from telegram_kol_research.strategy_records import (
     count_strategy_records,
     enrich_strategy_records_with_exchange,
+    is_finished_lifecycle_state,
     load_live_bindings_without_lifecycle,
     load_strategy_record_detail,
     load_strategy_record_summaries,
@@ -1866,7 +1867,7 @@ def _timeline_group_names_by_chat_id(
 
 
 def _strategy_record_api_sort_key(record: dict[str, object]) -> tuple[int, float, int]:
-    attention = record.get("attention")
+    attention = record.get("action_required") or record.get("attention")
     severity = (
         str(attention.get("severity") or "")
         if isinstance(attention, dict)
@@ -1894,7 +1895,83 @@ STRATEGY_RECORD_FILTERS = {
     "executing",
     "pending_entry",
     "finished",
+    "other",
 }
+_STRATEGY_STATE_LABELS = {
+    "lifecycle": {
+        "expired": "已过期",
+        "exited": "已离场",
+        "entered": "已入场",
+        "pending_entry": "待入场",
+        "invalidated": "已作废",
+        "cancelled": "已取消",
+        "rejected": "已拒绝",
+        "finished": "已结束",
+        "exchange_only": "仅交易所仓位",
+        "binding_without_lifecycle": "缺少策略记录",
+    },
+    "execution": {
+        "not_started": "未下单",
+        "open": "持仓中",
+        "active": "持仓中",
+        "closed": "已平仓",
+        "failed": "失败",
+        "rejected": "失败",
+        "error": "失败",
+        "live_position": "持仓中",
+    },
+    "attribution": {
+        "unbound": "未关联仓位",
+        "live_bound": "有真实仓位",
+        "bound_non_live": "仓位已结束",
+        "bound": "已关联仓位",
+        "unassigned": "未归属",
+        "ambiguous": "归属不唯一",
+        "conflict": "归属冲突",
+    },
+    "recognition": {
+        "failed": "识别失败",
+        "failure": "识别失败",
+        "error": "识别失败",
+        "识别失败": "识别失败",
+        "legacy": "旧流程",
+        "unknown": "未知",
+        "not_applicable": "不适用",
+    },
+}
+
+
+def _strategy_state_label(value: object, kind: str) -> str:
+    """Chinese label for a strategy state code; unknown codes are shown raw."""
+
+    text = str(value if value is not None else "")
+    return _STRATEGY_STATE_LABELS.get(kind, {}).get(text.strip().lower(), text)
+
+
+def _strategy_local_time(value: object) -> str:
+    """``MM-DD HH:mm`` in Asia/Shanghai, or an empty string when unknown."""
+
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return ""
+    if not isinstance(value, datetime):
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(DEFAULT_LOCAL_TIMEZONE).strftime("%m-%d %H:%M")
+
+
+STRATEGY_RECORD_STATUS_BUCKETS = ("executing", "pending_entry", "finished", "other")
+
+
+def _strategy_record_has_real_position(record: dict[str, object]) -> bool:
+    return record.get("real_position") is not None or bool(record.get("real_positions"))
+
+
+def _strategy_record_is_exchange_only(record: dict[str, object]) -> bool:
+    return record.get("lifecycle_id") is None
 
 
 def _strategy_record_matches_filter(
@@ -1902,30 +1979,34 @@ def _strategy_record_matches_filter(
     *,
     filter_name: str,
 ) -> bool:
-    """Apply mobile record filters only after exchange enrichment."""
+    """Apply mobile record filters only after exchange enrichment.
+
+    The four status buckets partition ``all``: a record with a real position or
+    without a lifecycle is executing; otherwise its lifecycle state decides.
+    """
 
     if filter_name == "all":
         return True
     if filter_name == "needs_attention":
-        return record.get("attention") is not None
+        return record.get("action_required") is not None
 
     lifecycle_state = str(record.get("lifecycle_state") or "").strip().lower()
+    executing = (
+        _strategy_record_is_exchange_only(record)
+        or lifecycle_state == "entered"
+        or _strategy_record_has_real_position(record)
+    )
+    if filter_name == "executing":
+        return executing
+    if executing:
+        return False
     if filter_name == "pending_entry":
         return lifecycle_state == "pending_entry"
     if filter_name == "finished":
-        return lifecycle_state in {
-            "cancelled",
-            "exited",
-            "expired",
-            "finished",
-            "invalidated",
-            "rejected",
-        }
-    if filter_name == "executing":
-        return (
-            lifecycle_state == "entered"
-            or record.get("real_position") is not None
-            or bool(record.get("real_positions"))
+        return is_finished_lifecycle_state(lifecycle_state)
+    if filter_name == "other":
+        return lifecycle_state != "pending_entry" and not is_finished_lifecycle_state(
+            lifecycle_state
         )
     return False
 
@@ -7490,6 +7571,8 @@ def create_web_app(
 
 
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
+    templates.env.filters["strategy_state_label"] = _strategy_state_label
+    templates.env.filters["strategy_local_time"] = _strategy_local_time
     app.mount(
         "/static",
         StaticFiles(directory=str(Path(__file__).parent / "static")),
@@ -8656,6 +8739,14 @@ def create_web_app(
         page: int = 1,
     ) -> dict[str, Any]:
         group_labels = _group_label_by_chat_id(app.state.group_config)
+        # Only auto_trade groups place orders; everywhere else "entered without a
+        # position" is by design and is not an attention reason.
+        auto_trade_chat_ids = {
+            int(group.chat_id)
+            for group in app.state.group_config.groups
+            if group.chat_id is not None
+            and str(group.trading_mode or "") == "auto_trade"
+        }
         # One request owns one read-only, already-annotated exchange snapshot.
         # Enrichment below is pure and never calls Deepcoin from a record loop.
         positions_context = build_positions_panel_context()
@@ -8672,10 +8763,13 @@ def create_web_app(
         # live binding is not mislabeled as an orphan due to the recent bound.
         scan_limit = max(200, page * limit)
         recent_limit = scan_limit
-        local_attention_limit = scan_limit
+        # After the actionable rule the needs-attention set is small (unfinished
+        # strategies plus live positions), so it is loaded whole and counted from
+        # the very same rows the list pages through.
+        local_attention_limit = None
         lifecycle_page_filter = (
             filter_name
-            if filter_name in {"executing", "pending_entry", "finished"}
+            if filter_name in {"executing", "pending_entry", "finished", "other"}
             else "all"
         )
         recent_records = load_strategy_record_summaries(
@@ -8685,6 +8779,7 @@ def create_web_app(
             chat_id=chat_id,
             limit=recent_limit,
             now=app.state.now_provider(),
+            auto_trade_chat_ids=auto_trade_chat_ids,
         )
         local_attention_records = load_strategy_record_summaries(
             app.state.session_factory,
@@ -8693,6 +8788,7 @@ def create_web_app(
             chat_id=chat_id,
             limit=local_attention_limit,
             now=app.state.now_provider(),
+            auto_trade_chat_ids=auto_trade_chat_ids,
         )
         current_live_binding_records = load_strategy_record_summaries(
             app.state.session_factory,
@@ -8702,6 +8798,7 @@ def create_web_app(
             live_binding_only=True,
             limit=None,
             now=app.state.now_provider(),
+            auto_trade_chat_ids=auto_trade_chat_ids,
         )
         orphan_live_binding_records = load_live_bindings_without_lifecycle(
             app.state.session_factory,
@@ -8717,6 +8814,7 @@ def create_web_app(
                 pos_ids=exchange_pos_ids,
                 limit=None,
                 now=app.state.now_provider(),
+                auto_trade_chat_ids=auto_trade_chat_ids,
             )
             if exchange_pos_ids
             else []
@@ -8749,59 +8847,44 @@ def create_web_app(
         ]
         enriched.sort(key=_strategy_record_api_sort_key)
 
+        # One source of truth: every count below is derived from the same
+        # matcher the list uses, so a count always equals the number of cards
+        # its filter pages through.  SQL only supplies the bulk status totals;
+        # records that enrichment moves between buckets (real positions, records
+        # without a lifecycle) are corrected from the enriched rows.
         summary_counts = count_strategy_records(
             app.state.session_factory,
             chat_id=chat_id,
+            auto_trade_chat_ids=auto_trade_chat_ids,
         )
-        exchange_applicable_count = summary_counts.pop("_exchange_applicable")
-        attention_exchange_applicable_count = summary_counts.pop(
-            "_attention_exchange_applicable"
-        )
-        lifecycle_sources = {
-            int(row["lifecycle_id"]): row
-            for row in [
-                *local_attention_records,
-                *current_live_binding_records,
-                *current_position_records,
-                *recent_records,
-            ]
-            if row.get("lifecycle_id") is not None
-        }
-        enriched_by_lifecycle_id = {
-            int(row["lifecycle_id"]): row
-            for row in unfiltered_enriched
-            if row.get("lifecycle_id") is not None
-        }
-        if exchange_snapshot.get("error"):
-            summary_counts["needs_attention"] += (
-                exchange_applicable_count - attention_exchange_applicable_count
-            )
-        else:
-            summary_counts["needs_attention"] += sum(
-                1
-                for lifecycle_id, row in enriched_by_lifecycle_id.items()
-                if row.get("attention") is not None
-                and lifecycle_sources.get(lifecycle_id, {}).get("attention") is None
-            )
-        for name in STRATEGY_RECORD_FILTERS - {"all", "needs_attention"}:
-            summary_counts[name] += sum(
-                1
-                for lifecycle_id, row in enriched_by_lifecycle_id.items()
-                if _strategy_record_matches_filter(row, filter_name=name)
-                and not _strategy_record_matches_filter(
-                    lifecycle_sources.get(lifecycle_id, {}),
-                    filter_name=name,
-                )
-            )
         synthetic_records = [
             row for row in unfiltered_enriched if row.get("lifecycle_id") is None
         ]
-        for name in STRATEGY_RECORD_FILTERS:
-            summary_counts[name] += sum(
-                1
-                for row in synthetic_records
-                if _strategy_record_matches_filter(row, filter_name=name)
-            )
+        summary_counts["all"] += len(synthetic_records)
+        summary_counts["executing"] += len(synthetic_records)
+        for row in unfiltered_enriched:
+            if row.get("lifecycle_id") is None:
+                continue
+            lifecycle_state = str(row.get("lifecycle_state") or "").strip().lower()
+            if lifecycle_state == "entered" or not _strategy_record_has_real_position(
+                row
+            ):
+                continue
+            # SQL counted this lifecycle by status; enrichment says it is
+            # running because a real position exists.
+            if lifecycle_state == "pending_entry":
+                source_bucket = "pending_entry"
+            elif is_finished_lifecycle_state(lifecycle_state):
+                source_bucket = "finished"
+            else:
+                source_bucket = "other"
+            summary_counts[source_bucket] -= 1
+            summary_counts["executing"] += 1
+        summary_counts["needs_attention"] = sum(
+            1
+            for row in unfiltered_enriched
+            if _strategy_record_matches_filter(row, filter_name="needs_attention")
+        )
 
         start = (page - 1) * limit
         page_records = enriched[start : start + limit]

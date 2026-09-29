@@ -2364,16 +2364,19 @@ def test_strategy_records_api_preserves_exchange_error_as_unknown(tmp_path):
             database_path=database_path,
             deepcoin_client_factory=BrokenDeepcoinClient,
         )
-    ).get("/api/strategy-records")
+    ).get("/api/strategy-records", params={"filter_name": "all"})
 
     assert response.status_code == 200
     payload = response.json()
     record = payload["records"][0]
     assert record["exchange_state"] == "unknown"
     assert record["real_position"] is None
+    # The history keeps the reason, but an unreadable snapshot is a banner,
+    # not something the user can act on, so it no longer inflates the count.
     assert record["attention"]["code"] == "exchange_unavailable"
+    assert record["action_required"] is None
     assert payload["summary_counts"]["all"] == 1
-    assert payload["summary_counts"]["needs_attention"] == 1
+    assert payload["summary_counts"]["needs_attention"] == 0
 
 
 def test_strategy_records_api_exposes_safe_exchange_error_with_empty_database(tmp_path):

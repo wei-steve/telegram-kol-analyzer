@@ -1157,7 +1157,7 @@ def test_exchange_unavailable_is_explicit_and_not_treated_as_empty(tmp_path):
 
     assert list_response.status_code == 200
     assert 'data-exchange-state="unknown"' in list_response.text
-    assert "Deepcoin 仓位快照暂不可用" in list_response.text
+    assert "Deepcoin 暂时连不上，仓位相关检查暂停" in list_response.text
     assert 'data-exchange-state="unknown"' in detail_response.text
     assert "secret-exchange-error" not in list_response.text
     assert "secret-exchange-error" not in detail_response.text

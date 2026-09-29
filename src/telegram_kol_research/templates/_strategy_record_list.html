@@ -10,9 +10,8 @@
   <section class="home-dashboard strategy-record-list" data-strategy-record-list data-strategy-record-limit="{{ applied_limit }}" data-strategy-record-page="{{ applied_page }}">
   <header class="panel panel-heading">
     <div>
-      <small>实盘观察台</small>
       <h1>策略记录</h1>
-      <p>从 AI 识别到实际持仓，每条记录都保留完整归属证据。</p>
+      <p>每一条被识别成交易策略的喊单都在这里，能看到它有没有真的下单、现在走到哪一步。平时不用管；「需要你处理」里出现卡片时，照卡片上写的去做就行。</p>
     </div>
     <button type="button" class="secondary-button" data-strategy-record-refresh>刷新</button>
   </header>
@@ -42,25 +41,36 @@
 
     {% if exchange_state == "unknown" %}
       <aside class="home-priority-risk" role="status">
-        <span>{{ exchange_message }}</span>
+        <span>Deepcoin 暂时连不上，仓位相关检查暂停</span>
         <strong>归属未确认</strong>
       </aside>
     {% endif %}
 
-    <nav class="strategy-workflow-filters" aria-label="策略筛选">
+    {% set scope_query = ("&amp;chat_id=" ~ applied_chat_id) if applied_chat_id is not none else "" %}
+    <div class="strategy-record-needs-you {% if summary_counts.needs_attention %}is-hot{% else %}is-quiet{% endif %}">
+      <a
+        href="/strategy-records?filter=needs_attention{{ scope_query|safe }}&amp;limit={{ applied_limit }}&amp;page=1"
+        data-strategy-record-filter="needs_attention"
+        {% if applied_filter == "needs_attention" %}aria-current="page" class="is-active"{% endif %}
+      >需要你处理 {{ summary_counts.needs_attention }}</a>
+    </div>
+
+    <nav class="strategy-workflow-filters" aria-label="状态筛选">
     {% set filter_labels = {
-      "needs_attention": "待处理",
       "all": "全部",
       "executing": "执行中",
       "pending_entry": "待入场",
-      "finished": "已结束"
+      "finished": "已结束",
+      "other": "其他"
     } %}
-    {% for filter_name in ["needs_attention", "all", "executing", "pending_entry", "finished"] %}
+    {% for filter_name in ["all", "executing", "pending_entry", "finished", "other"] %}
+      {% if filter_name != "other" or summary_counts.other > 0 or applied_filter == "other" %}
       <a
-        href="/strategy-records?filter={{ filter_name }}{% if applied_chat_id is not none %}&amp;chat_id={{ applied_chat_id }}{% endif %}&amp;limit={{ applied_limit }}&amp;page=1"
+        href="/strategy-records?filter={{ filter_name }}{{ scope_query|safe }}&amp;limit={{ applied_limit }}&amp;page=1"
         data-strategy-record-filter="{{ filter_name }}"
         {% if applied_filter == filter_name %}aria-current="page" class="is-active"{% endif %}
       >{{ filter_labels[filter_name] }} {{ summary_counts[filter_name] }}</a>
+      {% endif %}
     {% endfor %}
     </nav>
 
@@ -82,26 +92,43 @@
   <section class="home-event-feed" aria-labelledby="strategy-record-results-title" data-strategy-record-scroll>
     <h2 id="strategy-record-results-title" class="sr-only">策略记录结果</h2>
     {% for record in records %}
-      <a
-        class="strategy-record-card home-event-card home-event-card--{% if record.attention %}risk{% else %}strategy{% endif %}"
-        href="{% if record.lifecycle_id is not none %}/strategy-records/{{ record.lifecycle_id }}?{{ detail_query }}{% else %}{{ record.detail_href }}{% endif %}"
-        data-strategy-record-card
-        data-attention-code="{{ record.attention.code if record.attention else '' }}"
-        data-strategy-state-label="{% if record.attention %}attention{% else %}normal{% endif %}"
-      >
-        <time datetime="{{ record.latest_changed_at }}">{{ record.latest_changed_at }}</time>
-        <span class="home-event-source">{{ record.group_name }} · #{{ record.message_id or '-' }}</span>
-        <strong>{{ record.symbol or '未知币种' }} · {{ record.side or '方向未知' }}</strong>
-        <span class="strategy-record-statuses" aria-label="状态摘要">
-          <span class="strategy-record-status-label">策略 {{ record.lifecycle_state }}</span>
-          <span class="strategy-record-status-label">AI {{ record.recognition_state }}</span>
-          <span class="strategy-record-status-label">执行 {{ record.execution_state }}</span>
-          <span class="strategy-record-status-label">归属 {{ record.attribution_state }}</span>
-        </span>
-        <small class="strategy-record-attention-label">{% if record.attention %}需关注：{{ record.attention.label }}{% else %}状态正常{% endif %} ›</small>
-      </a>
+      {% set action = record.action_required %}
+      <article class="strategy-record-entry">
+        <a
+          class="strategy-record-card home-event-card home-event-card--{% if action %}risk{% else %}strategy{% endif %}"
+          href="{% if record.lifecycle_id is not none %}/strategy-records/{{ record.lifecycle_id }}?{{ detail_query }}{% else %}{{ record.detail_href }}{% endif %}"
+          data-strategy-record-card
+          data-attention-code="{{ action.code if action else '' }}"
+          data-strategy-state-label="{% if action %}attention{% else %}normal{% endif %}"
+        >
+          <span class="strategy-record-times">
+            {% if record.signal_at %}
+              <time datetime="{{ record.signal_at.isoformat() }}">喊单 {{ record.signal_at|strategy_local_time }}</time>
+            {% endif %}
+            {% if record.latest_changed_at %}
+              <time datetime="{% if record.latest_changed_at is string %}{{ record.latest_changed_at }}{% else %}{{ record.latest_changed_at.isoformat() }}{% endif %}">最近变化 {{ record.latest_changed_at|strategy_local_time }}</time>
+            {% endif %}
+          </span>
+          <span class="home-event-source">{{ record.group_name }} · #{{ record.message_id or '-' }}</span>
+          <strong>{{ record.symbol or '未知币种' }} · {{ record.side or '方向未知' }}</strong>
+          <span class="strategy-record-statuses" aria-label="状态摘要">
+            <span class="strategy-record-status-label">策略 {{ record.lifecycle_state|strategy_state_label("lifecycle") }}</span>
+            <span class="strategy-record-status-label">AI {{ record.recognition_state|strategy_state_label("recognition") }}</span>
+            <span class="strategy-record-status-label">执行 {{ record.execution_state|strategy_state_label("execution") }}</span>
+            <span class="strategy-record-status-label">归属 {{ record.attribution_state|strategy_state_label("attribution") }}</span>
+          </span>
+          {% if action %}
+            <small class="strategy-record-attention-label">{{ action.action_text }} ›</small>
+          {% elif record.track_only %}
+            <small class="strategy-record-attention-label" data-strategy-track-only>仅跟踪，不下单</small>
+          {% endif %}
+        </a>
+        {% if action and action.action_href %}
+          <a class="strategy-record-action-link" href="{{ action.action_href }}" data-strategy-record-action>去持仓页处理 ›</a>
+        {% endif %}
+      </article>
     {% else %}
-      <p class="home-event-empty" data-strategy-record-empty>当前筛选没有策略记录。</p>
+      <p class="home-event-empty" data-strategy-record-empty>{% if applied_filter == "needs_attention" %}现在没有需要你处理的事。{% else %}当前筛选没有策略记录。{% endif %}</p>
     {% endfor %}
   </section>
   {% if has_more %}
