@@ -121,6 +121,11 @@ from telegram_kol_research.management_stop_price_gate import (
 from telegram_kol_research.management_directives import future_take_profit_level
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.trading_settings import load_trading_settings
+from telegram_kol_research.take_profit_adjustment import (
+    TAKE_PROFIT_ADJUST_INTENT,
+    TakeProfitInstruction,
+    classify_take_profit_instruction,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -144,7 +149,24 @@ PROTECTION_INTENTS = frozenset(
 )
 PROTECTION_EVIDENCE_INTENTS = PROTECTION_INTENTS | frozenset({"partial_take_profit"})
 SUPPORTED_INTENTS = frozenset(
-    {"partial_take_profit", "full_exit", *PROTECTION_INTENTS}
+    {
+        "partial_take_profit",
+        "full_exit",
+        *PROTECTION_INTENTS,
+        TAKE_PROFIT_ADJUST_INTENT,
+    }
+)
+#: 2026-09-29 take-profit adjustment (design 3.6). The batch may occupy the
+#: one-active-batch slot for at most this long; ``management_recovery_timeout``
+#: ends it after that.
+TAKE_PROFIT_ADJUST_DEADLINE = timedelta(seconds=180)
+#: Instructions that stand down a take-profit adjustment which has not started
+#: writing: the A-6 risk-reducing set, plus a newer take-profit adjustment.
+TAKE_PROFIT_ADJUST_SUPERSEDING_INTENTS = frozenset(
+    {*RISK_REDUCING_INTENTS, TAKE_PROFIT_ADJUST_INTENT}
+)
+SUPERSEDED_BY_NEWER_TAKE_PROFIT_ADJUSTMENT = (
+    "superseded_by_newer_take_profit_adjustment"
 )
 MANAGEABLE_ENTRY_LEG_STATES = frozenset(
     {"active", "open", "filled", "partial_closed"}
@@ -549,6 +571,33 @@ def _plan_strategy_management_batch_locked(
         )
         if future_level_result is not None:
             return future_level_result
+    take_profit_instruction: TakeProfitInstruction | None = None
+    if intent == TAKE_PROFIT_ADJUST_INTENT:
+        # Design 3.7: ``disabled`` is today's behaviour -- no adjustment batch
+        # at all. The message is still never turned into a market reduction;
+        # that was decided in recognition and does not depend on this switch.
+        if (
+            load_trading_settings(session_factory).take_profit_adjust_mode
+            == "disabled"
+        ):
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="take_profit_adjust_disabled",
+                target_lifecycle_id=lifecycle.id,
+            )
+        take_profit_instruction = _take_profit_instruction_for_identity(
+            session_factory, identity=identity
+        )
+        if take_profit_instruction is None:
+            return _persist_blocked(
+                session_factory,
+                identity=identity,
+                raw_message_id=raw_message_id,
+                intent=intent,
+                reason_code="take_profit_adjust_instruction_unavailable",
+                planned_at=now,
+                execution_mode=execution_mode,
+            )
     (
         identity,
         price_plausibility,
@@ -907,10 +956,26 @@ def _plan_strategy_management_batch_locked(
         effective_action_name, effective_fraction = intent, None
 
     stop_gate_evidence = None
-    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
+    # The explicit stop an instruction carries. For ``adjust_take_profit`` it is
+    # the stop named in the same message ("止盈位：73070 止损位：78700"), read
+    # again from the text; the candidate's ``stop_loss_text`` there defaults to
+    # the strategy's original stop and must never be mistaken for a new one.
+    gated_stop_text = (
+        candidate.stop_loss_text
+        if intent == "adjust_stop_loss"
+        else take_profit_instruction.stop_loss
+        if take_profit_instruction is not None
+        else None
+    )
+    gated_stop_source = (
+        candidate.stop_price_source
+        if intent == "adjust_stop_loss"
+        else "current_message_text"
+    )
+    if gated_stop_text not in (None, ""):
         gate = validate_management_stop(
-            action=intent, stop_mode="explicit_price", stop_price=candidate.stop_loss_text,
-            stop_price_source=candidate.stop_price_source,
+            action=intent, stop_mode="explicit_price", stop_price=gated_stop_text,
+            stop_price_source=gated_stop_source,
             current_message_text=identity.raw_message.text,
             side=str(lifecycle.side).lower(),
             entry_prices=[position["avg_entry_price"] for position in economics],
@@ -925,7 +990,7 @@ def _plan_strategy_management_batch_locked(
             )
         stop_gate_evidence = gate.evidence
         try:
-            explicit_stop = Decimal(str(candidate.stop_loss_text))
+            explicit_stop = Decimal(str(gated_stop_text))
             price_tick = Decimal(str(contract_spec.price_tick))
             exact_tick = price_tick.is_finite() and price_tick > 0 and explicit_stop % price_tick == 0
         except (InvalidOperation, TypeError, ValueError):
@@ -936,6 +1001,28 @@ def _plan_strategy_management_batch_locked(
                 intent=intent, gate=StopGateResult("management_stop_tick_invalid", gate.evidence),
                 planned_at=now, execution_mode=execution_mode,
             )
+
+    if intent == TAKE_PROFIT_ADJUST_INTENT and not _pending_tpsl_snapshot_complete(
+        reconciliation_snapshot, instrument_id=instrument_id
+    ):
+        # Trimmed for take-profit adjustment: only the completeness half of the
+        # protection-evidence block below. Its matching half compares every
+        # stop and take profit against the ledger by price and size, which is
+        # exactly what a take-profit adjustment is about to change -- batch 174
+        # (#18199) was refused there as ``protection_price_or_size_mismatch``
+        # for a difference that was the instruction itself. Which orders the
+        # position owns is answered at execution time, under the position
+        # lock, by ``resolve_protection_authority`` (design 3.4 step 1); a
+        # refusal there is zero writes and an alert.
+        return _persist_blocked(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            intent=intent,
+            reason_code="target_protection_snapshot_incomplete",
+            planned_at=now,
+            execution_mode=execution_mode,
+        )
 
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
     if (
@@ -1186,8 +1273,14 @@ def _plan_strategy_management_batch_locked(
             "reason_codes": list(capabilities.reason_codes),
         }
         required_capability = (
+            # A take-profit adjustment needs the base write proof only (exact
+            # position, complete snapshot, no unresolved mutation). Stop
+            # ownership is not proven here -- the evidence block above is not
+            # run for it -- and is required at execution instead: the executor
+            # refuses a position whose resolved protection has no stop.
             capabilities.may_close_exact_position
             if effective_action_name in {"full_close", "full_exit"}
+            or intent == TAKE_PROFIT_ADJUST_INTENT
             else capabilities.may_reduce_exact_position
             if effective_action_name
             in {"partial_close", "partial_then_break_even", BREAK_EVEN_BY_MARKET_ACTION}
@@ -1475,6 +1568,26 @@ def _plan_strategy_management_batch_locked(
                 ),
                 **break_even_reference_fields,
             }
+    if intent == TAKE_PROFIT_ADJUST_INTENT:
+        planned_tpsl_payload = {"intent": intent}
+        if take_profit_instruction.stop_loss is not None:
+            # ``validate_batch_stops`` re-checks exactly this at execution.
+            planned_tpsl_payload.update(
+                {
+                    "stop_loss_text": take_profit_instruction.stop_loss,
+                    "stop_price_source": "current_message_text",
+                }
+            )
+        target_snapshot["take_profit_adjustment"] = {
+            "version": 1,
+            "instruction": take_profit_instruction.to_dict(),
+            "planned_mode": load_trading_settings(
+                session_factory
+            ).take_profit_adjust_mode,
+            "strategy_take_profit": lifecycle.take_profit,
+            "deadline_seconds": int(TAKE_PROFIT_ADJUST_DEADLINE.total_seconds()),
+        }
+        target_fingerprint = management_target_fingerprint(target_snapshot)
     batch_legs = [
         ManagementLegCreate(
             execution_order_leg_id=legs_by_pos_id[position["pos_id"]].id,
@@ -1495,6 +1608,29 @@ def _plan_strategy_management_batch_locked(
     ]
     try:
         with session_factory() as session:
+            if intent in TAKE_PROFIT_ADJUST_SUPERSEDING_INTENTS:
+                # Design 3.6: a take-profit adjustment that has not started
+                # writing never stands in the way of a risk-reducing
+                # instruction (A-6), nor of a newer take-profit adjustment.
+                _supersede_unstarted_take_profit_adjustments_in_session(
+                    session,
+                    strategy_instance_id=str(binding.strategy_instance_id),
+                    superseded_at=now,
+                    reason_code=(
+                        SUPERSEDED_BY_NEWER_TAKE_PROFIT_ADJUSTMENT
+                        if intent == TAKE_PROFIT_ADJUST_INTENT
+                        else SUPERSEDED_BY_RISK_REDUCTION
+                    ),
+                )
+            if intent == TAKE_PROFIT_ADJUST_INTENT and _active_batch_ids_in_session(
+                session, strategy_instance_id=str(binding.strategy_instance_id)
+            ):
+                session.rollback()
+                return ManagementPlanningResult(
+                    status="blocked",
+                    reason_code="prior_management_batch_unresolved",
+                    target_lifecycle_id=lifecycle.id,
+                )
             if risk_reduction_bypass:
                 superseded_ids = _supersede_partial_batches_in_session(
                     session,
@@ -1658,6 +1794,9 @@ def _plan_strategy_management_batch_locked(
                     partial_policy_state=partial_policy_state,
                     composite_contract=composite_contract,
                 )
+            if intent == TAKE_PROFIT_ADJUST_INTENT:
+                created = session.get(StrategyManagementBatch, int(batch_id))
+                created.execution_deadline_at = now + TAKE_PROFIT_ADJUST_DEADLINE
             session.commit()
     except ManagementPlanningStateChanged:
         return ManagementPlanningResult(
@@ -2515,6 +2654,115 @@ def _supersede_partial_batches_in_session(
         superseded.append(int(batch.id))
     session.flush()
     return tuple(superseded)
+
+
+def _supersede_unstarted_take_profit_adjustments_in_session(
+    session,
+    *,
+    strategy_instance_id: str,
+    superseded_at: datetime,
+    reason_code: str,
+) -> tuple[int, ...]:
+    """Stand down take-profit adjustments that have not written anything.
+
+    "Not started" is a durable fact, not a guess: every leg is still
+    ``planned``. The executor moves a leg off ``planned`` in its own
+    transaction before the first exchange write, and it holds the position
+    authority lock for the whole run -- the same lock this planner holds --
+    so a batch cannot start writing between this read and the update. A batch
+    that has started writing is left alone; its 180 s deadline ends it.
+    """
+
+    batches = (
+        session.query(StrategyManagementBatch)
+        .filter(StrategyManagementBatch.strategy_instance_id == str(strategy_instance_id))
+        .filter(StrategyManagementBatch.intent == TAKE_PROFIT_ADJUST_INTENT)
+        .filter(StrategyManagementBatch.status.in_(("ready", "executing")))
+        .order_by(StrategyManagementBatch.id.asc())
+        .all()
+    )
+    superseded: list[int] = []
+    for batch in batches:
+        leg_statuses = {
+            str(status)
+            for (status,) in session.query(StrategyManagementLeg.status)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .all()
+        }
+        if leg_statuses - {"planned"}:
+            continue
+        batch.status = "resolved"
+        batch.reason_code = reason_code
+        batch.completed_at = superseded_at
+        batch.updated_at = superseded_at
+        superseded.append(int(batch.id))
+    session.flush()
+    return tuple(superseded)
+
+
+def _active_batch_ids_in_session(
+    session, *, strategy_instance_id: str
+) -> tuple[int, ...]:
+    """Batches holding the one-active-batch-per-strategy slot right now."""
+
+    return tuple(
+        int(batch_id)
+        for (batch_id,) in session.query(StrategyManagementBatch.id)
+        .filter(StrategyManagementBatch.strategy_instance_id == str(strategy_instance_id))
+        .filter(
+            StrategyManagementBatch.status.not_in(("succeeded", "blocked", "resolved"))
+        )
+        .all()
+    )
+
+
+def _take_profit_instruction_for_identity(
+    session_factory, *, identity: _PlanningIdentity
+) -> TakeProfitInstruction | None:
+    """Read the take-profit instruction again from the message itself.
+
+    The candidate row keeps only the normalised intent; its ``take_profit_text``
+    is the model's field (for #18294 the support zone "84000-84400附近"), so the
+    instruction is re-derived from the same text recognition used: the raw
+    message and the model's ``observed_text``, with the model's action and stop
+    for the same vetoes. Same inputs, same pure function, same answer.
+    """
+
+    with session_factory() as session:
+        decision = session.get(RecognitionDecision, identity.recognition_decision_id)
+        payload_json = decision.authoritative_payload_json if decision else None
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    event = payload.get("lifecycle_event")
+    event = event if isinstance(event, dict) else {}
+    reading = payload.get("input_reading")
+    reading = reading if isinstance(reading, dict) else {}
+    parts = [
+        str(identity.raw_message.text or "").strip(),
+        str(reading.get("observed_text") or "").strip(),
+    ]
+    text = "\n\u2029\n".join(dict.fromkeys(part for part in parts if part))
+    stop_loss = event.get("stop_loss")
+    if stop_loss in (None, ""):
+        # Recognition's authoritative path fills an empty model stop from the
+        # text before resolving the directive; do the same here so both
+        # readings see the same candidate stop.
+        from telegram_kol_research.message_recognition import (
+            _extract_explicit_stop_loss_from_management_text,
+        )
+
+        stop_loss = _extract_explicit_stop_loss_from_management_text(text)
+    return classify_take_profit_instruction(
+        text,
+        {
+            "event_type": "position_update",
+            "management_action": event.get("management_action"),
+            "stop_loss": stop_loss,
+        },
+    )
 
 
 def _record_management_freeze_audit_in_session(
