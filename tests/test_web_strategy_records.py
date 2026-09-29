@@ -1724,3 +1724,53 @@ def test_loader_and_sql_count_apply_same_actionable_rule_before_limit(tmp_path):
         ]
         == 1
     )
+
+
+def test_lists_order_by_recency_not_historical_attention(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        old_failed = _add_lifecycle(
+            session, chat_id=AUTO_CHAT, message_id=1, status="expired",
+            recognition_failed=True, signal_at=NOW - timedelta(days=40),
+        )
+        mid = _add_lifecycle(
+            session, chat_id=AUTO_CHAT, message_id=2, status="exited",
+            signal_at=NOW - timedelta(days=2),
+        )
+        newest = _add_lifecycle(
+            session, chat_id=AUTO_CHAT, message_id=3, status="exited",
+            signal_at=NOW - timedelta(hours=3),
+        )
+        actionable_old = _add_lifecycle(
+            session, chat_id=AUTO_CHAT, message_id=4, status="entered",
+            signal_at=NOW - timedelta(days=30),
+        )
+        session.commit()
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=EmptyDeepcoinClient,
+            group_config=GroupConfig(
+                groups=[
+                    TargetGroupConfig(
+                        chat_title="auto", chat_id=AUTO_CHAT, trading_mode="auto_trade"
+                    )
+                ]
+            ),
+        )
+    )
+
+    finished = _api(client, "finished")["records"]
+    assert [row["lifecycle_id"] for row in finished] == [newest, mid, old_failed]
+    everything = _api(client, "all")["records"]
+    # The actionable record leads; the rest follow by recency, so the ancient
+    # record with a historical recognition failure is last.
+    assert [row["lifecycle_id"] for row in everything] == [
+        actionable_old, newest, mid, old_failed,
+    ]
+    # Paging follows the same order: page 1 holds the newest records.
+    page1 = _api(client, "finished", limit=2, page=1)["records"]
+    page2 = _api(client, "finished", limit=2, page=2)["records"]
+    assert [row["lifecycle_id"] for row in page1] == [newest, mid]
+    assert [row["lifecycle_id"] for row in page2] == [old_failed]

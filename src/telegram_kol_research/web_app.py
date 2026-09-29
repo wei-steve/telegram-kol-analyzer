@@ -1867,7 +1867,7 @@ def _timeline_group_names_by_chat_id(
 
 
 def _strategy_record_api_sort_key(record: dict[str, object]) -> tuple[int, float, int]:
-    attention = record.get("action_required") or record.get("attention")
+    attention = record.get("action_required")
     severity = (
         str(attention.get("severity") or "")
         if isinstance(attention, dict)

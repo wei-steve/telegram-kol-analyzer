@@ -2471,8 +2471,17 @@ def load_strategy_record_summaries(
                 latest_expression.desc(),
                 StrategyLifecycle.id.desc(),
             )
-        elif filter_name in {"executing", "pending_entry", "finished", "other"}:
-            lifecycle_query, severity_expression, latest_expression = (
+        elif pos_ids is not None or live_binding_only:
+            # Scoped loads are unbounded; their order is settled in Python.
+            lifecycle_query = lifecycle_query.order_by(
+                StrategyLifecycle.updated_at.desc(),
+                StrategyLifecycle.id.desc(),
+            )
+        else:
+            # Non-actionable lists are ordered by recency only: historical
+            # attention (an old recognition failure) must not float ancient
+            # records to the top.  Python applies the same order.
+            lifecycle_query, _severity_expression, latest_expression = (
                 _attention_lifecycle_query(
                     lifecycle_query,
                     only_attention=False,
@@ -2480,13 +2489,7 @@ def load_strategy_record_summaries(
                 )
             )
             lifecycle_query = lifecycle_query.order_by(
-                severity_expression,
                 latest_expression.desc(),
-                StrategyLifecycle.id.desc(),
-            )
-        else:
-            lifecycle_query = lifecycle_query.order_by(
-                StrategyLifecycle.updated_at.desc(),
                 StrategyLifecycle.id.desc(),
             )
         lifecycles = (
@@ -2848,15 +2851,23 @@ def load_strategy_record_summaries(
             }
         )
 
-    rows.sort(
-        key=lambda row: (
-            ATTENTION_SEVERITY_RANK.get(
-                str((row["attention"] or {}).get("severity")), 3  # type: ignore[union-attr]
-            ),
-            -_timestamp_value(row["latest_changed_at"]),
-            -int(row["lifecycle_id"]),
+    if filter_name == "needs_attention":
+        rows.sort(
+            key=lambda row: (
+                ATTENTION_SEVERITY_RANK.get(
+                    str((row["attention"] or {}).get("severity")), 3  # type: ignore[union-attr]
+                ),
+                -_timestamp_value(row["latest_changed_at"]),
+                -int(row["lifecycle_id"]),
+            )
         )
-    )
+    else:
+        rows.sort(
+            key=lambda row: (
+                -_timestamp_value(row["latest_changed_at"]),
+                -int(row["lifecycle_id"]),
+            )
+        )
     return rows if limit is None else rows[:limit]
 
 
