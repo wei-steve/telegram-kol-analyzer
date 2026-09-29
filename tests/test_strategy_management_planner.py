@@ -32,6 +32,7 @@ from telegram_kol_research.models import (
     StrategyManagementComponent,
     StrategyManagementLeg,
 )
+from telegram_kol_research.message_recognition import _apply_lifecycle_event_decision
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 from telegram_kol_research.strategy_management_contracts import (
@@ -5638,3 +5639,270 @@ def test_m2_guardrail_pure_function_allows_a_level_within_tolerance():
         execution_mode="live",
     )
     assert result is None
+
+
+# --- 2026-09-29 Mia design, M1: planner + execution-side stop gate replay -
+
+# #17901 and #18154 real production text and the model's actual top-level
+# lifecycle_event payload (as production reads it -- not the richer nested
+# _context_resolution.first_pass.lifecycle_event object). Candidate
+# generation goes through the real _apply_lifecycle_event_decision, planning
+# through the real plan_strategy_management_batch, and the final check
+# through the real validate_batch_stops -- the coordinator's 2026-09-29
+# review asked for the planner and execution-gate legs of this replay, not
+# just the directive-level one in test_management_directives.py.
+
+_M1_PLANNER_CASES = [
+    pytest.param(
+        (
+            "BTC多单目前获利600点，止盈40%，"
+            "剩余仓位止损位上移至80600，"
+            "夜晚风险较大，做无风险持仓！"
+            "\n@Tarderfengge QQ:158241758"
+        ),
+        {
+            "confidence": 0.99,
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+            "reason": (
+                "对应已进入的BTC多单策略，"
+                "执行部分止盈40%并移动止损至80600，"
+                "属于仓位管理操作，无冲突或新增风险。"
+            ),
+            "symbol": "BTC",
+            "side": "long",
+        },
+        79000,
+        80700,
+        "81400",
+        "2",
+        "80700",
+    ),
+    pytest.param(
+        (
+            "恭喜跟上BTC多单的朋友，"
+            "目前获利1100点，止盈60%，"
+            "剩余仓位止损位上移至64100，"
+            "做无风险持仓！"
+            "\n@Tarderfengge QQ:158241758"
+        ),
+        {
+            "confidence": 0.99,
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+            "reason": (
+                "消息明确管理已有BTC多单"
+                "（thread_id 629），执行部分止盈60%"
+                "并移动止损至64100，属于降风险"
+                "仓位管理动作。"
+            ),
+            "symbol": "BTC",
+            "side": "long",
+        },
+        83000,
+        84100,
+        "85290",
+        "4",
+        "84100",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    (
+        "raw_text",
+        "decision",
+        "entry_range_low",
+        "entry_range_high",
+        "ticker_price",
+        "expected_close_size",
+        "expected_break_even_price",
+    ),
+    _M1_PLANNER_CASES,
+    ids=["17901", "18154"],
+)
+def test_m1_planner_and_stop_gate_replay(
+    monkeypatch,
+    tmp_path,
+    raw_text,
+    decision,
+    entry_range_low,
+    entry_range_high,
+    ticker_price,
+    expected_close_size,
+    expected_break_even_price,
+):
+    """#17901 / #18154 candidate -> planner -> execution-side stop gate.
+
+    Baseline code (before M1/M2) on this exact path: candidate generation
+    produced a plain ``partial_take_profit`` (never composite) with
+    ``stop_loss_text`` carrying the KOL's raw 80600/64100 and no provenance
+    tag; ``plan_strategy_management_batch`` still returned ``ready`` (the old
+    plain-partial planning path does not need a break-even reference), but
+    ``validate_batch_stops`` then refused the whole batch with
+    ``management_stop_provenance_invalid`` -- confirmed by running this exact
+    scenario against the pre-fix modules (see the implementation report).
+    """
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=1,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=PLANNED_AT,
+            entered_at=PLANNED_AT,
+            entry_range_low=entry_range_low,
+            entry_range_high=entry_range_high,
+            stop_loss=79400,
+        )
+        raw_message = RawMessage(
+            chat_id=1, message_id=20, posted_at=PLANNED_AT, text=raw_text
+        )
+        session.add_all([lifecycle, raw_message])
+        session.flush()
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:1:10:BTC:long",
+            kol_id="alice",
+            chat_id=1,
+            message_id=10,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="pos-b",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="market",
+            order_id="pos-b",
+            pos_id="pos-b",
+            venue="deepcoin",
+            attribution_status="verified",
+            attribution_evidence_json=json.dumps(
+                {"policy_version": 2, "source": "direct_order_identity"}
+            ),
+            status="active",
+        )
+        session.add(leg)
+        session.flush()
+        for order_id, purpose, trigger_price, size_text in (
+            ("tp-old", "take_profit", "88000", "7"),
+            ("sl-old", "stop_loss", "79400", "0"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                pos_id="pos-b",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text=size_text,
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="非策略",
+                authoritative_payload_json="{}",
+                agreement_status="authoritative_only",
+                differences_json="[]",
+            )
+        )
+        session.flush()
+        decision = dict(decision)
+        decision["target_lifecycle_id"] = lifecycle.id
+        applied = _apply_lifecycle_event_decision(
+            session,
+            raw_message,
+            decision,
+            parse_source="mimo_authoritative",
+            authoritative_generation="gen-1",
+        )
+        session.commit()
+        candidate = session.query(SignalCandidate).one()
+        raw_id = raw_message.id
+
+    # Candidate generation is composite, with the message's own price tagged
+    # as its provenance -- the M1 fix.
+    assert applied is True
+    assert candidate.management_action == "partial_then_break_even"
+    assert candidate.stop_price_source == "current_message_text"
+
+    _disable_reconciliation(monkeypatch, planner)
+    tpsl_orders = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "tp-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "posId": "pos-b",
+            "tpTriggerPx": "88000",
+            "sz": "7",
+            "cTime": "1721000000000",
+        },
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "sl-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "posId": "pos-b",
+            "slTriggerPx": "79400",
+            "sz": "0",
+            "cTime": "1721000000000",
+        },
+    ]
+    client = _TickerDeepcoin(
+        [_position("pos-b", size="7", avg_px="80000", side="long")],
+        tpsl_orders=tpsl_orders,
+        ticker_price=ticker_price,
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.batch.intent == "partial_then_break_even"
+    assert result.batch.legs[0].planned_close_size == expected_close_size
+    assert result.batch.legs[0].planned_tpsl["break_even_reference_source"] == (
+        "strategy_first_leg"
+    )
+    assert result.batch.legs[0].planned_tpsl["break_even_reference_price"] == (
+        expected_break_even_price
+    )
+    assert result.batch.legs[0].planned_tpsl["stop_loss_text"] is None
+    snapshot = result.batch.target_snapshot
+    disposed = snapshot["price_plausibility"]["removed"]
+    assert {row["disposition"] for row in disposed} == {"superseded_by_strategy_price"}
+
+    from telegram_kol_research import management_stop_price_gate as gate
+
+    gate_result = gate.validate_batch_stops(
+        session_factory, batch=result.batch, client=client, now=PLANNED_AT
+    )
+    assert gate_result is None
