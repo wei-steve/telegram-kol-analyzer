@@ -353,3 +353,72 @@ B 会换算成 83800。
   - 读不到现价时同样不减仓，并告警。
 - **Q6**：判据按第 4 节执行：同一句里有「剩余仓位 / 剩余持仓」或「获利 / 浮盈 N 点」，就判为现在减仓。
   本稿先实施，「调止盈」稿之后 rebase，并带上本稿的回放用例。
+
+## 8. 实施记录（2026-09-29）
+
+三个 Sonnet 5 子代理并行实施（A 管理解析、B 执行器 / 规划器、C 入场），各自在独立 worktree 完成。
+本会话审阅后，按顺序 cherry-pick 到分支 `claude/sweet-jones-aaf0da`。
+改动的源码文件：`config.py`、`management_directives.py`、`message_recognition.py`、`strategy_management_planner.py`，
+另新增 `management_add_position_rejection.py`。没有碰 `oncall_*` / `runtime_incident_adapters*`，没有改提示词和表结构。
+
+| 提交 | 内容 |
+|---|---|
+| `f2766308` | M5 回放证明；Q1 补丁首版 |
+| `4d32a5ba` | Q1 修正：重定向时同时改写持久化的 intent，并去掉候选里的显式价 |
+| `efb633bc` | M6 / Q3：确定性「半仓入场」规则 |
+| `3d36b84a` | M1：「止盈X%，剩余仓位止损位上移至P」升级为复合指令 |
+| `2c39a7f3` | M3：尾仓分支优先用明写比例，并保留保本 |
+| `66428c6e` | M8：「保本出局 / 先保本出局」进全平词表 |
+| `d19e94d0` | M2：部分止盈不再抄原止损；加未来价位护栏 |
+| `11d34b8f` | 审阅修正：保本类意图恢复「不抄原止损」 |
+| `c79cebe4` | 审阅修正：护栏排除「第N止盈 / TP1」，超过 10 倍的不算价格，告警带 raw_message_id |
+| `8ae8b8cc` | M1 回放用例：跑通规划器和执行器入口止损门 |
+
+### 8.1 与设计稿的差异
+
+- **M5 不需要修代码。** 复合执行器 `replace_remaining_protection` 在保本价落到现价错的一侧时，已经会对剩余仓位市价平仓
+  （`_break_even_fallback_applies` 这一路）。第 2 节「复合路径没有这个分支」的判断不对。本次只补了 #19597 的真实数值回放：
+  现价 83900 → 剩余止损挂 83800；现价 83700 → 剩余 5 张市价平。
+- **M2 选了「不抄原止损」。** 没有用 `lifecycle_existing` 标记，因为测试证明旧的部分平仓执行器按交易所实时保护单缩量，
+  并不读这个字段。为了不破坏军长规则解析器（它靠这里的「抄止损」记录一次真实的止损移动），
+  只让 AI 识别路径关闭抄写。保本类意图照旧一律为空。
+- **`protection_price_or_size_mismatch`（批次 159 / 166 / 172 / 174）** 与 M2 无关。它比对的是账本保护行与交易所同一订单的
+  价格和数量，是设计内的拦截（fail-closed），当前代码上仍会发生；本次没有修。
+- **Q1 补丁的判据：** 同一 lifecycle 在 `signal_at` 之后有 `automation_reason=lifecycle_apply_failed`，
+  且载荷里的 `management_action` 含 `add_position` / `increase_position`。查询走 `raw_messages(chat_id, posted_at)` 复合索引，
+  再按唯一键关联 `recognition_decisions`。重定向成立时，批次 intent 持久化为 `move_stop_to_break_even`，
+  候选里的显式价被移除；幂等指纹仍按原 intent 计算。
+- **Q3 只覆盖「还没提交」的入场腿。** 规则秒级写入 `EntryPreamble`，入场组装定案是分钟级，时间上赶得上。
+  「已经提交、限价单挂着」这个更晚的窗口需要撤单重挂，本次没做。#19063 → #19064 只隔 4 秒，
+  生产里大概率碰不到这个窗口；如果以后出现，另行立项。
+
+### 8.2 回放用例（修复前失败 → 修复后通过）
+
+| 用例 | 修复前 | 修复后 |
+|---|---|---|
+| #17901 / #18154：候选 → 规划器 → 止损门 | 非复合，止损门报 `management_stop_provenance_invalid` | 复合，减 2/7、4/7，剩余止损 80700 / 84100（`strategy_first_leg`），止损门放行 |
+| 批次 177 结构（「第一止盈位到了」） | `provenance_invalid` | 止损门放行；来源不明的显式价仍然拒绝 |
+| #19670 | — | 现价 84000 → `partial_take_profit_future_level` + 1 条 high 告警；现价 82550 → 正常减 3 张 |
+| #17936 | 0.8 / `partial_take_profit` | 0.7 / `partial_then_break_even` |
+| Q1：binding 385 + #19514 + 「剩余仓位止损上移至83200」 | 规划写 83200（变异对照） | 执行器实测：83900 → 止损挂 83800；83700 → 市价平 10 张；两种情况都没有写入 83200 |
+| #19063 + #19064 | 满仓 | `EntryPreamble.risk_multiplier=0.5` + 1 条 high 告警；70 秒后、跨群、长句、模型已识别等情况都不触发 |
+
+新增必达告警类型（`config.ALWAYS_NOTIFIED_INCIDENT_TYPES`）：
+`management_add_position_rejected_stop_superseded`、`half_position_entry_confirmed_by_rule`、
+`management_partial_take_profit_future_level_blocked`。
+
+### 8.3 最终候选
+
+- 代码候选：`8ae8b8cc59ca1ecda1e416e00f81d7aebda6b47e`（基于 `origin/main` `6450ac67`；之后只有文档提交）。
+  全量 `uv run python -m pytest -q`：**10375 passed / 4 skipped / 0 failed**（1004 秒）。
+- **未部署，未推送 `origin/main`。** 部署由调度会话排期，按 L2 执行：
+  1. 部署前确认候选是当时生产 HEAD（`0bcb894e`）的后代，并且不处在时效操作中。
+  2. `tg-deploy <sha>`。这次没有改值守代码，不用单独重启值守服务。
+  3. 观察窗口 30 分钟，至少 5 条真实消息。重点看：是否还出现 `management_stop_provenance_invalid`；
+     部分止盈批次是否能到 `succeeded`；新增的三类告警有没有投递出去。
+  4. 回滚：`tg-deploy 0bcb894e9280d273e145eb44e99d24d14c6870a7`。
+- **首个正向样本需要复核。** 上线后第一条米娅风格的「止盈X%，剩余仓位止损位上移至P」、第一条「第一止盈位到了」、
+  第一条「半仓入场」，都要用交易所 GET 核对：减了几张、止损挂在哪个价、有没有错写。
+- **与「调止盈」设计稿的交接。** 那份稿子（分支 `claude/take-profit-adjustment`）实施前要先 rebase 到本候选；
+  本稿的回放用例（`test_m1_*`、`test_m2_guardrail_*`、`test_r2g_17936_*`）必须保持通过。
+  另外，它要改的 R3（止损抽取误吃止盈价）本稿没有碰。
