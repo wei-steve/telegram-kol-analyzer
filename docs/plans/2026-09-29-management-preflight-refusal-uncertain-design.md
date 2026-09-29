@@ -8,7 +8,7 @@
   `strategy_management_market_decisions.management_batch_id`、`execution_events` 经 `raw_messages (chat_id, message_id)`）；
   代码读 `execution_boundary.py`、`authoritative_recognition.py`、`authoritative_execution_attempts.py`、
   `strategy_management_executor.py`。没有交易所调用。
-- 状态：**已批准（2026-09-29，用户：第 7 节全部按推荐）**；实施中
+- 状态：**已批准（2026-09-29，用户：第 7 节全部按推荐）**；代码候选 `ca17518c`，全量通过，**未部署、未推 origin/main**
 - 风险级别：**L3**（改的是「跨过副作用边界之后的结果如何定性」，属 AGENTS.md 所说的交易所写入语义；
   **不改表结构、不修生产数据、不改任何真实下单 / 撤单代码**）
 
@@ -188,3 +188,36 @@ A-6 已经让「每个条目载荷都写着 `status: blocked` 等」的管理拒
 ### 7.1 裁定（2026-09-29）
 
 Q1＝B（`closed_no_write`，不可自动重试）；Q2 新增 `management_refused_before_write`；Q3 L3 评审 + L2 观察；Q4 审计发现例外就排除在证明之外、照旧冻结。
+
+## 8. 实施记录（2026-09-29）
+
+| 提交 | 内容 |
+|---|---|
+| `e8cf42d9` | 子代理（Sonnet 5）：写前日志审计（`docs/management-preflight-refusal-status.md`）、`management_batches_prove_no_exchange_contact`、`record_management_preflight_refusal`（`closed_no_write` / `ManagementPreflightRefusal` / `exchange_effect=not_started`，决定行 completed/failed）、新类型 `management_refused_before_write`（必发、留事件处理、「需要你」一句）、R5-a～i |
+| `ca17518c` | 本会话审阅修正：账本证明只在执行边界**没追踪到任何写入**时才运行；更正调用点注释（Q1=B 不可重试）；两条端到端测试 |
+
+### 8.1 审阅发现
+
+- **账本不是完整的见证。** 子代理审计发现 `_cancel_deferred_entry_legs` 先撤单后落账，并论证「成功 / 异常两种结局都会补执行事件」。
+  漏了第三种：撤单成功后快照复核失败，直接抛 `deferred_entry_cancel_leg_not_pending`，**不写任何事件**——交易所撤过单，账本却像没动过。
+  而原调用点只看 `exchange_effect == "outcome_unknown"`，写过交易所的矛盾结果也会走到这里。
+  修正：`boundary.evidence_refs` 里有任何 `deepcoin_write` 就直接冻结、不查账本。整条自动执行链路用 `TrackedDeepcoinClient`，
+  它拦截包括 `cancel_order` / `cancel_trigger_order` 在内的全部写方法。回放 `test_ledger_proof_is_never_consulted_after_a_tracked_write`
+  在修正前失败、修正后通过。4631 / 4705 的 `evidence_refs_json` 都是 `[]`，修正后仍会被正确收口。
+- 子代理本次遵守了三条禁令（未运行通知脚本、未派子代理、署名为 Sonnet 5）。
+
+### 8.2 rebase 与测试
+
+- rebase 到 `origin/main` = `5ba66e8a`（调止盈上线）无冲突。调止盈改了 `strategy_management_executor.py` 并新增
+  `take_profit_adjustment_executor` 等：同步执行链路里它用的是传入的被追踪客户端，写入会被追踪器记录；
+  worker 里 `get_client()` 那条是批次之后的异步执行，不属于执行尝试。
+- 受影响测试 204 passed；最终候选 `ca17518c69b469e51629c1823a3c91915ce89b89` 全量 **10649 passed / 4 skipped / 0 failed**。
+
+### 8.3 部署（调度会话排期；本会话不部署、不推 `origin/main`）
+
+1. 候选是生产 HEAD 的后代；非策略时效操作期间；无进行中的管理批次 / 执行尝试。
+2. `tg-deploy <候选 sha>`。值守代码未改，**不需要**重启 `telegram-kol-oncall`。
+3. L2 观察：连续 30 分钟、≥5 条真实消息；看 `authoritative_execution_attempts` 没有新的 `uncertain`、无新的 `closed_no_write`
+   之外的异常、worker 无 Traceback。上线后第一个管理预检拒绝样本出现时，核对它落在 `closed_no_write`（`error_class=ManagementPreflightRefusal`）、
+   evidence 里批次证明与账本一致、事件处理 bot 收到一条 `management_refused_before_write`；7 天内没有样本记为待验证。
+4. 回滚：`tg-deploy <上线前 sha>`。已按新规则收口的行保持 `closed_no_write`，旧代码认识这个状态，无需数据回滚。
