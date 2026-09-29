@@ -752,6 +752,23 @@ def _plan_strategy_management_batch_locked(
             execution_mode=execution_mode,
         )
 
+    add_position_rejection_evidence = None
+    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
+        (
+            intent,
+            identity,
+            add_position_rejection_evidence,
+        ) = _redirect_stop_worse_than_fill_after_rejected_add(
+            session_factory,
+            identity=identity,
+            lifecycle=lifecycle,
+            economics=economics,
+            candidate=candidate,
+            default_intent=intent,
+            now=now,
+        )
+        candidate = identity.candidate
+
     protection_health_by_pos_id: dict[str, dict[str, Any]] = {}
     if (
         protection_recovery_bypass
@@ -875,32 +892,8 @@ def _plan_strategy_management_batch_locked(
     else:
         effective_action_name, effective_fraction = intent, None
 
-    add_position_rejection_evidence = None
-    if (
-        intent == "adjust_stop_loss"
-        and effective_action_name == "adjust_stop_loss"
-        and candidate.stop_loss_text not in (None, "")
-    ):
-        effective_action_name, add_position_rejection_evidence = (
-            _redirect_stop_worse_than_fill_after_rejected_add(
-                session_factory,
-                identity=identity,
-                lifecycle=lifecycle,
-                economics=economics,
-                candidate=candidate,
-                default_effective_action=effective_action_name,
-                now=now,
-            )
-        )
-        if add_position_rejection_evidence is not None:
-            effective_fraction = None
-
     stop_gate_evidence = None
-    if (
-        intent == "adjust_stop_loss"
-        and effective_action_name == "adjust_stop_loss"
-        and candidate.stop_loss_text not in (None, "")
-    ):
+    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
         gate = validate_management_stop(
             action=intent, stop_mode="explicit_price", stop_price=candidate.stop_loss_text,
             stop_price_source=candidate.stop_price_source,
@@ -1231,11 +1224,7 @@ def _plan_strategy_management_batch_locked(
             if pos_id not in capability_deferred_pos_ids
         }
 
-    if (
-        intent == "adjust_stop_loss"
-        and effective_action_name == "adjust_stop_loss"
-        and candidate.stop_loss_text not in (None, "")
-    ):
+    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
         explicit_stop = Decimal(str(candidate.stop_loss_text))
         verified_stops: list[Decimal] = []
         for protection in protection_by_pos_id.values():
@@ -1265,18 +1254,7 @@ def _plan_strategy_management_batch_locked(
 
     break_even_reference = None
     stop_ladder_evidence = None
-    if (
-        intent in IMPLICIT_STOP_ACTIONS
-        # Q1 patch: an ``adjust_stop_loss`` redirected to the break-even-by-
-        # market action still carries the original ``intent``, so it is not
-        # itself a member of ``IMPLICIT_STOP_ACTIONS`` -- but it needs the
-        # exact same strategy-price reference the native
-        # ``move_stop_to_break_even`` path computes here, or the leg's
-        # ``planned_tpsl_json`` would carry no reference at all and
-        # ``break_even_target_price`` would fall back to our own fill, which
-        # is precisely the price this redirect exists to avoid.
-        or effective_action_name == BREAK_EVEN_BY_MARKET_ACTION
-    ):
+    if intent in IMPLICIT_STOP_ACTIONS:
         (
             break_even_reference,
             price_plausibility,
@@ -1891,7 +1869,7 @@ def _redirect_stop_worse_than_fill_after_rejected_add(
     lifecycle: StrategyLifecycle,
     economics,
     candidate: SignalCandidate,
-    default_effective_action: str,
+    default_intent: str,
     now: datetime,
 ):
     """Q1 patch: only ``adjust_stop_loss`` with an explicit price is in scope.
@@ -1906,12 +1884,33 @@ def _redirect_stop_worse_than_fill_after_rejected_add(
     2. the message's explicit stop is worse than our own average fill --
        lower than it for a long, higher for a short.
 
-    When both hold, the KOL's number is superseded by the strategy's
-    break-even price (the same ``BREAK_EVEN_BY_MARKET_ACTION`` path
-    ``move_stop_to_break_even`` already uses, so a target on the wrong side of
-    the market already closes the remainder at market instead of arming an
-    instantly-triggering stop -- unchanged, reused verbatim). A single ``high``
-    incident is always raised so the override is never silent.
+    When both hold, this rewrites the ``intent`` itself to
+    ``move_stop_to_break_even`` and returns a candidate view with the
+    explicit price and its provenance removed -- not just a different
+    ``effective_action``. Two execution-time readers require exactly that:
+    ``strategy_management_executor.reserve_break_even_market_actions`` refuses
+    any batch whose *persisted* ``intent`` is not literally
+    ``move_stop_to_break_even``, and ``_planned_stop_price`` prefers an
+    explicit ``stop_loss_text`` sourced from ``current_message_text`` over the
+    break-even reference regardless of ``effective_action`` -- so leaving the
+    KOL's price on the candidate would still arm 83200-shaped numbers even
+    after the batch's effective action said "break-even". Rewriting ``intent``
+    here, before every branch below that keys off it (``PARTIAL_INTENTS``,
+    ``full_exit``, the ``move_stop_to_break_even`` branch that sets
+    ``effective_action``, ``IMPLICIT_STOP_ACTIONS``, the stop gate, and the
+    tightening precheck), makes the rest of this function process a redirected
+    instruction exactly as it would a message that had said "move stop to
+    break-even" in the first place -- one behaviour, not a second one bolted
+    on. A single ``high`` incident is always raised so the override is never
+    silent.
+
+    The idempotency fingerprint is deliberately computed by the caller
+    *before* this function runs (using ``default_intent``, still
+    ``adjust_stop_loss`` at that point), not after: this function's answer
+    depends on mutable history (whether a rejected add-position row exists
+    yet), so keying the fingerprint to its output would let two plannings of
+    the *same* message compute two different fingerprints and silently create
+    a second batch instead of finding the first by idempotency.
     """
 
     side = str(lifecycle.side or "").lower()
@@ -1919,7 +1918,7 @@ def _redirect_stop_worse_than_fill_after_rejected_add(
     if avg_entry_price is None or not explicit_stop_worse_than_fill(
         side=side, stop_price=candidate.stop_loss_text, avg_entry_price=avg_entry_price,
     ):
-        return default_effective_action, None
+        return default_intent, identity, None
 
     with session_factory() as session:
         evidence = find_rejected_add_position_before(
@@ -1929,7 +1928,7 @@ def _redirect_stop_worse_than_fill_after_rejected_add(
             signal_at=lifecycle.signal_at,
         )
     if evidence is None:
-        return default_effective_action, None
+        return default_intent, identity, None
 
     summary = json.dumps(
         {
@@ -1974,7 +1973,13 @@ def _redirect_stop_worse_than_fill_after_rejected_add(
             [f"raw_message:{evidence.raw_message_id}"]
         ),
     )
-    return BREAK_EVEN_BY_MARKET_ACTION, evidence
+    sanitized_identity = replace(
+        identity,
+        candidate=_PriceSanitizedCandidate(
+            candidate, stop_loss_text=None, stop_price_source=None,
+        ),
+    )
+    return "move_stop_to_break_even", sanitized_identity, evidence
 
 
 def _identity_without_explicit_break_even_prices(

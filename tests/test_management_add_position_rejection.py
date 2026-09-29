@@ -301,11 +301,17 @@ def test_worse_stop_after_rejected_add_is_superseded_by_strategy_price(tmp_path)
     monkeypatch.undo()
 
     assert result.status == "ready"
-    assert result.batch.intent == "adjust_stop_loss"
+    # The persisted intent itself is rewritten, not just the effective
+    # action: the executor's ``reserve_break_even_market_actions`` refuses any
+    # batch whose ``intent`` is not literally ``move_stop_to_break_even``.
+    assert result.batch.intent == "move_stop_to_break_even"
     assert result.batch.effective_action == "break_even_by_market"
     assert result.batch.legs[0].planned_tpsl["break_even_reference_price"] == "83800"
-    # The KOL's own worse number never becomes the armed target.
+    # The KOL's own worse number never becomes the armed target, and is
+    # removed from the candidate entirely -- not merely overridden by the
+    # reference -- so ``_planned_stop_price`` cannot prefer it back.
     assert result.batch.legs[0].planned_tpsl["break_even_reference_price"] != "83200"
+    assert result.batch.legs[0].planned_tpsl.get("stop_loss_text") is None
 
     with session_factory() as session:
         incidents = session.query(RuntimeIncident).filter(
@@ -431,3 +437,286 @@ def test_a_stop_that_is_not_worse_than_the_fill_is_also_unchanged(tmp_path):
             == "management_add_position_rejected_stop_superseded"
         ).all()
     assert incidents == []
+
+
+# ---------------------------------------------------------------------------
+# Executor-level replay: the real batch this guard plans, handed to the
+# worker's own execution entry point (``execute_management_batch``), not a
+# hand-built batch shaped to look like one. Two market prices, and one
+# mutation check that the redirect is actually load-bearing.
+# ---------------------------------------------------------------------------
+
+
+def _plan_worse_stop_batch(
+    session_factory, *, with_rejection_history, redirect_active=True,
+):
+    """The exact fixture the first three tests use: 83200 KOL price, 83800 fill.
+
+    Returns the real ``ManagementPlanningResult`` from
+    ``plan_strategy_management_batch`` -- the same entry point production
+    calls -- so the executor tests below hand the executor a batch this
+    module actually produced, not one built by hand to resemble it.
+
+    ``redirect_active=False`` is only for the mutation test: with the
+    redirect turned off, planning takes the ordinary ``adjust_stop_loss``
+    explicit-price stop-gate path, which needs a plan-time quote the
+    redirected path never reads at all -- so this only patches
+    ``get_ticker_quote`` in that one case, to keep the other tests proving
+    the redirected path never needs a plan-time quote either.
+    """
+
+    planner = _planner()
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="adjust_stop_loss",
+        side="long",
+        current_stop_loss=81800,
+        requested_stop_loss="83200",
+        stop_price_source="current_message_text",
+        management_text="剩余仓位止损上移至83200",
+        entry_range=(83800, 83800),
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    _disable_reconciliation(monkeypatch, planner)
+    if with_rejection_history:
+        _seed_rejected_add_position(
+            session_factory, chat_id=100, target_lifecycle_id=lifecycle_id,
+            signal_at=PLANNED_AT,
+        )
+    _seed_verified_stop(
+        session_factory, binding_id=binding_id, pos_id="pos-b", trigger_price="81800",
+    )
+    client = _ReadOnlyDeepcoin(
+        [_position(avg_px="83800", side="long")],
+        tpsl_orders=[_matching_tpsl_order(pos_id="pos-b", trigger_price="81800")],
+    )
+    if not redirect_active:
+        monkeypatch.setattr(client, "get_ticker_quote", lambda **kwargs: {
+            "instrument_id": "BTC-USDT-SWAP", "price": "83900", "price_field": "last",
+            "observed_at": PLANNED_AT.isoformat(),
+        })
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+    monkeypatch.undo()
+    return result
+
+
+class _BreakEvenExecutorClient:
+    """Everything ``execute_management_batch``'s break-even-by-market route
+    reads or writes, for one BTC long position ``pos-b`` at 83800/10.
+
+    ``market_price`` backs both the position row's ``markPx`` (what
+    ``reserve_break_even_market_actions`` reads first) and
+    ``get_ticker_quote`` (what ``validate_batch_stops`` and the market
+    decision itself read) -- the two are never made to disagree here, the
+    same simplification ``test_mia_m5_composite_remainder_replay.py`` makes
+    for the composite route.
+    """
+
+    def __init__(self, *, market_price: str, position_size: str = "10"):
+        self.market_price = market_price
+        self.position_size = position_size
+        self.pending = [
+            {
+                "ordId": "binding-385-old-stop", "posId": "pos-b",
+                "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "triggerOrderType": "TPSL", "slTriggerPx": "81800", "sz": "0",
+            },
+        ]
+        self.open_orders: list[dict] = []
+        self.set_calls: list[dict] = []
+        self.cancel_sltp_calls: list[dict] = []
+        self.close_calls: list[dict] = []
+
+    def list_positions(self, *, inst_id=None):
+        if self.position_size in (None, "0"):
+            return []
+        return [
+            {
+                "posId": "pos-b", "instId": "BTC-USDT-SWAP", "posSide": "long",
+                "pos": self.position_size, "avgPx": "83800",
+                "markPx": self.market_price, "mgnMode": "cross",
+                "mrgPosition": "split", "posMode": "split",
+            }
+        ]
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        return list(self.pending)
+
+    def list_trigger_order_history(self, *, inst_id):
+        return []
+
+    def list_order_history(self, *, inst_id):
+        return []
+
+    def list_trade_fills(self, *, inst_id):
+        return []
+
+    def list_open_orders(self, *, inst_id=None):
+        return list(self.open_orders)
+
+    def get_ticker_quote(self, *, inst_id):
+        return {
+            "instrument_id": "BTC-USDT-SWAP", "price": self.market_price,
+            "price_field": "last", "observed_at": PLANNED_AT.isoformat(),
+        }
+
+    def set_position_sltp(self, payload):
+        self.set_calls.append(dict(payload))
+        order_id = f"new-stop-{len(self.set_calls)}"
+        # A full-position (non-partial) protection write omits ``sz``
+        # entirely (``PositionMutationGateway.set_exact_position_sltp``); the
+        # exchange's own convention for "whole position" is ``sz="0"``.
+        self.pending.append(
+            {
+                "ordId": order_id, "posId": "pos-b", "instId": "BTC-USDT-SWAP",
+                "posSide": "long", "triggerOrderType": "TPSL",
+                "slTriggerPx": payload["slTriggerPx"],
+                "sz": payload.get("sz", "0"),
+            }
+        )
+        return {"code": "0", "data": {"ordId": order_id}}
+
+    def cancel_position_sltp(self, payload):
+        order_id = payload["ordId"]
+        self.cancel_sltp_calls.append(dict(payload))
+        self.pending = [row for row in self.pending if row["ordId"] != order_id]
+        return {"code": "0", "data": {"ordId": order_id}}
+
+    def cancel_trigger_order(self, payload):  # pragma: no cover - unused route
+        raise AssertionError("this replay never cancels via cancel_trigger_order")
+
+    def place_order(self, payload):
+        self.close_calls.append(dict(payload))
+        self.position_size = "0"
+        return {"code": "0", "data": {"ordId": f"close-{len(self.close_calls)}"}}
+
+    def cancel_order(self, payload):  # pragma: no cover - no deferred entries
+        raise AssertionError("this replay has no deferred entry legs to cancel")
+
+
+def _execute(session_factory, batch_id, *, market_price):
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    client = _BreakEvenExecutorClient(market_price=market_price)
+    result = execute_management_batch(
+        session_factory, batch_id=batch_id, deepcoin_client=client,
+        executed_at=PLANNED_AT,
+    )
+    return result, client
+
+
+def test_executor_arms_the_strategy_price_not_83200_when_the_market_allows_it(
+    tmp_path,
+):
+    """Market 83900: the redirected batch behaves exactly like a native
+    ``move_stop_to_break_even`` batch reaching the executor -- the strategy
+    price (83800) is armed, and 83200 is written nowhere at all.
+    """
+
+    session_factory = create_session_factory(tmp_path / "exec-armed.db")
+    plan = _plan_worse_stop_batch(session_factory, with_rejection_history=True)
+    assert plan.status == "ready"
+    assert plan.batch.intent == "move_stop_to_break_even"
+
+    result, client = _execute(session_factory, plan.batch.id, market_price="83900")
+
+    assert result["status"] == "succeeded"
+    assert client.close_calls == []
+    assert [call["slTriggerPx"] for call in client.set_calls] == ["83800"]
+    assert all(call["slTriggerPx"] != "83200" for call in client.set_calls)
+    assert client.cancel_sltp_calls and (
+        client.cancel_sltp_calls[0]["ordId"] == "binding-385-old-stop"
+    )
+
+    from telegram_kol_research.management_stop_price_gate import (
+        validate_batch_stops,
+    )
+    from telegram_kol_research.strategy_management_batches import (
+        load_management_batch,
+    )
+
+    batch = load_management_batch(session_factory, plan.batch.id)
+    gate = validate_batch_stops(
+        session_factory, batch=batch, client=client, now=PLANNED_AT,
+    )
+    assert gate is None
+
+
+def test_executor_market_closes_the_remainder_when_83800_is_on_the_wrong_side(
+    tmp_path,
+):
+    """Market 83700: the strategy price 83800 is above the market for a long,
+    so it can never be armed. The executor closes at market instead of
+    writing either 83800 or 83200 as a stop.
+    """
+
+    session_factory = create_session_factory(tmp_path / "exec-market-close.db")
+    plan = _plan_worse_stop_batch(session_factory, with_rejection_history=True)
+    assert plan.status == "ready"
+
+    result, client = _execute(session_factory, plan.batch.id, market_price="83700")
+
+    assert result["status"] == "reconciling"
+    assert client.set_calls == []
+    assert [(call["closePosId"], call["sz"]) for call in client.close_calls] == [
+        ("pos-b", "10")
+    ]
+
+    from telegram_kol_research.management_stop_price_gate import (
+        validate_batch_stops,
+    )
+    from telegram_kol_research.strategy_management_batches import (
+        load_management_batch,
+    )
+
+    batch = load_management_batch(session_factory, plan.batch.id)
+    gate = validate_batch_stops(
+        session_factory, batch=batch, client=client, now=PLANNED_AT,
+    )
+    assert gate is None
+
+
+def test_removing_the_redirect_writes_83200_straight_through(tmp_path, monkeypatch):
+    """Mutation check: turn the redirect off, keep everything else identical.
+
+    ``strategy_management_planner._redirect_stop_worse_than_fill_after_rejected_add``
+    is monkeypatched to its own no-op default (``default_intent`` unchanged,
+    ``identity`` unchanged, no evidence) -- exactly what it returns today when
+    either of its two conditions is false. With the same rejection history and
+    the same worse price, the batch now keeps ``intent == "adjust_stop_loss"``
+    and its explicit 83200, and the executor arms 83200 verbatim. This is the
+    positive control for the two tests above: without the redirect, the same
+    fixture produces the bug the redirect exists to prevent.
+    """
+
+    planner = _planner()
+
+    def _no_redirect(session_factory, *, identity, lifecycle, economics, candidate,
+                      default_intent, now):
+        return default_intent, identity, None
+
+    monkeypatch.setattr(
+        planner, "_redirect_stop_worse_than_fill_after_rejected_add", _no_redirect,
+    )
+
+    session_factory = create_session_factory(tmp_path / "exec-mutation.db")
+    plan = _plan_worse_stop_batch(
+        session_factory, with_rejection_history=True, redirect_active=False,
+    )
+
+    assert plan.status == "ready"
+    assert plan.batch.intent == "adjust_stop_loss"
+    assert plan.batch.legs[0].planned_tpsl["stop_loss_text"] == "83200"
+
+    result, client = _execute(session_factory, plan.batch.id, market_price="83900")
+
+    assert result["status"] == "succeeded"
+    assert [call["slTriggerPx"] for call in client.set_calls] == ["83200"]
