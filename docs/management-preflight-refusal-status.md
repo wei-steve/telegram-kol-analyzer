@@ -34,6 +34,21 @@
 - 唯一没被这条堵住的场景，是进程在"交易所调用已发出、还没来得及写诊断/成功记录"之间被杀掉（真正的中途崩溃）——这是一个通用的"崩溃在写后确认之前"问题，不是本设计要解决的东西；对应的冻结留在原地（`uncertain`），后续仍走运维收口。
 - 结论：证明对"批次曾经走到过 `_cancel_deferred_entry_legs` 且有实际撤单动作"这一类情况**结构性地不成立**（因为条件 6 会失败），无需单独排查时间窗口。
 
+### 指挥会话审阅更正（2026-09-29）
+
+上面「两种正常控制流结局都会补一条 `execution_events`」**不成立**。还有第三种结局：撤单调用**成功返回**之后，
+`_deferred_entry_still_matches_snapshot` 复核失败，函数直接 `raise ManagementBatchExecutionError("deferred_entry_cancel_leg_not_pending")`，
+**不写任何执行事件**。这时交易所上确实撤过一张单，而批次腿仍是 `planned`、名下没有执行事件——账本证明会误判为「没写过」。
+
+处理（本会话补的提交）：证明只在执行边界的追踪器**一次写入都没记录**时才运行（`authoritative_recognition.py`，
+`boundary.evidence_refs` 里有任何 `kind=deepcoin_write` 就直接冻结，不查账本）。整条自动执行链路用的是
+`TrackedDeepcoinClient`（`web_app._run_auto_trade_executor`），它拦截 `DEEPCOIN_WRITE_METHODS` 里的每一个方法，
+包括 `cancel_order` / `cancel_trigger_order`，所以这条路径上的撤单必定留下追踪记录。两个见证各管一半：
+追踪器管「有没有发过写请求」，账本管追踪器看不到的部分；**任何一方单独都不足以判定没写过**。
+回放：`tests/test_authoritative_recognition.py::test_ledger_proof_is_never_consulted_after_a_tracked_write`
+（修复前失败、修复后通过），`::test_a_proven_preflight_refusal_closes_and_is_never_replayed`（端到端：收口、不抛异常、决定行 completed/failed）。
+另更正调用点注释：原注释写「消息仍可再次尝试，跟 failed_safe 一样」，与裁定 Q1=B 相反，已改为「不可自动重试」。
+
 ### 救援表 `trigger_protection_stop_rescues` 是否由管理批次路径创建
 
 **不会。** `TriggerProtectionStopRescue` 只在 `strategy_management_planner.plan_trigger_protection_stop_rescue` 里创建（键在 `trigger_protection_intent_id`），这是一条完全独立的入口，不由 `execute_management_batch` 触发；`execute_trigger_protection_stop_rescue`（执行救援）也是独立顶层函数，不在管理批次执行链路里被调用。所以证明第 5 条（救援行检查）在这条路径上永远不会被触发——已在状态文档里记录这个结论，代码里仍保留这条防御性检查（成本几乎为零，且设计稿明确要求）。

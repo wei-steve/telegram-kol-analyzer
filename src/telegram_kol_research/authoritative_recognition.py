@@ -2892,12 +2892,33 @@ def _run_leased_authoritative_execution(
             # exchange write still lands here with no evidence. Try the
             # structural ledger proof before freezing: if every item and every
             # batch for this message proves no contact, this is a fact
-            # (``closed_no_write``), not an unknown, and the message stays
-            # eligible for another try -- exactly like A-6's ``failed_safe``,
-            # just for a proof the boundary itself cannot see.
-            proven, management_refs = management_batches_prove_no_exchange_contact(
-                session_factory,
-                raw_message_id=raw_message_id,
+            # (``closed_no_write``), not an unknown. Unlike A-6's
+            # ``failed_safe`` the message does NOT become retryable:
+            # ``closed_no_write`` is in ``RETRY_BLOCKING_ATTEMPT_STATUSES``, so
+            # automatic and context retries stay blocked exactly as they were
+            # while the attempt was frozen (the user's 2026-09-29 ruling, Q1=B).
+            #
+            # The proof only runs when the boundary tracked no exchange write
+            # at all. The ledger is not a complete witness on its own:
+            # ``_cancel_deferred_entry_legs`` sends its cancel before writing
+            # any ledger row, and if the leg then fails its snapshot re-check
+            # it raises without recording an event -- a real cancel that the
+            # ledger never saw. The tracked client sits in front of every
+            # write method, so "no tracked write" is the witness for that
+            # path and the ledger proof is the witness for the rest; neither
+            # is trusted alone.
+            tracked_write = any(
+                str(ref.get("kind") or "") == "deepcoin_write"
+                for ref in boundary.evidence_refs
+                if isinstance(ref, dict)
+            )
+            proven, management_refs = (
+                (False, ())
+                if tracked_write
+                else management_batches_prove_no_exchange_contact(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                )
             )
             if proven:
                 if not record_management_preflight_refusal(

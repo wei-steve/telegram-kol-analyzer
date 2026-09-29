@@ -21,6 +21,7 @@ from telegram_kol_research.context_resolution import (
 )
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    AuthoritativeExecutionAttempt,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
@@ -2475,6 +2476,100 @@ def test_post_boundary_unknown_freezes_generation_and_never_replays(
     with session_factory() as session:
         decision = session.query(RecognitionDecision).one()
         assert decision.comparison_status == "execution_uncertain"
+
+
+def _management_refusal_boundary(evidence_refs=()):
+    return ExecutionBoundaryOutcome(
+        status="outcome_unknown",
+        exchange_effect="outcome_unknown",
+        raw_status="partial_failed",
+        reason_code=None,
+        evidence_refs=tuple(evidence_refs),
+        public_result={"status": "partial_failed"},
+    )
+
+
+def test_ledger_proof_is_never_consulted_after_a_tracked_write(
+    tmp_path, monkeypatch
+):
+    """2026-09-29: the ledger alone is not a complete witness.
+
+    ``_cancel_deferred_entry_legs`` sends its cancel before any ledger row and
+    can raise without recording one, so a batch ledger that "proves" no
+    contact is only believed when the tracked client saw no write either.
+    """
+
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "preflight-tracked-write"
+    )
+    consulted = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition."
+        "management_batches_prove_no_exchange_contact",
+        lambda *args, **kwargs: consulted.append(kwargs)
+        or (True, ({"kind": "management_batch_no_exchange_contact"},)),
+    )
+    write = {
+        "kind": "deepcoin_write",
+        "method": "cancel_order",
+        "ordinal": 1,
+        "outcome": "confirmed_applied",
+    }
+
+    with pytest.raises(RuntimeError, match="outcome_unknown"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=lambda _: _management_refusal_boundary((write,)),
+            execution_owner=_execution_owner(),
+        )
+
+    assert consulted == []
+    with session_factory() as session:
+        attempt = session.query(AuthoritativeExecutionAttempt).one()
+        assert attempt.status == "uncertain"
+        decision = session.query(RecognitionDecision).one()
+        assert decision.comparison_status == "execution_uncertain"
+
+
+def test_a_proven_preflight_refusal_closes_and_is_never_replayed(
+    tmp_path, monkeypatch
+):
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "preflight-proven"
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition."
+        "management_batches_prove_no_exchange_contact",
+        lambda *args, **kwargs: (
+            True,
+            ({"kind": "management_batch_no_exchange_contact", "batch_id": 184},),
+        ),
+    )
+    calls = []
+
+    def executor(message_id):
+        calls.append(message_id)
+        return _management_refusal_boundary()
+
+    process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=executor,
+        execution_owner=_execution_owner(),
+    )
+    assert calls == [raw_id]
+    with session_factory() as session:
+        attempt = session.query(AuthoritativeExecutionAttempt).one()
+        assert attempt.status == "closed_no_write"
+        assert attempt.exchange_effect == "not_started"
+        decision = session.query(RecognitionDecision).one()
+        assert decision.comparison_status == "completed"
+        assert decision.automation_status == "failed"
 
 
 @pytest.mark.parametrize(
