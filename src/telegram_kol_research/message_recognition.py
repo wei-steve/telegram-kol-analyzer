@@ -80,6 +80,7 @@ from telegram_kol_research.management_directives import (
     ManagementFractionInvalid,
     build_management_instruction_contract,
     multi_target_action_policy,
+    directive_is_not_actionable,
     resolve_management_directive,
 )
 from telegram_kol_research.management_fraction_gate import (
@@ -1264,6 +1265,12 @@ def _apply_lifecycle_event_decision(
         if str(exc) != "management_fraction_ambiguous":
             raise
         return False
+    if directive_is_not_actionable(management_directive):
+        # Phase 3 plan section 5.2: an intention, hypothetical or price-trigger
+        # comment is not an order. Nothing below may write (exit intent,
+        # cancel, candidate); the reason is attributed by
+        # ``_attribute_unapplied_lifecycle_event`` from the same directive.
+        return False
 
     reply_target = _resolve_reply_lifecycle_target(session, raw_message)
     explicit_target_lifecycle_id = _int_or_none(
@@ -2182,6 +2189,10 @@ def _admit_one_explicit_management_target_in_session(
     target_id = _int_or_none(target_decision.get("target_lifecycle_id"))
     if target_id is None:
         raise ValueError("target_lifecycle_id_missing")
+    if directive_is_not_actionable(directive):
+        # Phase 3 plan section 5.2: refused per target with the gate's own
+        # ``management_not_actionable:<rule>`` code.
+        raise ValueError(directive.reason_code)
     if not directive.risk_reducing:
         raise ValueError(directive.reason_code)
     if policy.requires_fraction and directive.fraction is None:
@@ -2355,6 +2366,14 @@ def _attribute_unapplied_lifecycle_event(
         directive_error = str(exc)
     else:
         intent = str(getattr(directive, "intent", "") or "") or None
+        if directive_is_not_actionable(directive):
+            # Phase 3 plan section 5.2: the gate's own refusal, recorded as
+            # ``management_not_actionable:<rule>``. Not in ALERTED_REASONS: for
+            # a commentary message this is the expected outcome.
+            return recognition_attribution.LifecycleApplicationVerdict(
+                directive.reason_code,
+                str(lifecycle_event.get("management_action") or "") or "none",
+            )
 
     # A multi-target instruction names its lifecycles inside ``targets``, and a
     # malformed one expands to nothing at all -- which is a refusal to read the
@@ -2539,6 +2558,10 @@ def _apply_deterministic_management_scope_if_matched(
     except ValueError as exc:
         if str(exc) != "management_fraction_ambiguous":
             raise
+        return False
+    if directive_is_not_actionable(directive):
+        # Phase 3 plan section 5.2, and the fan-out shape in particular
+        # ("其它币种多单继续持有做好加一次仓的预期"): no fixed object, no order.
         return False
     reply_target = _resolve_reply_lifecycle_target(session, raw_message)
     explicit_target_lifecycle_id = _int_or_none(

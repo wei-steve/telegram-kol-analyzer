@@ -9,6 +9,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from telegram_kol_research.contact_digit_scrubbing import scrub_contact_identifiers
+from telegram_kol_research.management_actionability import (
+    REASON_PREFIX as MANAGEMENT_NOT_ACTIONABLE_PREFIX,
+    assess_management_actionability,
+)
 from telegram_kol_research.strategy_management_contracts import (
     COMPOSITE_MANAGEMENT_CONTRACT_VERSION,
     ManagementInstructionContract,
@@ -199,9 +203,61 @@ def resolve_management_directive(
     *,
     text: str,
     lifecycle_event: Mapping[str, Any],
+    actionability_gate: bool = True,
 ) -> ManagementDirective:
-    """Convert one authoritative lifecycle event into deterministic policy."""
+    """Convert one authoritative lifecycle event into deterministic policy.
 
+    First-pass phase 3 plan section 5.2: the directive is then put through the
+    actionability gate (``management_actionability``). An intention, a
+    hypothetical or a price-trigger comment is not an instruction, whatever the
+    model classified it as: the result is ``intent="none"`` with
+    ``reason_code="management_not_actionable:<rule>"`` and nothing downstream
+    writes to the exchange. Only exchange-writing intents are judged.
+
+    ``actionability_gate=False`` is for the recovery path
+    (``position_management_remediation``), which re-drives a candidate that was
+    already admitted -- possibly before the gate existed, and rebuilt from the
+    candidate row, which no longer carries the model's ``event_type`` -- and must
+    not re-litigate it.
+    """
+
+    directive = _resolve_management_directive_unchecked(
+        text=text, lifecycle_event=lifecycle_event
+    )
+    if not actionability_gate:
+        return directive
+    refusal = assess_management_actionability(
+        text, lifecycle_event, directive.intent
+    )
+    if refusal is None:
+        return directive
+    return ManagementDirective(
+        intent="none",
+        fraction=None,
+        symbol=directive.symbol,
+        side=directive.side,
+        stop_loss=directive.stop_loss,
+        risk_reducing=False,
+        fanout_allowed=False,
+        cancel_deferred_entries=False,
+        reason_code=refusal.reason_code,
+        strategy_thread_id=directive.strategy_thread_id,
+    )
+
+
+def directive_is_not_actionable(directive: ManagementDirective) -> bool:
+    """Whether ``directive`` is the actionability gate's refusal."""
+
+    return str(directive.reason_code or "").startswith(
+        MANAGEMENT_NOT_ACTIONABLE_PREFIX + ":"
+    )
+
+
+def _resolve_management_directive_unchecked(
+    *,
+    text: str,
+    lifecycle_event: Mapping[str, Any],
+) -> ManagementDirective:
     validate_management_fraction_inputs(lifecycle_event, str(text or ""))
     normalized_text = str(text or "").strip().lower()
     event_type = str(lifecycle_event.get("event_type") or "").strip().lower()

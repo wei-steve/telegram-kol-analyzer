@@ -118,6 +118,9 @@ from telegram_kol_research.management_stop_price_gate import (
     validate_management_stop, read_stop_quote, record_stop_gate_rejection,
     stop_gate_clock,
 )
+from telegram_kol_research.management_actionability import (
+    assess_management_actionability,
+)
 from telegram_kol_research.management_directives import future_take_profit_level
 from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -557,6 +560,22 @@ def _plan_strategy_management_batch_locked(
             raw_message_id=raw_message_id,
             intent=intent or "unknown",
             reason_code="management_intent_not_supported",
+            planned_at=now,
+            execution_mode=execution_mode,
+        )
+    actionability_refusal = _actionability_backstop_refusal(
+        identity=identity, intent=intent
+    )
+    if actionability_refusal is not None:
+        # Phase 3 plan section 5.2, last line of defence: the recognition-side
+        # gate already refused these; this catches a candidate that reached the
+        # planner by any other route. Zero exchange writes, recorded, not alerted.
+        return _persist_blocked(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            intent=intent,
+            reason_code=actionability_refusal.reason_code,
             planned_at=now,
             execution_mode=execution_mode,
         )
@@ -2986,6 +3005,36 @@ def _leg_state(leg: ExecutionOrderLeg) -> tuple[Any, ...]:
         leg.terminal_reason,
         leg.last_verified_at,
         leg.status,
+    )
+
+
+#: Candidates whose text drove them. Deterministic price/lifecycle exits, source
+#: deletion and the low-confidence group exit are not text instructions and are
+#: never judged here.
+_ACTIONABILITY_TEXT_PARSE_SOURCES = frozenset({"mimo_authoritative", "lifecycle_ai"})
+
+
+def _actionability_backstop_refusal(*, identity: _PlanningIdentity, intent: str):
+    """Rules 1-3 of the actionability gate against the candidate's own message.
+
+    Rule 4 (a price is required) is left to the stop gate, which already sees the
+    resolved price; rule 5 needs the model's ``event_type``, which a candidate
+    does not carry. Both are evaluated on the recognition side.
+    """
+
+    if str(identity.candidate.parse_source or "") not in _ACTIONABILITY_TEXT_PARSE_SOURCES:
+        return None
+    raw_message = identity.raw_message
+    if raw_message is None or not str(raw_message.text or "").strip():
+        return None
+    return assess_management_actionability(
+        raw_message.text,
+        {
+            "management_action": intent,
+            "stop_loss": identity.candidate.stop_loss_text,
+        },
+        intent,
+        check_price=False,
     )
 
 

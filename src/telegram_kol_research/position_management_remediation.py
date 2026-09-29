@@ -208,6 +208,9 @@ def resolve_remediation_scope(
                 directive = resolve_management_directive(
                     text=raw_message.text or "",
                     lifecycle_event=decision,
+                    # Recovery of an already admitted candidate; see the
+                    # ``actionability_gate`` note on the resolver.
+                    actionability_gate=False,
                 )
                 targets = resolve_management_scope_in_session(
                     session,
@@ -465,6 +468,9 @@ def build_position_management_remediation_plan(
                 directive = resolve_management_directive(
                     text=raw_message.text or "",
                     lifecycle_event=decision,
+                    # Recovery of an already admitted candidate; see the
+                    # ``actionability_gate`` note on the resolver.
+                    actionability_gate=False,
                 )
                 targets = resolve_management_scope_in_session(
                     session,
