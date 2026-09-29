@@ -20,7 +20,7 @@
 |---|---|---|
 | 阶段 1 · 影子 | L1（additive dormant） | `completed`（代码 `5ca19513`，提示词 v9 = `ai_prompt_versions.id=10` 已发布，观察窗通过） |
 | 阶段 2 · 观察与人工核准 | L0 | `completed`（2026-09-29：四张表已出；A、B 两组共 44 条人工核准已写入标注表） |
-| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 代码候选 `25cce75e` 全量通过，未部署；批次 B 提示词待 entry_fragments 版本发布后做） |
+| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 代码候选已变基到 `c40fb421` 之上，末个代码提交 `386bf8d7` 全量通过，未部署；批次 B 提示词待 v11 满一周） |
 | 阶段 4 · 收口 | 以后 | `planned` |
 
 **仓库层面的一件事（2026-09-24，与本设计无关但影响所有会话）**：
@@ -671,6 +671,16 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
 | 实施 | Sonnet 5 子代理两批；Opus 5.5 审阅并补两处修正 |
 | 未碰 | `prompt_defaults.py` / `prompt_composition.py` 及其两份测试（entry_fragments 会话在改）；数据库结构；提示词版本 |
 
+**变基（2026-09-29 夜，调度会话要求）。** 生产已前进到 `c40fb421`（entry_fragments 部署，提示词 `ai_prompt_versions.id = 11` 于 **2026-09-29 16:14:30 UTC** 发布，即下面测量界线 2）。本分支变基到 `origin/main` `5973e31d`，10 个提交无冲突，`c40fb421` 在祖先链上。原候选 `25cce75e` 作废；新的末个代码提交为 **`386bf8d7`**，全量 `10834 passed, 4 skipped`（926 s），与变基前一致。
+
+**v11 下复核回放**（同样在服务器上以只读库连接重答，不写任何表，shared id=11）：
+
+| raw | v11 输出 | 本阶段代码下的结果 |
+|---|---|---|
+| 18602 | `策略管理 / exact / 1291`，`cancel_entry → 1291`（0.99），与 v9 一致 | R1 仍成立：首轮自带撤单目标，`cancellation_language` 可删 |
+| 19016 | `是策略`（strategy 完整、止损 null）+ `[策略管理 / forthcoming / ETH short]` + `entry_context.risk_multiplier = 0.1` | 违规只有 `strategy_not_allowed`，**非致命**；校验器通过，不被 fail-closed；forthcoming 不触发上下文。这正是方案 §3.1 把 `strategy_not_allowed` 定为非致命的那个形状——若判致命，v11 下每条「无止损的是策略」都会被整条丢掉，也会毁掉 §11 的恢复统计 |
+| 7929 / 12042 | `[闲话]`（v9 下是 `策略管理/unknown`，12042 另有 `仓位管理`） | 不再触发 `management_without_exact_target`；旧字段 `event_type = none`，兜底判据也不触发。v9 下阶段 3 会为它们各调一次上下文，v11 下不会——方向与本阶段一致（没有定量的半截消息不进管理链路） |
+
 **回放 R1（18602）已完成，`cancellation_language` 可以删。** 2026-09-29 在服务器上以只读库连接、生产 v9（shared id=10、vision id=2）、`gpt-5.6-luna` 让模型重答一次，**不写任何表**（比方案批准的「提示词中心对照测试写一行」更轻）。结果：`message_classes = [策略管理 / exact / 1291 / BTC long]`，`lifecycle_event = cancel_entry → 1291`（0.99）。1291 在消息时刻（09-23 14:21:29）仍是 `pending_entry`，两分钟后（14:23:18）才入场。新判据下首轮自己就给出了撤单目标，不需要关键词触发；如果目标届时已不在候选或已终态，由两条新判据接住。
 
 **与方案的偏差（审阅已接受）：**
@@ -687,7 +697,7 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
 
 **测量界线**（本线以后按段统计）：
 1. 2026-09-27 01:32:14 UTC（校验器修复 `e1d29708`）；
-2. entry_fragments 会话的新提示词版本发布时刻（待它写入）；
+2. **2026-09-29 16:14:30 UTC**：entry_fragments 会话发布 `ai_prompt_versions.id = 11`（详见上文「第二条测量界线」一节）；
 3. **阶段 3 代码部署时刻**（待部署）；
 4. **阶段 3 提示词（批次 B）发布时刻**（待发布）。
 
@@ -697,7 +707,7 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
 
 ### 部署前待做（调度会话排期）
 
-- L2 部署：推自有分支 → 核对候选是生产 HEAD 的后代 → `tg-deploy 25cce75e…` → 同一 sha 推 `origin/main` → 双向核对 + offenders 检查。无 schema、无依赖变更。
+- L2 部署：推自有分支 → 核对候选是生产 HEAD（`c40fb421`）的后代 → `tg-deploy <本分支末端 sha>` → 同一 sha 推 `origin/main` → 双向核对 + offenders 检查。无 schema、无依赖变更。
 - 观察判据见方案 §8（30 分钟、≥5 条真实消息；被删三个触发名不再出现；每条非网络错误的上下文请求 ≤1；两个新终态原因与 `management_not_actionable` 逐条列出；窗口内若有管理写入，直接核对交易所历史）。
 - 若部署前 `origin/main` 又前进了代码，先变基、重跑相关聚焦测试与一次全量。
 
