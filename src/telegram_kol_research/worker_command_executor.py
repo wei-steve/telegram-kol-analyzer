@@ -85,6 +85,10 @@ class WorkerCommandDependencies:
         deliver_terminal_entry_cleanup_notifications
     )
     entry_admission_frozen: bool = False
+    #: ``chat_id -> label or None``; names the group in the geometry refusal
+    #: alert the cleanup deliverer sends (2026-09-29). ``None`` makes that
+    #: alert say 「未知群」 -- it never falls back to printing the chat id.
+    group_label_for: Callable[[int], str | None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -354,6 +358,7 @@ async def _execute_sync(
             dependencies.session_factory,
             config=dependencies.system_operator_bot_config,
             delivered_at=dependencies.now_provider(),
+            group_label_for=dependencies.group_label_for,
         )
     return WorkerCommandExecutionResult(http_status=200, body=body)
 
@@ -431,6 +436,7 @@ async def _execute_close(
             dependencies.session_factory,
             config=dependencies.system_operator_bot_config,
             delivered_at=dependencies.now_provider(),
+            group_label_for=dependencies.group_label_for,
         )
     return WorkerCommandExecutionResult(http_status=200, body=body)
 

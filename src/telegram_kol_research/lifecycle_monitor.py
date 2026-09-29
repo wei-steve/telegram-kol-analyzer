@@ -35,6 +35,7 @@ from telegram_kol_research.lifecycle_exit_intents import (
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     ExecutionOrderLeg,
     RawMessage,
     SignalCandidate,
@@ -90,6 +91,19 @@ EXPIRY_OUT_OF_SCOPE_CLOSEOUT_ACTION = "expiry_auto_expired_out_of_scope"
 #: The human-readable half of the same distinction. Manual notes start with
 #: 人工, A2's with 超时自动收口, this one says which scope it fell outside.
 EXPIRY_OUT_OF_SCOPE_CLOSEOUT_NOTE_PREFIX = "不在自动交易范围（非人工判定）"
+
+#: 2026-09-29. The ``management_action`` written when a timed-out pending
+#: entry is closed out because its own message was refused by the entry price
+#: geometry check -- nothing was ever submitted, so there is no exchange order
+#: to ask about. Its own value, so it stays tellable apart from a person's
+#: decision, from A2's timeout and from 乙's scope close-out, and ``expiry_``
+#: prefixed for the same filter reason as those.
+EXPIRY_ENTRY_REFUSED_CLOSEOUT_ACTION = "expiry_entry_refused_closeout"
+EXPIRY_ENTRY_REFUSED_CLOSEOUT_NOTE_PREFIX = "入场已被拒绝（非人工判定）"
+#: The one refusal that counts (the user's ruling, design Q7). Written by
+#: ``execution_events.enqueue_entry_price_geometry_rejection_notification``
+#: with ``source_message_id`` = the raw message id.
+ENTRY_PRICE_GEOMETRY_REJECTED_ACTION = "entry_price_geometry_rejected"
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -1020,6 +1034,7 @@ class LifecycleMonitor:
         # 乙: one settings read per scan, not per row.
         allowed_symbols = self._expiry_review_allowed_symbols()
         out_of_scope_closed: list[int] = []
+        entry_refused_closed: list[int] = []
         with self._session_factory() as session:
             rows = (
                 session.query(StrategyLifecycle)
@@ -1070,6 +1085,25 @@ class LifecycleMonitor:
                     ):
                         state_changed = True
                         out_of_scope_closed.append(int(row.id))
+                    continue
+                # 2026-09-29: in scope, but its entry was refused by the price
+                # geometry check before anything was submitted, so the review's
+                # question -- keep waiting, expire, or cancel the exchange order
+                # -- has only one answer. Only at expiry, never at refusal: until
+                # then a later message in the group may still resolve to this
+                # strategy. If the claim does not land (a continued review, a
+                # concurrent writer), the row falls through and is asked about
+                # as before -- an extra question, never a missed one.
+                if (
+                    row.lifecycle_status == "pending_entry"
+                    and row.execution_binding_id is None
+                    and self._entry_refused_by_geometry_or_false(session, row)
+                    and self._claim_expiry_entry_refused_closeout(
+                        session, row, now=now
+                    )
+                ):
+                    state_changed = True
+                    entry_refused_closed.append(int(row.id))
                     continue
                 continued_review = row.expiry_review_next_at is not None
                 expiry_at = self._next_expiry_review_at(row)
@@ -1132,7 +1166,34 @@ class LifecycleMonitor:
                 len(out_of_scope_closed),
                 out_of_scope_closed,
             )
+        if entry_refused_closed:
+            # Unnotified on purpose: the refusal itself was notified when it
+            # happened. This line and each row's action and note are the record.
+            logger.info(
+                "Expired %d timed-out pending entries refused by the entry price geometry check, unnotified: lifecycle_ids=%s",
+                len(entry_refused_closed),
+                entry_refused_closed,
+            )
         return review_payloads
+
+    def _entry_refused_by_geometry_or_false(
+        self, session, row: StrategyLifecycle
+    ) -> bool:
+        """``_entry_refused_by_geometry``, reading a failure as "not refused".
+
+        Not refused means the row is reviewed as before, so a lookup that
+        cannot answer costs one notification rather than silencing one.
+        """
+
+        try:
+            return self._entry_refused_by_geometry(session, row)
+        except Exception:
+            logger.warning(
+                "geometry refusal lookup failed for lifecycle_id=%s; reviewing as before",
+                row.id,
+                exc_info=True,
+            )
+            return False
 
     def _expiry_review_allowed_symbols(self) -> frozenset[str] | None:
         """The global symbol whitelist, read once per scan.
@@ -1291,8 +1352,6 @@ class LifecycleMonitor:
           claimant cannot be overwritten.
         """
 
-        if row.lifecycle_status != "pending_entry":
-            return False
         mode_label = {
             "group_not_auto_trade": "群组未开启自动交易（或未在配置中）",
             "symbol_not_allowed": "标的不在全局白名单",
@@ -1308,6 +1367,101 @@ class LifecycleMonitor:
             "且无执行绑定（交易所无挂单可撤），"
             "未发人工审批，由系统按超时直接标记过期并停止跟踪。"
         )
+        return self._claim_expiry_silent_closeout(
+            session,
+            row,
+            now=now,
+            management_action=EXPIRY_OUT_OF_SCOPE_CLOSEOUT_ACTION,
+            note=note,
+        )
+
+    @staticmethod
+    def _entry_refused_by_geometry(session, row: StrategyLifecycle) -> bool:
+        """Whether this lifecycle's own message was refused by the geometry check.
+
+        Two indexed reads: ``raw_messages`` by ``(chat_id, message_id)`` for the
+        raw id, then ``execution_events.source_message_id`` -- which the
+        geometry refusal writes as that raw id -- narrowed to the one action.
+        Only ``entry_price_geometry_rejected`` counts (the user's 2026-09-29
+        ruling on Q7): it is written before any order exists, so a refused
+        message has nothing on the exchange. Other "never ordered" shapes -- an
+        entry still queued for admission, say -- may yet get an order, and keep
+        asking a person.
+        """
+
+        raw_ids = [
+            int(raw_id)
+            for (raw_id,) in session.query(RawMessage.id)
+            .filter(
+                RawMessage.chat_id == row.chat_id,
+                RawMessage.message_id == row.message_id,
+            )
+            .limit(5)
+            .all()
+        ]
+        if not raw_ids:
+            return False
+        return (
+            session.query(ExecutionEvent.id)
+            .filter(
+                ExecutionEvent.source_message_id.in_(raw_ids),
+                ExecutionEvent.action == ENTRY_PRICE_GEOMETRY_REJECTED_ACTION,
+            )
+            .limit(1)
+            .first()
+            is not None
+        )
+
+    def _claim_expiry_entry_refused_closeout(
+        self,
+        session,
+        row: StrategyLifecycle,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Expire a timed-out entry the geometry check refused, unasked.
+
+        2026-09-29: 舒琴 #19639 was refused and notified at 14:51Z; lifecycle
+        1356 was still built as ``pending_entry`` with no binding, and at 17:51Z
+        the review asked whether to cancel an exchange order that never
+        existed. 32 of the last 40 refusals were followed by that question,
+        none of them bound. Same conditional update as the out-of-scope
+        close-out, so every one of its guards holds here too.
+        """
+
+        note = (
+            f"{EXPIRY_ENTRY_REFUSED_CLOSEOUT_NOTE_PREFIX}："
+            "入场已被价格几何校验拒绝，交易所无挂单，按超时直接过期，未发人工审批。"
+            f"该策略已超过 {self._config.max_age_hours} 小时未入场，"
+            "拒绝当时已单独通知。"
+        )
+        return self._claim_expiry_silent_closeout(
+            session,
+            row,
+            now=now,
+            management_action=EXPIRY_ENTRY_REFUSED_CLOSEOUT_ACTION,
+            note=note,
+        )
+
+    @staticmethod
+    def _claim_expiry_silent_closeout(
+        session,
+        row: StrategyLifecycle,
+        *,
+        now: datetime,
+        management_action: str,
+        note: str,
+    ) -> bool:
+        """The one conditional UPDATE both unasked expiry close-outs share.
+
+        The guards are the ones ``_claim_expiry_out_of_scope_closeout``
+        explains: ``pending_entry`` only, no binding at write time, never
+        notified and no continued review, ``management_action`` unchanged
+        since the read.
+        """
+
+        if row.lifecycle_status != "pending_entry":
+            return False
         claim = session.query(StrategyLifecycle).filter(
             StrategyLifecycle.id == row.id,
             StrategyLifecycle.lifecycle_status == "pending_entry",
@@ -1326,9 +1480,7 @@ class LifecycleMonitor:
                 StrategyLifecycle.lifecycle_status: "expired",
                 StrategyLifecycle.exit_reason: "expired",
                 StrategyLifecycle.exited_at: now,
-                StrategyLifecycle.management_action: (
-                    EXPIRY_OUT_OF_SCOPE_CLOSEOUT_ACTION
-                ),
+                StrategyLifecycle.management_action: management_action,
                 StrategyLifecycle.management_note: note,
                 StrategyLifecycle.last_checked_at: now,
                 StrategyLifecycle.updated_at: now,

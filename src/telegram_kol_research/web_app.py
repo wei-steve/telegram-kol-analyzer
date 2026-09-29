@@ -1825,6 +1825,22 @@ def _group_label_by_chat_id(group_config: GroupConfig) -> dict[int, str]:
     }
 
 
+def _group_label_lookup(app):
+    """``chat_id -> label or None`` over the live group config.
+
+    Read on every call rather than captured at startup: ``app.state.group_config``
+    is replaced when the file is reloaded or a group's settings change, and a
+    label captured once would go stale for the life of the worker. Used by the
+    operator-bot reports, which name a group by label and never by its chat id
+    (2026-09-29).
+    """
+
+    def lookup(chat_id):
+        return _group_label_by_chat_id(app.state.group_config).get(int(chat_id))
+
+    return lookup
+
+
 def _timeline_group_names_by_chat_id(
     group_config: GroupConfig,
     group_labels_by_title: dict[str, str] | None = None,
@@ -6135,6 +6151,7 @@ def create_web_app(
                         terminal_entry_cleanup_bot_config=(
                             app.state.system_operator_bot_config
                         ),
+                        group_label_for=_group_label_lookup(app),
                         contract_spec_provider=app.state.deepcoin_contract_spec_provider,
                         authority_observer=(
                             app.state.runtime_authority_status.record_reconcile_cycle
@@ -6305,6 +6322,7 @@ def create_web_app(
                                     notification_config=(
                                         app.state.notification_bot_config
                                     ),
+                                    group_label_for=_group_label_lookup(app),
                                 ),
                                 session_factory=app.state.session_factory,
                                 runtime_config=app.state.runtime_incident_config,
@@ -7094,6 +7112,7 @@ def create_web_app(
         notification_bot_config=app.state.notification_bot_config,
         system_operator_bot_config=app.state.system_operator_bot_config,
         entry_admission_frozen=deployment_entry_frozen,
+        group_label_for=_group_label_lookup(app),
     )
     app.state.break_even_convergence_worker_runner = (
         break_even_convergence_worker_runner
@@ -11208,6 +11227,7 @@ async def run_deepcoin_execution_reconcile_loop(
     wake_signal=None,
     shadow_instrument_map_provider=None,
     group_trading_mode_provider=None,
+    group_label_for=None,
 ) -> None:
     """Reconcile on a fixed timer, and additionally as soon as a frame lands.
 
@@ -11279,6 +11299,7 @@ async def run_deepcoin_execution_reconcile_loop(
                         session_factory,
                         config=terminal_entry_cleanup_bot_config,
                         delivered_at=synced_at,
+                        group_label_for=group_label_for,
                     )
                 if authority_observer is not None:
                     authority_observer(observed_at=synced_at)

@@ -333,7 +333,9 @@ _PROVIDER_OUTAGE_MANAGEMENT_REASON_TEXT = {
 }
 
 
-def _format_provider_outage_replay_notification(incident, summary) -> str:
+def _format_provider_outage_replay_notification(
+    incident, summary, *, context: "IncidentContext | None" = None
+) -> str:
     def value(key: str, limit: int = 64) -> str:
         return _safe_runtime_incident_value(summary.get(key), limit=limit)
 
@@ -342,17 +344,24 @@ def _format_provider_outage_replay_notification(incident, summary) -> str:
         if summary.get("head_model")
         else None
     )
+    # 2026-09-29: the group by its label, never the chat id the summary
+    # carries -- the same rule as every other event-bot report.
+    group = _safe_runtime_incident_value(
+        (context.group_label if context is not None else None)
+        or UNKNOWN_GROUP_LABEL,
+        limit=64,
+    )
 
     incident_type = str(incident.incident_type or "")
     if incident_type == "provider_outage_entry_not_replayed":
         lines = [
             "识别主用模型故障期间的入场未执行，需人工判断",
-            f"群: {value('chat_id')}",
+            f"群: {group}",
             f"消息时间: {value('message_posted_at')} (UTC)",
             f"价格区间: {value('entry_summary', 128)}",
             f"原文: {value('instruction_excerpt', 200)}",
             "原因: 供应商故障耽误了识别；按规则，故障期间的入场一律不补执行",
-            "处理: 如仍要入场，请手动下单",
+            "需要你：如仍要入场，请手动下单",
         ]
     elif incident_type == "provider_outage_management_not_replayed":
         reason = _PROVIDER_OUTAGE_MANAGEMENT_REASON_TEXT.get(
@@ -360,11 +369,11 @@ def _format_provider_outage_replay_notification(incident, summary) -> str:
         )
         lines = [
             "识别主用模型故障期间的管理指令未自动执行，需人工判断",
-            f"群: {value('chat_id')}",
+            f"群: {group}",
             f"消息时间: {value('message_posted_at')} (UTC)",
             f"原文: {value('instruction_excerpt', 200)}",
             f"原因: {reason}",
-            "处理: 这条指令没有可用 /choose 选择的项，请人工核对仓位后决定",
+            "需要你：这条指令没有可用 /choose 选择的项，请人工核对仓位后决定",
         ]
     else:
         lines = [
@@ -386,9 +395,13 @@ def _format_provider_outage_replay_notification(incident, summary) -> str:
     )
 
 
-def _format_mimo_provider_incident_notification(incident, summary) -> str:
+def _format_mimo_provider_incident_notification(
+    incident, summary, *, context: "IncidentContext | None" = None
+) -> str:
     if str(incident.incident_type or "").startswith("provider_outage_"):
-        return _format_provider_outage_replay_notification(incident, summary)
+        return _format_provider_outage_replay_notification(
+            incident, summary, context=context
+        )
 
     def value(key: str) -> str:
         return _safe_runtime_incident_value(summary.get(key), limit=64)
@@ -518,8 +531,311 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
     )
 
 
-def format_runtime_incident_notification(incident) -> str:
-    """Render one bounded deterministic report without AI interpretation."""
+#: The one sentence that closes a runtime-incident report going to the
+#: notification bot. It is true there -- those types are for reading, and the
+#: trading flow really did not wait for anyone -- and it is kept word for word.
+RUNTIME_INCIDENT_RECORDED_ONLY_LINE = "处理: 已记录，正常交易流程未等待本通知。"
+
+#: 2026-09-29: what a person has to do, by incident type, for the types that
+#: stay in 「Kol事件处理」. Every one of them closed with the sentence above
+#: until then, which told the reader nothing was waiting on them -- the exact
+#: opposite of why the user ruled on 2026-09-26 that these stay in the event
+#: bot: the automatic path froze or gave up, and a person has to take over.
+#: Only event-handling types belong here; a type in
+#: ``NOTIFICATION_BOT_INCIDENT_TYPES`` keeps the recorded-only sentence.
+INCIDENT_ACTION_HINTS: dict[str, str] = {
+    "uncertain_without_write": (
+        "这条消息已冻结、不会再自动执行；请到交易所核对相关仓位是否需要手动处理。"
+    ),
+    "authoritative_execution_uncertain": (
+        "这条消息已冻结、不会再自动执行；请到交易所核对相关仓位是否需要手动处理。"
+    ),
+    "management_recovery_timeout": (
+        "这条管理指令已放弃执行、冻结已解除；请核对仓位的止损 / 止盈是否符合原意。"
+    ),
+    "severe_protection_incident": "到交易所核对并人工恢复。",
+    "management_recovery_required": "到交易所核对并人工恢复。",
+    "source_deletion_exit_stuck": "到交易所核对并人工恢复。",
+    "management_target_needs_confirmation": "回复 /choose 或 /dismiss。",
+    "duplicate_entry_needs_confirmation": "回复 /choose 或 /dismiss。",
+}
+#: An event-handling type nobody has written a sentence for yet. Deliberately
+#: still an instruction: a new type defaults to the event bot, and the event
+#: bot's messages are the ones a person acts on.
+GENERIC_INCIDENT_ACTION_HINT = "自动处理已停止，需要人工核对"
+#: A group with no configured label. Never the chat id: the event bot names
+#: groups the way the user does, and a bare -100… number is neither readable
+#: nor something that belongs in a Telegram message.
+UNKNOWN_GROUP_LABEL = "未知群"
+INCIDENT_CONTEXT_EXCERPT_CHARS = 120
+INCIDENT_CONTEXT_RELATED_LIMIT = 3
+INCIDENT_CONTEXT_RELATED_WINDOW = timedelta(hours=24)
+_INCIDENT_CONTEXT_SOURCE_ID_LIMIT = 20
+_POSITION_SIDE_LABELS = {"long": "多", "short": "空"}
+
+
+def incident_action_line(incident_type: Any) -> str:
+    """The closing line of a generic runtime-incident report, by destination."""
+
+    incident_type = str(incident_type or "")
+    if incident_type in NOTIFICATION_BOT_INCIDENT_TYPES:
+        return RUNTIME_INCIDENT_RECORDED_ONLY_LINE
+    return (
+        "需要你："
+        f"{INCIDENT_ACTION_HINTS.get(incident_type, GENERIC_INCIDENT_ACTION_HINT)}"
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class IncidentContext:
+    """What a person needs beside the incident row itself; display only.
+
+    Each field is ``None`` (or empty) when it could not be read, and the report
+    simply leaves that line out. Nothing here is written anywhere.
+    """
+
+    raw_message_id: int | None = None
+    group_label: str | None = None
+    message_excerpt: str | None = None
+    position: str | None = None
+    related: tuple[str, ...] = ()
+
+    def is_empty(self) -> bool:
+        return not (
+            self.group_label
+            or self.message_excerpt
+            or self.position
+            or self.related
+        )
+
+    def lines(self) -> list[str]:
+        lines = []
+        if self.group_label:
+            lines.append(
+                f"群: {_safe_runtime_incident_value(self.group_label, limit=64)}"
+            )
+        if self.message_excerpt:
+            lines.append(
+                "原文: "
+                + _safe_runtime_incident_value(
+                    self.message_excerpt, limit=INCIDENT_CONTEXT_EXCERPT_CHARS
+                )
+            )
+        if self.position:
+            lines.append(
+                f"仓位: {_safe_runtime_incident_value(self.position, limit=96)}"
+            )
+        if self.related:
+            lines.append("关联：同一消息此前已报 " + "、".join(self.related))
+        return lines
+
+
+def _positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def load_incident_context(
+    session_factory,
+    incident,
+    *,
+    group_label_for=None,
+) -> IncidentContext | None:
+    """Read the group, message, position and earlier reports for one incident.
+
+    2026-09-29: incidents 2417, 2418 and 2419 were all about 陈哥's raw 19598
+    and none of the three said so -- the report printed the incident row and
+    nothing else, so a person had to know which tables to query before they
+    could even tell it was one event. Everything here is a primary-key read or
+    an indexed equality read (``authoritative_execution_attempts.raw_message_id``,
+    ``strategy_management_batches.raw_message_id``, ``runtime_incidents
+    (source_kind, source_record_id)``); there is no scan.
+
+    Display only, and it may never cost the delivery: each step fails on its
+    own and leaves its line out, one warning names the steps that failed
+    (never their error text), and when nothing at all could be read the
+    result is ``None``. ``group_label_for(chat_id)`` returns the configured
+    label or ``None``; an unknown group is shown as 「未知群」, never as its
+    chat id.
+    """
+
+    from telegram_kol_research.models import (
+        AuthoritativeExecutionAttempt,
+        ExecutionBinding,
+        RawMessage,
+        RuntimeIncident,
+        StrategyManagementBatch,
+    )
+
+    failed: list[str] = []
+    incident_id = _positive_int(getattr(incident, "id", None))
+    source_kind = str(getattr(incident, "source_kind", "") or "")
+    source_record_id = _positive_int(getattr(incident, "source_record_id", None))
+
+    try:
+        summary = json.loads(getattr(incident, "redacted_summary", None) or "{}")
+    except (TypeError, ValueError):
+        summary = {}
+    raw_message_id = (
+        _positive_int(summary.get("raw_message_id"))
+        if isinstance(summary, dict)
+        else None
+    )
+    binding_id: int | None = None
+
+    if source_kind == "strategy_management_batch" and source_record_id is not None:
+        try:
+            with session_factory() as session:
+                batch = session.get(StrategyManagementBatch, source_record_id)
+                if batch is not None:
+                    raw_message_id = raw_message_id or _positive_int(
+                        batch.raw_message_id
+                    )
+                    binding_id = _positive_int(batch.execution_binding_id)
+        except Exception as exc:
+            failed.append(f"batch:{type(exc).__name__}")
+    if (
+        raw_message_id is None
+        and source_kind == "authoritative_execution_attempt"
+        and source_record_id is not None
+    ):
+        try:
+            with session_factory() as session:
+                attempt = session.get(AuthoritativeExecutionAttempt, source_record_id)
+                if attempt is not None:
+                    raw_message_id = _positive_int(attempt.raw_message_id)
+        except Exception as exc:
+            failed.append(f"attempt:{type(exc).__name__}")
+
+    group_label: str | None = None
+    excerpt: str | None = None
+    if raw_message_id is not None:
+        chat_id = None
+        text = None
+        try:
+            with session_factory() as session:
+                raw = session.get(RawMessage, raw_message_id)
+                if raw is not None:
+                    chat_id = raw.chat_id
+                    text = raw.text
+        except Exception as exc:
+            failed.append(f"message:{type(exc).__name__}")
+        if chat_id is not None:
+            label = None
+            if group_label_for is not None:
+                try:
+                    label = group_label_for(int(chat_id))
+                except Exception as exc:
+                    failed.append(f"group_label:{type(exc).__name__}")
+            group_label = str(label or "").strip() or UNKNOWN_GROUP_LABEL
+        collapsed = " ".join(str(text or "").split())
+        if collapsed:
+            excerpt = collapsed[:INCIDENT_CONTEXT_EXCERPT_CHARS]
+
+    position: str | None = None
+    if binding_id is not None:
+        try:
+            with session_factory() as session:
+                binding = session.get(ExecutionBinding, binding_id)
+                if binding is not None:
+                    side = str(binding.side or "").lower()
+                    position = (
+                        f"{binding.symbol or '?'} "
+                        f"{_POSITION_SIDE_LABELS.get(side, side or '?')}"
+                        f"（绑定 #{binding_id}，{binding.status or '?'}）"
+                    )
+        except Exception as exc:
+            failed.append(f"binding:{type(exc).__name__}")
+
+    related: tuple[str, ...] = ()
+    if raw_message_id is not None and incident_id is not None:
+        sources: list[tuple[str, list[str]]] = []
+        for kind, model, label in (
+            (
+                "authoritative_execution_attempt",
+                AuthoritativeExecutionAttempt,
+                "related_attempts",
+            ),
+            ("strategy_management_batch", StrategyManagementBatch, "related_batches"),
+        ):
+            try:
+                with session_factory() as session:
+                    ids = [
+                        str(int(row_id))
+                        for (row_id,) in session.query(model.id)
+                        .filter(model.raw_message_id == raw_message_id)
+                        .order_by(model.id.desc())
+                        .limit(_INCIDENT_CONTEXT_SOURCE_ID_LIMIT)
+                        .all()
+                    ]
+                if ids:
+                    sources.append((kind, ids))
+            except Exception as exc:
+                failed.append(f"{label}:{type(exc).__name__}")
+        anchor = getattr(incident, "first_occurred_at", None) or getattr(
+            incident, "last_occurred_at", None
+        )
+        found: list[tuple[int, str]] = []
+        for kind, ids in sources:
+            try:
+                with session_factory() as session:
+                    query = session.query(
+                        RuntimeIncident.id, RuntimeIncident.incident_type
+                    ).filter(
+                        RuntimeIncident.source_kind == kind,
+                        RuntimeIncident.source_record_id.in_(ids),
+                        RuntimeIncident.id < incident_id,
+                    )
+                    if isinstance(anchor, datetime):
+                        query = query.filter(
+                            RuntimeIncident.last_occurred_at
+                            >= anchor - INCIDENT_CONTEXT_RELATED_WINDOW
+                        )
+                    found.extend(
+                        (int(row_id), str(row_type or ""))
+                        for row_id, row_type in query.order_by(
+                            RuntimeIncident.id.desc()
+                        )
+                        .limit(INCIDENT_CONTEXT_RELATED_LIMIT)
+                        .all()
+                    )
+            except Exception as exc:
+                failed.append(f"related_incidents:{type(exc).__name__}")
+        found.sort(reverse=True)
+        related = tuple(
+            f"#{row_id}（{_safe_runtime_incident_value(row_type, limit=64)}）"
+            for row_id, row_type in found[:INCIDENT_CONTEXT_RELATED_LIMIT]
+        )
+
+    if failed:
+        logger.warning(
+            "Runtime incident context partly unavailable: incident=%s steps=%s",
+            incident_id,
+            ",".join(failed),
+        )
+    context = IncidentContext(
+        raw_message_id=raw_message_id,
+        group_label=group_label,
+        message_excerpt=excerpt,
+        position=position,
+        related=related,
+    )
+    return None if context.is_empty() else context
+
+
+def format_runtime_incident_notification(
+    incident, context: IncidentContext | None = None
+) -> str:
+    """Render one bounded deterministic report without AI interpretation.
+
+    ``context`` is optional and display only (see ``load_incident_context``);
+    without it the report is exactly what the incident row alone can say.
+    """
 
     try:
         summary = json.loads(incident.redacted_summary or "{}")
@@ -528,7 +844,9 @@ def format_runtime_incident_notification(incident) -> str:
     if not isinstance(summary, dict):
         summary = {}
     if str(getattr(incident, "incident_type", "") or "") in _MIMO_PROVIDER_INCIDENT_TYPES:
-        return _format_mimo_provider_incident_notification(incident, summary)
+        return _format_mimo_provider_incident_notification(
+            incident, summary, context=context
+        )
     labels = {
         "component": "组件",
         "source_status": "源状态",
@@ -558,6 +876,8 @@ def format_runtime_incident_notification(incident) -> str:
         ),
         f"重复次数: {max(1, int(incident.repeat_count or 1))}",
     ]
+    if context is not None:
+        lines.extend(context.lines())
     for key, label in labels.items():
         if key in summary:
             lines.append(
@@ -567,7 +887,7 @@ def format_runtime_incident_notification(incident) -> str:
         (
             "AI诊断: 未启用",
             "自动操作: 未执行",
-            "处理: 已记录，正常交易流程未等待本通知。",
+            incident_action_line(getattr(incident, "incident_type", "")),
         )
     )
     return wrap_ai_agent_notification(
@@ -2384,7 +2704,21 @@ def claim_next_strategy_management_notification(
         }
 
 
-def format_terminal_entry_cleanup_notification(event) -> str:
+def _group_label_line(chat_id: Any, group_label_for) -> str:
+    """「群: <label>」, or 「群: 未知群」 -- never the chat id itself."""
+
+    label = None
+    if group_label_for is not None and chat_id not in (None, ""):
+        try:
+            label = group_label_for(int(chat_id))
+        except Exception:
+            logger.warning("Group label unavailable for an operator notification")
+            label = None
+    label = str(label or "").strip() or UNKNOWN_GROUP_LABEL
+    return f"群: {_safe_management_text(label, limit=64)}"
+
+
+def format_terminal_entry_cleanup_notification(event, *, group_label_for=None) -> str:
     payload = _decode_mapping(event.response_json)
     if event.action == "entry_price_geometry_rejected":
         entry_domain = payload.get("entry_domain")
@@ -2400,7 +2734,9 @@ def format_terminal_entry_cleanup_notification(event) -> str:
             "【入场方向/价格几何拒绝】\n"
             f"Raw message: {payload.get('raw_message_id')}\n"
             f"Candidate: {payload.get('candidate_id')}\n"
-            f"Chat: {payload.get('chat_id')}\n"
+            # 2026-09-29: this line printed the bare chat id (舒琴 #19639's
+            # alert read ``Chat: -100…``). The group is named by its label.
+            f"{_group_label_line(payload.get('chat_id'), group_label_for)}\n"
             f"标的/方向: {_safe_management_text(payload.get('symbol'), limit=64)} / "
             f"{_safe_management_text(payload.get('side'), limit=16)}\n"
             f"入场价格域: {entry_domain[0]} - {entry_domain[1]}\n"
@@ -2608,8 +2944,13 @@ async def deliver_terminal_entry_cleanup_notifications(
     config: SystemOperatorBotConfig,
     delivered_at: datetime | None = None,
     limit: int = 20,
+    group_label_for=None,
 ) -> int:
-    """Deliver a bounded durable outbox; this worker performs no exchange writes."""
+    """Deliver a bounded durable outbox; this worker performs no exchange writes.
+
+    ``group_label_for(chat_id)`` names the group in the geometry refusal alert;
+    without it the alert says 「未知群」 rather than print the chat id.
+    """
 
     from telegram_kol_research.models import ExecutionEvent
 
@@ -2627,7 +2968,9 @@ async def deliver_terminal_entry_cleanup_notifications(
         try:
             message_id = await send_system_operator_bot_message(
                 config=config,
-                text=format_terminal_entry_cleanup_notification(event),
+                text=format_terminal_entry_cleanup_notification(
+                    event, group_label_for=group_label_for
+                ),
             )
         except Exception as exc:
             attempts = int(event.notification_attempts or 0)
@@ -2813,12 +3156,16 @@ async def deliver_runtime_incident_notifications(
     limit: int = 20,
     claimed_at: datetime | None = None,
     notification_config: SystemOperatorBotConfig | None = None,
+    group_label_for=None,
 ) -> int:
     """Deliver with at-least-once crash semantics and stable incident IDs.
 
     A process death after Telegram accepts a report but before ``delivered``
     commits can cause one repeat after lease expiry. The visible incident ID is
     the operator deduplication marker; committed successes are not reclaimed.
+
+    ``group_label_for(chat_id)`` names a group by its configured label; it is
+    used only for the event-handling reports' context lines (2026-09-29).
     """
 
     from telegram_kol_research.models import RuntimeIncident
@@ -2930,14 +3277,36 @@ async def deliver_runtime_incident_notifications(
             operator_config=config,
             notification_config=notification_config,
         )
+        diagnosed = bool(incident.status == "diagnosed" and incident.diagnosis_json)
+        context = None
+        if (
+            not diagnosed
+            and str(incident.incident_type or "")
+            not in NOTIFICATION_BOT_INCIDENT_TYPES
+        ):
+            # Event-handling reports only: they are the ones a person acts on.
+            # Display only, and never a reason not to deliver -- the loader
+            # fails open on its own, and this guards the loader itself.
+            try:
+                context = load_incident_context(
+                    session_factory, incident, group_label_for=group_label_for
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Runtime incident context skipped: incident=%s error=%s",
+                    incident.id,
+                    type(exc).__name__,
+                )
+                context = None
         try:
             await send_system_operator_bot_message(
                 config=target_config,
                 text=(
                     format_runtime_incident_diagnosis_notification(incident)
-                    if incident.status == "diagnosed"
-                    and incident.diagnosis_json
-                    else format_runtime_incident_notification(incident)
+                    if diagnosed
+                    else format_runtime_incident_notification(
+                        incident, context=context
+                    )
                 ),
             )
         except Exception as exc:
@@ -3234,6 +3603,7 @@ async def run_runtime_incident_notification_loop(
     deepcoin_client_factory=None,
     delivery_observer=None,
     notification_config: SystemOperatorBotConfig | None = None,
+    group_label_for=None,
 ) -> None:
     """Poll the Phase 2 outbox through the dedicated system operator bot.
 
@@ -3266,6 +3636,7 @@ async def run_runtime_incident_notification_loop(
                 config=config,
                 runtime_config=feature_config,
                 notification_config=notification_config,
+                group_label_for=group_label_for,
             )
             if delivered and delivery_observer is not None:
                 delivery_observer(datetime.now(UTC))

@@ -544,7 +544,18 @@ def test_a_delayed_entry_is_refused_and_announced_and_a_normal_one_is_not(
     assert "故障期间的入场未执行" in text
     assert "77000-77500" in text
     assert "BTC 77000 多" in text
-    assert f"群: {AUTO_CHAT}" in text
+    # 2026-09-29: the group by its label, never its chat id; the label comes
+    # from the delivery-time context, and without one the group is unknown.
+    assert "群: 未知群" in text
+    assert str(AUTO_CHAT) not in text
+    from telegram_kol_research.system_operator_bot import load_incident_context
+
+    context = load_incident_context(
+        session_factory, incidents[0], group_label_for={AUTO_CHAT: "自动群"}.get
+    )
+    labelled = format_runtime_incident_notification(incidents[0], context=context)
+    assert "群: 自动群" in labelled
+    assert "需要你：如仍要入场，请手动下单" in labelled
 
 
 def _management_candidate(raw_message):
