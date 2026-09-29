@@ -808,3 +808,29 @@ def test_the_worker_label_lookup_reads_the_live_group_config(tmp_path):
     assert lookup(-1008888888888) is None
     # The worker-command path hands the same lookup to the cleanup deliverer.
     assert app.state.worker_command_dependencies.group_label_for is not None
+
+
+@pytest.mark.parametrize(
+    "incident_type",
+    [
+        "management_add_position_rejected_stop_superseded",
+        "half_position_entry_confirmed_by_rule",
+        "management_partial_take_profit_future_level_blocked",
+    ],
+)
+def test_the_mia_always_notified_types_get_their_own_action_sentence(incident_type):
+    """42d8a73b added these three; two are "the system acted differently", not
+    "automation stopped", so the generic sentence would mislead."""
+
+    from telegram_kol_research.config import ALWAYS_NOTIFIED_INCIDENT_TYPES
+    from telegram_kol_research.system_operator_bot import (
+        GENERIC_INCIDENT_ACTION_HINT,
+        INCIDENT_ACTION_HINTS,
+        incident_action_line,
+    )
+
+    assert incident_type in ALWAYS_NOTIFIED_INCIDENT_TYPES
+    assert incident_type in INCIDENT_ACTION_HINTS
+    line = incident_action_line(incident_type)
+    assert line.startswith("需要你：")
+    assert GENERIC_INCIDENT_ACTION_HINT not in line

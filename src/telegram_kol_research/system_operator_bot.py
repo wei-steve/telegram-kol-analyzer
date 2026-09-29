@@ -558,6 +558,19 @@ INCIDENT_ACTION_HINTS: dict[str, str] = {
     "source_deletion_exit_stuck": "到交易所核对并人工恢复。",
     "management_target_needs_confirmation": "回复 /choose 或 /dismiss。",
     "duplicate_entry_needs_confirmation": "回复 /choose 或 /dismiss。",
+    # 2026-09-29, the three always-notified types the Mia fixes (42d8a73b)
+    # added. Two of them are not "automation stopped" at all -- the system
+    # acted, differently from the message -- so the generic sentence below
+    # would tell the reader the opposite of what happened.
+    "management_add_position_rejected_stop_superseded": (
+        "止损已改挂到策略保本价（未按消息里的价格）；请核对是否符合 KOL 本意。"
+    ),
+    "half_position_entry_confirmed_by_rule": (
+        "系统已按规则以半仓入场；请核对仓位大小是否符合 KOL 本意。"
+    ),
+    "management_partial_take_profit_future_level_blocked": (
+        "这条「到某价位再止盈」的指令未立即执行；如需在该价位止盈，请手动挂单。"
+    ),
 }
 #: An event-handling type nobody has written a sentence for yet. Deliberately
 #: still an instruction: a new type defaults to the event bot, and the event
