@@ -2299,7 +2299,22 @@ def _serialize_execution_outcome(
     return {"state": "not_executed", "label": "未执行", "detail": detail}
 
 
+_NOT_ACTIONABLE_RULE_LABELS = {
+    "intent_marker": "意向/预告",
+    "hypothetical_condition": "条件句",
+    "price_trigger_immediate": "到价条件下的立即成交",
+    "price_required": "缺具体价位",
+    "exit_verb_required": "无明确离场动作",
+}
+
+
 def _execution_reason_label(reason: str | None) -> str | None:
+    # Phase 3 execution gate: ``management_not_actionable:<rule>``.
+    text = str(reason or "")
+    if text.startswith("management_not_actionable"):
+        rule = text.partition(":")[2]
+        detail = _NOT_ACTIONABLE_RULE_LABELS.get(rule, rule)
+        return "不是可执行指令，未写交易所" + (f"（{detail}）" if detail else "")
     return {
         "close_submitted": "平仓请求已提交",
         "management_close_exchange_confirmed": "已根据交易所仓位快照确认",
@@ -2319,7 +2334,9 @@ def _execution_reason_label(reason: str | None) -> str | None:
         "management_fraction_invalid": "管理指令的减仓比例无法读取，已拒绝",
         "symbol_price_scale_conflict": "标的与价格区间矛盾，已转人工复核",
         "media_unreadable": "图片无法读取（未下载或 OCR 无内容）",
-    }.get(str(reason or ""))
+        "first_pass_contract_violation": "首轮输出违反分类契约，已终止",
+        "context_contract_failed": "上下文分析契约失败，已终止并告警",
+    }.get(text)
 
 
 def _serialize_media_assets(media_assets: list[MediaAsset]) -> list[dict[str, object | None]]:

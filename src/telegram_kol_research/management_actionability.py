@@ -134,6 +134,39 @@ def _first_hit(clauses: list[str], marker_re: re.Pattern[str]) -> tuple[str, str
     return None
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"[。；！？!?;\n\r]+")
+_COMMA_SPLIT_RE = re.compile(r"[，,]+")
+_MARKET_EVENT_RE = re.compile(r"突破|跌破|涨到|跌到|冲到|站稳|回踩|反弹|破位")
+
+
+def _hypothetical_consequent_hit(text: str) -> tuple[str, str] | None:
+    """A condition clause with no verb of its own governs the clause after it.
+
+    Review of phase 3 batch 2: "如果突破84000，全部平仓" puts the condition and
+    the order in two comma clauses of one sentence, so the same-clause check
+    alone would let an immediate full exit through for what is a conditional
+    order this system cannot place. Only a verb-less condition clause reaches
+    forward, and only within its sentence.
+    """
+
+    scrubbed = scrub_contact_identifiers(str(text or ""))
+    for sentence in _SENTENCE_SPLIT_RE.split(scrubbed):
+        parts = [part.strip() for part in _COMMA_SPLIT_RE.split(sentence) if part.strip()]
+        for index, part in enumerate(parts[:-1]):
+            marker = _HYPOTHETICAL_RE.search(part)
+            if marker is None or _ACTION_VERB_RE.search(part):
+                continue
+            # Only a market condition (a price or a price event) makes the
+            # next clause a conditional order. "如果你还在场内，全部出局" is
+            # addressed to whoever still holds, and is an order.
+            if not (_NUMBER_RE.search(part) or _MARKET_EVENT_RE.search(part)):
+                continue
+            consequent = parts[index + 1]
+            if _ACTION_VERB_RE.search(consequent):
+                return marker.group(0), f"{part}，{consequent}"
+    return None
+
+
 def assess_management_actionability(
     text: str | None,
     lifecycle_event: Mapping[str, Any] | None,
@@ -157,7 +190,9 @@ def assess_management_actionability(
     hit = _first_hit(clauses, _INTENT_MARKER_RE)
     if hit is not None:
         return ActionabilityRefusal(RULE_INTENT_MARKER, f"{hit[0]}: {hit[1]}")
-    hit = _first_hit(clauses, _HYPOTHETICAL_RE)
+    hit = _first_hit(clauses, _HYPOTHETICAL_RE) or _hypothetical_consequent_hit(
+        str(text or "")
+    )
     if hit is not None:
         return ActionabilityRefusal(RULE_HYPOTHETICAL, f"{hit[0]}: {hit[1]}")
 

@@ -622,3 +622,48 @@ def test_planner_backstop_blocks_a_candidate_that_reached_it_anyway(tmp_path):
         _actionability_backstop_refusal(identity=identity("保本出局"), intent="full_exit")
         is None
     )
+
+
+def test_a_verbless_condition_clause_governs_the_next_clause():
+    """Review fix: condition and order split across a comma, one sentence."""
+
+    from telegram_kol_research.management_actionability import (
+        RULE_HYPOTHETICAL,
+        assess_management_actionability,
+    )
+
+    event = {"event_type": "exit_position", "management_action": "exit_full"}
+    refusal = assess_management_actionability("如果突破84000，全部平仓", event, "full_exit")
+    assert refusal is not None and refusal.rule == RULE_HYPOTHETICAL
+    # The condition ends with its sentence: an unconditional order after it stands.
+    assert (
+        assess_management_actionability("如果能突破84000最好。现在全部平仓", event, "full_exit")
+        is None
+    )
+    # A condition about the reader, not the market, does not make an order conditional.
+    assert assess_management_actionability("如果你还在场内，全部出局", event, "full_exit") is None
+    # A plain order with a trailing unrelated remark is untouched.
+    assert assess_management_actionability("全部平仓，等下一笔", event, "full_exit") is None
+
+
+def test_the_web_card_names_each_refusal_rule_in_chinese():
+    from telegram_kol_research.management_actionability import (
+        RULE_EXIT_VERB_REQUIRED,
+        RULE_HYPOTHETICAL,
+        RULE_INTENT_MARKER,
+        RULE_PRICE_REQUIRED,
+        RULE_PRICE_TRIGGER_IMMEDIATE,
+    )
+    from telegram_kol_research.web_queries import _execution_reason_label
+
+    for rule in (
+        RULE_INTENT_MARKER,
+        RULE_HYPOTHETICAL,
+        RULE_PRICE_TRIGGER_IMMEDIATE,
+        RULE_PRICE_REQUIRED,
+        RULE_EXIT_VERB_REQUIRED,
+    ):
+        label = _execution_reason_label(f"management_not_actionable:{rule}")
+        assert label is not None and label.startswith("不是可执行指令")
+        assert rule not in label
+    assert _execution_reason_label("no_actionable_intent") == "消息未要求任何动作"
