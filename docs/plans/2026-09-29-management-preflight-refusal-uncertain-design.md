@@ -8,7 +8,7 @@
   `strategy_management_market_decisions.management_batch_id`、`execution_events` 经 `raw_messages (chat_id, message_id)`）；
   代码读 `execution_boundary.py`、`authoritative_recognition.py`、`authoritative_execution_attempts.py`、
   `strategy_management_executor.py`。没有交易所调用。
-- 状态：**已批准（2026-09-29，用户：第 7 节全部按推荐）**；代码候选 `ca17518c`，全量通过，**未部署、未推 origin/main**
+- 状态：**已批准（2026-09-29，用户：第 7 节全部按推荐）**；**已部署 `d244dfeb`（2026-09-29 13:15Z）**，L2 观察进行中，见第 9 节
 - 风险级别：**L3**（改的是「跨过副作用边界之后的结果如何定性」，属 AGENTS.md 所说的交易所写入语义；
   **不改表结构、不修生产数据、不改任何真实下单 / 撤单代码**）
 
@@ -221,3 +221,16 @@ Q1＝B（`closed_no_write`，不可自动重试）；Q2 新增 `management_refus
    之外的异常、worker 无 Traceback。上线后第一个管理预检拒绝样本出现时，核对它落在 `closed_no_write`（`error_class=ManagementPreflightRefusal`）、
    evidence 里批次证明与账本一致、事件处理 bot 收到一条 `management_refused_before_write`；7 天内没有样本记为待验证。
 4. 回滚：`tg-deploy <上线前 sha>`。已按新规则收口的行保持 `closed_no_write`，旧代码认识这个状态，无需数据回滚。
+
+## 9. 部署与观察（2026-09-29）
+
+- rebase 到 `origin/main` = `bd49850b`（token 脱敏修复，生产 `4d342bbe`），无冲突；token 修复与本候选都改了
+  `system_operator_bot.py`，受影响测试 192 passed。代码候选 `870d1795`，部署 sha `d244dfeb53de0b5dd3f050ab237cb00aad430270`
+  （其上只多一个文档提交）；全量 **10663 passed / 4 skipped / 0 failed**。
+- 部署前：生产 `4d342bbe`；进行中的管理批次 0、执行中的尝试 0、uncertain 0（`closed_no_write` 37、`failed_safe` 34）。
+- 推 `claude/eager-dubinsky-44265c` → `tg-deploy`（13:15Z，worker/web/ingest active）。值守加载的模块未改，**未重启值守**。
+  → 推 `origin/main`（无 `-f`）→ OFFENDERS 自测 FAIL/PASS 各一，判决 **PASS**；服务器 `git ls-remote` 核对远端 main 与分支均为 `d244dfeb`。
+- 回滚：`tg-deploy 4d342bbe138718b28a8a93e0f81587f32db4e08c`（无需重启值守、无需数据回滚）。
+- L2 观察：只读监视 `/root/observe-q5-preflight.sh`（`systemd-run` 单元 `observe-q5-preflight`），13:17:48Z 起，
+  证据 `/var/lib/telegram-kol-evidence/20260929-q5-preflight/`。基线：raw 19790、attempt 4830、incident 2434。
+  不健康即重置窗口：服务 / HEAD、部署后新增 uncertain、`management_refused_before_write` 10 分钟未送达、submit_unknown、critical。
