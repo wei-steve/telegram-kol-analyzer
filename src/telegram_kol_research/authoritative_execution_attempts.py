@@ -511,7 +511,18 @@ def mark_authoritative_execution_uncertain(
         row.updated_at = uncertain_at
         raw_message_id = int(row.raw_message_id)
         session.commit()
-    _capture_uncertain_incident(
+    # One frozen attempt, one incident. Until 2026-09-29 a freeze with no
+    # tracked write raised both: attempt 4631 produced incident 2417
+    # (``authoritative_execution_uncertain``) and 2418
+    # (``uncertain_without_write``) at the same instant, the second carrying
+    # every field of the first plus ``impact`` -- one event read as two in the
+    # operator bot. The two are now exclusive, chosen by the same ``writes``
+    # test that labels ``error_summary`` above. Both types stay always-notified
+    # and both go to the event-handling bot, so neither case goes unheard.
+    capture = (
+        _capture_uncertain_incident if writes else _capture_uncertain_without_write
+    )
+    capture(
         session_factory,
         attempt_id=int(attempt_id),
         raw_message_id=raw_message_id,
@@ -519,15 +530,6 @@ def mark_authoritative_execution_uncertain(
         error_class=error_class,
         error_summary=summary,
     )
-    if not writes:
-        _capture_uncertain_without_write(
-            session_factory,
-            attempt_id=int(attempt_id),
-            raw_message_id=raw_message_id,
-            occurred_at=uncertain_at,
-            error_class=error_class,
-            error_summary=summary,
-        )
     return True
 
 

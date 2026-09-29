@@ -330,6 +330,17 @@ def test_uncertain_authoritative_execution_records_a_high_incident(
         uncertain_at=NOW,
         error_class="DeepcoinRequestOutcomeUnknown",
         error_summary="read timed out after submit",
+        # Since 2026-09-29 this type is the freeze *with* a tracked write; a
+        # freeze without one raises ``uncertain_without_write`` instead, never
+        # both (attempt 4631 raised both, incidents 2417 and 2418).
+        evidence_refs=[
+            {
+                "kind": "deepcoin_write",
+                "method": "place_order",
+                "ordinal": 1,
+                "outcome": "outcome_unknown",
+            }
+        ],
     ) is True
 
     with session_factory() as session:
@@ -341,11 +352,8 @@ def test_uncertain_authoritative_execution_records_a_high_incident(
         summary = json.loads(row.redacted_summary)
         assert summary["raw_message_id"] == raw_id
         assert summary["attempt_id"] == claim.attempt_id
-        # A-6b appends the label when the freeze tracked no exchange write, so
-        # the incident says which of the two situations this was.
-        assert summary["error_summary"] == (
-            "read timed out after submit no_exchange_write_tracked"
-        )
+        # A write was tracked, so A-6b's no-write label is not appended.
+        assert summary["error_summary"] == "read timed out after submit"
         assert summary["operation"] == f"raw_message_{raw_id}"
     # The type is in the baseline, so a configured whitelist delivers it.
     assert load_runtime_incident_config(
