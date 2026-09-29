@@ -826,3 +826,145 @@ def test_r2f_narrative_add_is_only_stripped_in_its_exact_form() -> None:
             text=text, lifecycle_event={"event_type": "position_update"}
         )
         assert result.reason_code == "risk_increasing_fanout_forbidden"
+
+# --- 2026-09-29 Mia design, M1: "止盈X%，剩余仓位止损位上移至P" -------------
+#
+# Production text and the model's *actual* top-level lifecycle_event payload
+# (`_context_resolution.first_pass.lifecycle_event` is a separate, richer
+# object the production code never reads for this decision -- only the
+# top-level one, which is what these fixtures reproduce). Before M1, the
+# model tags this class of message as a plain partial_take_profit with no
+# stop_loss at all, so the directive never becomes composite and the price
+# never gets a provenance tag -- confirmed against the pre-fix module
+# (git show HEAD~n:.../management_directives.py) before this test was added,
+# see the implementation report for the captured before/after transcript.
+
+_M1_17900_RAW = (
+    "BTC多单目前获利600点，止盈40%，剩余仓位上移至80600，夜晚风险较大，做无风险持仓！"
+    "\n@Tarderfengge QQ:158241758"
+)
+_M1_17900_EVENT = {
+    "confidence": 0.95,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit",
+    "reason": "当前消息明确管理已有的BTC多单策略（thread_id 619, lifecycle_id 1250），"
+    "执行部分止盈40%并移动止损至80600，属于仓位管理操作，无冲突或新增风险。",
+    "target_lifecycle_id": 1250,
+}
+
+_M1_17901_RAW = (
+    "BTC多单目前获利600点，止盈40%，剩余仓位止损位上移至80600，夜晚风险较大，做无风险持仓！"
+    "\n@Tarderfengge QQ:158241758"
+)
+_M1_17901_EVENT = dict(_M1_17900_EVENT, confidence=0.99, target_lifecycle_id=1250)
+
+_M1_18154_RAW = (
+    "恭喜跟上BTC多单的朋友，目前获利1100点，止盈60%，剩余仓位止损位上移至64100，做无风险持仓！"
+    "\n@Tarderfengge QQ:158241758"
+)
+_M1_18154_EVENT = {
+    "confidence": 0.99,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit",
+    "reason": "消息明确管理已有BTC多单（thread_id 629），执行部分止盈60%并移动止损至64100，"
+    "属于降风险仓位管理动作。",
+    "target_lifecycle_id": 1260,
+}
+
+
+@pytest.mark.parametrize(
+    ("raw", "event", "expected_fraction", "expected_stop"),
+    [
+        (_M1_17900_RAW, _M1_17900_EVENT, 0.4, 80600.0),
+        (_M1_17901_RAW, _M1_17901_EVENT, 0.4, 80600.0),
+        (_M1_18154_RAW, _M1_18154_EVENT, 0.6, 64100.0),
+    ],
+    ids=["17900", "17901", "18154"],
+)
+def test_m1_partial_with_text_only_stop_move_becomes_composite(
+    raw, event, expected_fraction, expected_stop
+) -> None:
+    # Before M1, resolve_management_directive returned a plain
+    # partial_take_profit here with stop_loss=None (the model's payload
+    # carries no stop_loss field for this class of message) -- captured with
+    # the pre-fix module: intent="partial_take_profit", stop_loss=None,
+    # stop_price_source=None, reason_code="partial_risk_reduction". This is
+    # the positive half of the ARCHITECTURE.md #6 rule: assert what the
+    # fixed gate produces, not merely that it differs.
+    directive = resolve_management_directive(text=raw, lifecycle_event=event)
+    assert directive.intent == "partial_then_break_even"
+    assert directive.fraction == pytest.approx(expected_fraction)
+    assert directive.stop_loss == expected_stop
+    assert directive.stop_price_source == "current_message_text"
+
+    contract = build_management_instruction_contract(text=raw, lifecycle_event=event)
+    assert contract.stop_mode == "explicit_price"
+    # ManagementInstructionContract.__post_init__ canonicalizes stop_price to
+    # a decimal string.
+    assert contract.stop_price == str(int(expected_stop))
+    assert contract.stop_price_source == "current_message_text"
+
+
+def test_m1_negative_no_price_stays_plain_partial_take_profit() -> None:
+    # Same idiom, but the KOL never named a price: "剩余仓位继续持有" has no
+    # move-price to extract, so the directive must not be upgraded to a
+    # composite with an invented stop.
+    directive = resolve_management_directive(
+        text="止盈50%",
+        lifecycle_event={
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+        },
+    )
+    assert directive.intent == "partial_take_profit"
+    assert directive.stop_loss is None
+    assert directive.stop_price_source is None
+
+
+def test_m1_negative_bare_stop_move_without_fraction_stays_adjust_stop_loss() -> None:
+    # "止损上移至83200" with no percentage is not this idiom at all (there is
+    # no partial-take-profit clause, so M1's new branch never runs):
+    # behaviour must stay exactly the pre-M1 adjust_stop_loss path, driven by
+    # the model's own stop_loss field like every other adjust_stop_loss case.
+    directive = resolve_management_directive(
+        text="止损上移至83200",
+        lifecycle_event={
+            "event_type": "position_update",
+            "management_action": "adjust_stop_loss",
+            "stop_loss": "83200",
+        },
+    )
+    assert directive.intent == "adjust_stop_loss"
+    assert directive.stop_loss == "83200"
+    assert directive.stop_price_source == "current_message_text"
+
+
+def test_m1_negative_two_disagreeing_stop_moves_are_not_picked() -> None:
+    # Two different explicit move-prices in the same message are ambiguous;
+    # the directive must not silently pick either one.
+    price = management_directives_module._management_stop_move_price(
+        "止盈40%，剩余仓位止损位上移至80600，随后又改为止损下移至80000。"
+    )
+    assert price is None
+
+
+def test_m1_r3_take_profit_heading_defect_is_not_widened() -> None:
+    # docs/plans/2026-09-29-take-profit-adjustment-design.md R3: the existing
+    # _extract_explicit_stop_loss_from_management_text pattern1 mis-reads the
+    # "止盈止损" heading as a 止损 label and grabs the take-profit price on the
+    # next line. M1's own extractor must not repeat that: it requires a
+    # movement verb (上移/下移/移动/移至/挪动/调整), which this text has none
+    # of, so it must return None, never 73070.
+    price = management_directives_module._management_stop_move_price(
+        "止盈止损\n止盈位：73070\n止损位：78700"
+    )
+    assert price is None
+    # And the "剩余仓位" anchor must not claim a take-profit number either.
+    assert (
+        management_directives_module._management_stop_move_price(
+            "剩余仓位……止盈位：2710 止损位：2624(成本价)"
+        )
+        is None
+    )
+
+

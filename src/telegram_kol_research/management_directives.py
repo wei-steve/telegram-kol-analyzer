@@ -105,7 +105,52 @@ _BREAK_EVEN_TERMS = (
     "上推保护",
     "保护价",
     "保护止损",
+    # M1-c (2026-09-29 Mia design): "做无风险持仓" / "做无风险" is Mia's
+    # standard closing phrase for a partial-take-profit-plus-protection
+    # message ("止盈40%，剩余仓位止损位上移至80600，做无风险持仓"). It only
+    # matters when there is no explicit move price to attach (M1-a below
+    # supplies the price when one is written); this term makes the intent
+    # a protection intent so the strategy price is used as a fallback.
+    "无风险持仓",
+    "做无风险",
 )
+#: M1-a/d (2026-09-29 Mia design): "止损位上移至 P" / "剩余仓位上移至 P" /
+#: "止损移动至 P" / "止损下移至 P". Anchored on an explicit stop term, or on
+#: "剩余仓位/剩余持仓" *without* an intervening "止盈" (so "剩余仓位止盈上移至
+#: 2710" -- a take-profit move -- is never read as a stop move). Requires the
+#: movement verb, so it does not touch the R3 "止盈止损\n止盈位：73070" defect
+#: in ``message_recognition._extract_explicit_stop_loss_from_management_text``
+#: pattern 1 (that pattern has no movement-verb requirement at all).
+_MANAGEMENT_STOP_MOVE_RE = re.compile(
+    r"(?:止损(?:位)?|保护价)[^0-9]{0,20}?(?:上移|下移|移动|移至|挪动|调整)"
+    r"[^0-9]{0,10}?(?:至|到)?[^0-9]{0,6}?([0-9]+(?:\.\d+)?)"
+    r"|(?:剩余(?:仓位|持仓))(?:(?!止盈)[^0-9]){0,20}?(?:上移|下移|移动|移至|挪动|调整)"
+    r"[^0-9]{0,10}?(?:至|到)?[^0-9]{0,6}?([0-9]+(?:\.\d+)?)"
+)
+
+
+def _management_stop_move_price(text: str) -> float | None:
+    """The single unambiguous "move stop to P" price named in this text.
+
+    Returns ``None`` when nothing matches, or when two matches disagree --
+    ambiguous content must never silently pick one price over another.
+    """
+
+    scrubbed = scrub_contact_identifiers(str(text or ""))
+    values: list[float] = []
+    for match in _MANAGEMENT_STOP_MOVE_RE.finditer(scrubbed):
+        token = match.group(1) or match.group(2)
+        if token is None:
+            continue
+        try:
+            value = float(token)
+        except ValueError:
+            continue
+        if value not in values:
+            values.append(value)
+    if len(values) != 1:
+        return None
+    return values[0]
 _FULL_EXIT_TERMS = (
     "全部止盈出局",
     "全部平仓",
@@ -172,6 +217,17 @@ def resolve_management_directive(
     )
     has_partial = _has_partial_clause(combined, raw_action)
     has_break_even = _has_break_even_clause(combined, raw_action)
+    if has_partial and current_message_stop is None:
+        # M1-a (2026-09-29 Mia design): the model usually tags this class of
+        # message as a plain partial_take_profit with an empty stop_loss
+        # field. Read the move price straight from this message's own text
+        # (never the payload) so "止盈40%，剩余仓位止损位上移至80600" still
+        # becomes a composite partial_then_break_even instead of silently
+        # dropping the stop move.
+        text_move_price = _management_stop_move_price(str(text or ""))
+        if text_move_price is not None:
+            current_message_stop = text_move_price
+            current_message_stop_source = "current_message_text"
     has_protection = has_break_even or current_message_stop is not None
 
     if any(term in combined for term in _CANCEL_ENTRY_TERMS) or event_type == "cancel_entry":
