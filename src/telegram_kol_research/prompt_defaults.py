@@ -43,8 +43,8 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
   - 仓位管理：target 必须为对象，只能 exact 或 unknown，**不得 forthcoming**（持仓不可能还没发生）。
   - 闲话：target 必须 null，strategy 必须 null。
   - 图片不可读：target 必须 null，strategy 必须 null。
-- 数组里没有 新策略 元素时，strategy 必须为 null。
-- 策略管理 用 forthcoming 时，必须同时出现 entry_context 或 entry_fragments（承载“半仓 = 0.5”这类定量）；否则这条消息没有任何可携带给后续策略的信息，应判为 闲话 而不是 策略管理。
+- 数组里没有 新策略 元素、**且 recognition_result 不是 是策略** 时，strategy 必须为 null；若 recognition_result = 是策略（见下面【两套判据刻意不一致】举的那个例子），strategy 必须是完整对象，即使 message_classes 不含 新策略。
+- 策略管理 用 forthcoming 时，必须同时出现 entry_context（承载“半仓 = 0.5”这类定量）；否则这条消息没有任何可携带给后续策略的信息，应判为 闲话 而不是 策略管理。
 
 【五类的判据】
 - 新策略：同时满足 ① 明确标的；② 明确方向；③ 明确入场方式（价/区间/市价/到价）；④ **明确止损价或无效价**；⑤ 表达的是新开仓，不是复盘、教学、广告、历史截图。
@@ -53,7 +53,7 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
   - 撤销 / 改价：取消挂单、撤单、改入场价、改区间、改止损（针对未入场策略）。
   - 入场定量（策略已发布）：前一条是完整策略，本条“半仓入场”→ 目标是那条策略，resolution = exact，lifecycle_id 指向它。
   - 入场定量（策略尚未发布）：“BTC准备87500做空，半仓入场”——有标的有入场价但没有止损，不是策略；它预告的是后面那条正式策略按半仓对待。resolution = forthcoming，symbol = BTC，lifecycle_id = null。
-  “有标的 + 有入场价 + 无止损”这条边界正好接住被 新策略 的 ④ 挡下来的消息；但只有当这条消息还携带了对后续策略有用的信息（仓位倍率、分腿比例、补仓价）时才算 策略管理，只是提了一嘴价格、什么定量都没有的，是 闲话。
+  “有标的 + 有入场价 + 无止损”这条边界正好接住被 新策略 的 ④ 挡下来的消息；但只有当这条消息还携带了对后续策略有用的信息（仓位倍率）时才算 策略管理，只是提了一嘴价格、什么定量都没有的，是 闲话。
 - 仓位管理：目标**已经入场**。调止盈、调止损、移动止损到成本、部分止盈、临时离场、全平、继续持有。exit_position 与 position_update 的区分规则按本提示词既有条款执行，不合并、不改写。
 - 闲话：行情观点、复盘、教学、情绪、广告、联系方式、群公告，以及“只有方向没有入场”“只有价格没有方向”“已经错过”，和上面那种没有任何定量的半截价格。
 - 图片不可读：模型正常返回内容，但读不出图：模糊、裁切、遮挡、关键数字看不清。
@@ -112,15 +112,8 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
 - entry_context 是非执行的前置语义片段，可以和 recognition_result=“非策略”同时出现；它不得单独下单。
 - “半仓”统一解释为该币种已配置最大亏损预算乘以 50%，risk_multiplier 输出“0.5”；“30% 仓位”输出“0.3”。
 - 仅接受大于 0 且小于等于 1 的明确倍率。“轻仓”、“满仓”、杠杆倍数、“加仓”均不生成 entry_context，不得猜测倍率。
-
-【相邻入场消息片段】
-- entry_fragments 是非执行证据，可出现在完整策略之前或之后；它本身不得下单。
-- “半仓操作”或明确“50%仓位”输出 risk_multiplier=0.5；明确百分比统一换算为 0 到 1 的倍率。
-- “全仓操作”“正常仓位操作”输出 risk_multiplier=1，含义仅为使用该币种配置最大亏损预算，绝不表示投入账户全部余额或修改保证金模式。
-- “轻仓”单独出现仍然不得猜测；“轻仓入场，50%仓位”采用明确的 50%。
-- “两个点位各半仓”表示整单 risk_multiplier=1，同时输出 leg_allocation=[0.5,0.5]；不得把整单再次减半。
-- “补仓：63400附近”输出 supplemental_entry 的补仓价格，但不生成新的风险预算。
-- 不得根据入场价格区间或区间宽度推断半仓；相同区间可以是半仓或正常仓位。
+- “两个点位各半仓”“两个点位各挂半仓”“区间两档各一半”说的是**整单正常仓位拆成两腿**，不是整单减半：risk_multiplier 输出“1”，**不得输出 0.5**。系统本身就会把入场区间拆成两腿，这句话描述的正是它，不要再减一次。
+- 分辨的关键是“各”字作用在谁身上：“半仓入场”“半仓操作”是整单减半，输出 0.5；“两个点位各半仓”是每一腿各占一半、整单不变，输出 1。
 
 【图文证据分离】
 - 当前文字/caption 与每张图片必须分别提取证据，不得静默合并。
@@ -163,18 +156,6 @@ DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT = """
     "confidence": 0.95,
     "reason": "半仓操作，等待后续完整策略"
   },
-  "entry_fragments": [
-    {
-      "kind": "risk_multiplier | leg_allocation | supplemental_entry",
-      "symbol": "BTC",
-      "side": "long | short",
-      "risk_multiplier": "0.5",
-      "allocations": ["0.5", "0.5"],
-      "entry_price": "63400",
-      "confidence": 0.95,
-      "reason": "当前消息中的明确入场片段"
-    }
-  ],
   "lifecycle_event": {
     "event_type": "none | entry_confirm | cancel_entry | exit_position | position_update",
     "target_lifecycle_id": null,

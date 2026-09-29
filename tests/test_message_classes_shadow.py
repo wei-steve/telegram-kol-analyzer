@@ -154,8 +154,12 @@ def test_the_seed_prompt_defines_the_classification_contract():
         assert value in prompt
     # It is the message's primary conclusion, so it leads the output object.
     assert prompt.index('"message_classes"') < prompt.index('"recognition_result"')
-    # §8 阶段 1: no existing field is removed.
-    for legacy in ('"lifecycle_event"', '"entry_fragments"', '"input_reading"'):
+    # §8 阶段 1: no existing field is removed. ``entry_fragments`` used to be
+    # in this tuple and is not any more: it was never an existing field in the
+    # sense this rule protects. No published version ever asked for it, so the
+    # seed carrying it was the anomaly, not the contract. Retired 2026-09-29;
+    # see docs/plans/2026-09-25-entry-fragments-never-shipped-analysis.md.
+    for legacy in ('"lifecycle_event"', '"input_reading"'):
         assert legacy in prompt
 
 
