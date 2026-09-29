@@ -102,6 +102,7 @@ __all__ = [
     "MESSAGE_CLASS_VIOLATIONS",
     "MessageClassElement",
     "MessageClassTarget",
+    "NON_FATAL_VIOLATIONS",
     "ParsedMessageClasses",
     "TARGET_FORBIDDEN_CLASSES",
     "TARGET_REQUIRED_CLASSES",
@@ -109,6 +110,7 @@ __all__ = [
     "compare_message_classes",
     "message_class_identities",
     "derive_message_classes",
+    "fatal_violations",
     "parse_message_classes",
 ]
 
@@ -193,6 +195,32 @@ MESSAGE_CLASS_VIOLATIONS = frozenset(
     }
 )
 
+#: Phase 3 plan §3.1: the violations that are *normalised* rather than fatal.
+#: Every other code in ``MESSAGE_CLASS_VIOLATIONS`` is fatal (fail-closed in
+#: phase 3 batch 2). Nothing in this module acts on the split; it is data.
+#:
+#: ``duplicate_class_target`` / ``class_order_violation`` are repaired by the
+#: parser itself (elements are de-duplicated and management is moved ahead of
+#: 新策略). ``lifecycle_id_outside_candidate_set`` is handled by the
+#: ``exact_target_outside_candidates`` context trigger, not by rejection
+#: (plan §1.2, §9 question 4).
+#:
+#: ``strategy_not_allowed`` must stay non-fatal on purpose. The prompt's
+#: 【两套判据刻意不一致】 section is deliberate (design §11 R10): a message with
+#: take-profits but no stop loss is legitimately ``recognition_result = 是策略``
+#: while ``message_classes`` carries no ``新策略`` element. Making that fatal
+#: would fail-close every such message (about 0.4 per day once the
+#: entry_fragments session lands) and would destroy the "is 无止损 a 是策略"
+#: statistic the phase-2 observation §11 still has to measure.
+NON_FATAL_VIOLATIONS = frozenset(
+    {
+        "duplicate_class_target",
+        "class_order_violation",
+        "strategy_not_allowed",
+        "lifecycle_id_outside_candidate_set",
+    }
+)
+
 #: §4, the two existing ``event_type`` groups the derivation reads.
 _POSITION_EVENT_TYPES = frozenset({"position_update", "exit_position"})
 _STRATEGY_EVENT_TYPES = frozenset({"cancel_entry", "entry_confirm"})
@@ -225,6 +253,25 @@ class MessageClassTarget:
 
         return (self.resolution, self.lifecycle_id)
 
+    def duplicate_key(self) -> tuple[Any, ...]:
+        """The part of a target that decides whether two elements are *duplicates*.
+
+        Deliberately not ``identity()``. Phase 3 plan §4 F1: two ``unknown``
+        elements for different symbols ("TST 和 PUMP 都止盈掉", raw 19309;
+        BTC/ETH/SOL/ZEC, raw 19780) are different instructions, so duplicate
+        detection must look at ``symbol`` / ``side`` for ``unknown`` and
+        ``forthcoming``. ``exact`` is decided by the lifecycle id alone. The
+        comparison identity stays symbol/side-blind (see ``identity``).
+        """
+
+        if self.resolution == RESOLUTION_EXACT:
+            return (RESOLUTION_EXACT, self.lifecycle_id)
+        return (
+            self.resolution,
+            self.symbol.upper() if self.symbol else None,
+            self.side.lower() if self.side else None,
+        )
+
 
 @dataclass(frozen=True)
 class MessageClassElement:
@@ -244,6 +291,11 @@ class MessageClassElement:
             return (self.message_class, None, None)
         resolution, lifecycle_id = self.target.identity()
         return (self.message_class, resolution, lifecycle_id)
+
+    def duplicate_key(self) -> tuple[Any, ...]:
+        if self.target is None:
+            return (self.message_class, None)
+        return (self.message_class, *self.target.duplicate_key())
 
 
 @dataclass(frozen=True)
@@ -266,10 +318,24 @@ class ParsedMessageClasses:
 
         return self.present and not self.violations
 
+    @property
+    def fatal(self) -> bool:
+        """At least one violation outside ``NON_FATAL_VIOLATIONS`` (plan §3.1)."""
+
+        return bool(fatal_violations(self))
+
     def to_payload(self) -> list[dict[str, Any]]:
         """The canonical (normalized) form, for persistence and projection."""
 
         return [element.to_dict() for element in self.elements]
+
+
+def fatal_violations(parsed: ParsedMessageClasses) -> tuple[str, ...]:
+    """The violations of ``parsed`` that are not normalised away (plan §3.1)."""
+
+    return tuple(
+        code for code in parsed.violations if code not in NON_FATAL_VIOLATIONS
+    )
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any]:
@@ -366,6 +432,18 @@ def parse_message_classes(
         raw_target = raw_element.get("target")
         target: MessageClassTarget | None = None
 
+        if (
+            isinstance(raw_target, Mapping)
+            and message_class in TARGET_FORBIDDEN_CLASSES
+            and not any(
+                _clean_str(raw_target.get(key)) is not None
+                for key in ("resolution", "lifecycle_id", "symbol", "side")
+            )
+        ):
+            # Phase 3 plan §3.1 (raw 18970): an all-null target object where the
+            # contract wants ``null`` is the same thing as ``null``.
+            raw_target = None
+
         if raw_target is None:
             if message_class in TARGET_REQUIRED_CLASSES:
                 flag("target_required")
@@ -426,8 +504,8 @@ def parse_message_classes(
     if present_classes & EXCLUSIVE_MESSAGE_CLASSES and len(raw) != 1:
         flag("exclusive_class_not_alone")
 
-    identities = [element.identity() for element in elements]
-    if len(identities) != len(set(identities)):
+    duplicate_keys = [element.duplicate_key() for element in elements]
+    if len(duplicate_keys) != len(set(duplicate_keys)):
         flag("duplicate_class_target")
 
     seen_new_strategy = False
@@ -446,8 +524,32 @@ def parse_message_classes(
 
     return ParsedMessageClasses(
         present=True,
-        elements=tuple(elements),
+        elements=_normalized_elements(elements),
         violations=tuple(violations),
+    )
+
+
+def _normalized_elements(
+    elements: Sequence[MessageClassElement],
+) -> tuple[MessageClassElement, ...]:
+    """Repair the two non-fatal shape violations (plan §3.1).
+
+    De-duplicate by ``duplicate_key`` (first occurrence wins) and move
+    management elements ahead of ``新策略``; both keep the original relative
+    order otherwise. The violation codes are still reported by the caller.
+    """
+
+    seen: set[tuple[Any, ...]] = set()
+    unique: list[MessageClassElement] = []
+    for element in elements:
+        key = element.duplicate_key()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(element)
+    return tuple(
+        [e for e in unique if e.message_class != CLASS_NEW_STRATEGY]
+        + [e for e in unique if e.message_class == CLASS_NEW_STRATEGY]
     )
 
 
@@ -485,7 +587,12 @@ def _validate_strategy_coupling(
 def _derive_target(source: Mapping[str, Any]) -> MessageClassTarget:
     """§4: ``target_lifecycle_id`` 非空 → ``exact``，空 → ``unknown``."""
 
+    # ``lifecycle_event.targets[]`` entries use ``lifecycle_id`` (raw 19741),
+    # the top-level event uses ``target_lifecycle_id``; accept both, as
+    # ``authoritative_instructions`` does.
     lifecycle_id = _int_or_none(source.get("target_lifecycle_id"))
+    if lifecycle_id is None:
+        lifecycle_id = _int_or_none(source.get("lifecycle_id"))
     if lifecycle_id is None:
         return MessageClassTarget(
             resolution=RESOLUTION_UNKNOWN,
