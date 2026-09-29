@@ -1,7 +1,7 @@
 # 首次分析四分类 · 阶段 3（切换）实施方案
 
 - 日期：2026-09-29
-- 状态：**草稿，待用户确认**。确认前不写代码。
+- 状态：**已批准**（2026-09-29 用户：§9 八个问题「全部按推荐，开始实施」）。
 - 规格：`docs/plans/2026-09-24-first-pass-classification-contract-design.md`（下称「设计稿」）§5、§6、§8 阶段 3、§10
 - 输入：`docs/first-pass-classification-status.md` 阶段 3 条目；`docs/plans/2026-09-29-first-pass-phase2-observation.md`（下称「观察文档」）§6、§7、§9、§10、§11；
   `docs/plans/2026-09-28-chen-btc-expired-repost-and-queue-block-design.md`（下称「陈哥稿」）§2.3、§3.3、§5
