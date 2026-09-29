@@ -20,7 +20,7 @@
 |---|---|---|
 | 阶段 1 · 影子 | L1（additive dormant） | `completed`（代码 `5ca19513`，提示词 v9 = `ai_prompt_versions.id=10` 已发布，观察窗通过） |
 | 阶段 2 · 观察与人工核准 | L0 | `completed`（2026-09-29：四张表已出；A、B 两组共 44 条人工核准已写入标注表） |
-| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `planned` |
+| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 代码候选 `25cce75e` 全量通过，未部署；批次 B 提示词待 entry_fragments 版本发布后做） |
 | 阶段 4 · 收口 | 以后 | `planned` |
 
 **仓库层面的一件事（2026-09-24，与本设计无关但影响所有会话）**：
@@ -655,7 +655,51 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
   - 发布时刻要记到本文件，作为第二条测量界线；
   - ② 的数据清理对本线零影响。
 
-## 阶段 3 · 切换（planned，须用户单独批准后才能部署）
+## 阶段 3 · 切换（in_progress，须用户单独批准后才能部署）
+
+**实施方案**：`docs/plans/2026-09-29-first-pass-phase3-implementation-plan.md`（2026-09-29 用户：§9 八个问题全部按推荐）。
+
+### 批次 A · 代码（2026-09-29，候选已就绪，未部署、未推 `origin/main`）
+
+| 项 | 值 |
+|---|---|
+| 分支 | `claude/first-pass-phase3`（本地） |
+| 候选 sha | `25cce75e974dda542b361b784747aaa677182c2e` |
+| 基线 | `origin/main` `a5601082`：`10663 passed, 4 skipped`（1142 s） |
+| 候选全量 | `10834 passed, 4 skipped`（854 s），净增 171 条新用例，零失败 |
+| 提交 | `d3924bf2` 解析器（F1/F3、18970、致命/非致命）· `86dcddaa` 网页（F4/F2/E2）· `3f1ac137` 触发判据 + ② · `1d822494` 审阅修正（旧字段 `targets[]`）· `48c3a251` ③ 契约失败终态化 · `9eb85f40` 执行层闸门 · `25cce75e` 审阅修正（条件句跨子句、中文标签） |
+| 实施 | Sonnet 5 子代理两批；Opus 5.5 审阅并补两处修正 |
+| 未碰 | `prompt_defaults.py` / `prompt_composition.py` 及其两份测试（entry_fragments 会话在改）；数据库结构；提示词版本 |
+
+**回放 R1（18602）已完成，`cancellation_language` 可以删。** 2026-09-29 在服务器上以只读库连接、生产 v9（shared id=10、vision id=2）、`gpt-5.6-luna` 让模型重答一次，**不写任何表**（比方案批准的「提示词中心对照测试写一行」更轻）。结果：`message_classes = [策略管理 / exact / 1291 / BTC long]`，`lifecycle_event = cancel_entry → 1291`（0.99）。1291 在消息时刻（09-23 14:21:29）仍是 `pending_entry`，两分钟后（14:23:18）才入场。新判据下首轮自己就给出了撤单目标，不需要关键词触发；如果目标届时已不在候选或已终态，由两条新判据接住。
+
+**与方案的偏差（审阅已接受）：**
+1. 两个新终态原因进了 `ALERTED_REASONS`，但**没有**进 `AUTHORITY_NOT_PRODUCED_REASONS`：`provider_outage_replay.py:241` 会把那一组整体重放，而重放一个结构错误的答复只会得到同样的错误。
+2. 模型原样输出无处可存（run/attempt 表没有响应列，不加列），只把违规码写进 `error_message` / `final_error_message`。
+3. 执行层闸门包在 `resolve_management_directive` 整体外面，而不只是 :304 的全平分支，一处覆盖三条应用路径；`position_management_remediation` 的恢复路径用 `actionability_gate=False` 绕过（它重建的候选没有 `event_type`，闸门会误伤「取消这个计划」）。规划器兜底只跑规则 1–3。
+4. 离线/批量识别里的旧文字离场路径（`_apply_exit_signal_if_matched`、军长解析器）不经过闸门。已核实生产的权威识别路径（`apply_authoritative_mimo_payload`）只在「是策略」分支调用 `_persist_ai_result`，那里不跑文字离场，所以生产不受影响。
+5. 19360「只考虑加仓」不是被闸门拒的，而是被既有的加仓拒绝（Q1）先拦下。结果同样是零写入。
+
+**退役同一次尝试里的「二次纠错提问」的代价（生产核对，`status` 索引，09-16 以来）：**
+- 第二问救回 8 次（7 条消息），其中能落地动作的只有 2 次（`manage_thread`），其余 6 次是 hold/unresolved；
+- 第二问照样失败的有 44 次（13 条消息）。
+- 所以切换后，这类消息会以 `context_contract_failed` 告警出现，约每天 1–2 条（新判据会减少上下文调用，实际更少）。
+
+**测量界线**（本线以后按段统计）：
+1. 2026-09-27 01:32:14 UTC（校验器修复 `e1d29708`）；
+2. entry_fragments 会话的新提示词版本发布时刻（待它写入）；
+3. **阶段 3 代码部署时刻**（待部署）；
+4. **阶段 3 提示词（批次 B）发布时刻**（待发布）。
+
+### 批次 B · 提示词（未开始）
+
+方案 §5.1 的可执行性规则（条件句 / 意向 / 无确定对象的「管理」判 `闲话`，旧字段 `event_type = none`）。前置：entry_fragments 版本已发布且已进 `origin/main`；以其**生产原文**为底；按方案 §9 问题 2，等它发布满一周、「无止损的是策略」统计做完再发。
+
+### 部署前待做（调度会话排期）
+
+- L2 部署：推自有分支 → 核对候选是生产 HEAD 的后代 → `tg-deploy 25cce75e…` → 同一 sha 推 `origin/main` → 双向核对 + offenders 检查。无 schema、无依赖变更。
+- 观察判据见方案 §8（30 分钟、≥5 条真实消息；被删三个触发名不再出现；每条非网络错误的上下文请求 ≤1；两个新终态原因与 `management_not_actionable` 逐条列出；窗口内若有管理写入，直接核对交易所历史）。
+- 若部署前 `origin/main` 又前进了代码，先变基、重跑相关聚焦测试与一次全量。
 
 ① 触发判据换成 §5（删 3 留 4）；② 降级不再抹平首次分析；③ 契约类失败不重问。
 
