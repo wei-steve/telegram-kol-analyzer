@@ -3007,6 +3007,18 @@ def _apply_instruction_compatibility_view(
     return payload
 
 
+#: ``apply_authoritative_mimo_payload``: a 是策略 answer whose strategy names
+#: no stop loss is recorded, never persisted as an entry.
+STRATEGY_WITHOUT_STOP_LOSS_REASON = "strategy_without_stop_loss"
+
+
+def _strategy_names_a_stop_loss(payload: Mapping[str, Any]) -> bool:
+    strategy = payload.get("strategy")
+    if not isinstance(strategy, Mapping):
+        return False
+    return str(strategy.get("stop_loss") or "").strip() not in ("", "null", "None")
+
+
 def apply_authoritative_mimo_payload(
     session_factory: sessionmaker,
     *,
@@ -3236,7 +3248,26 @@ def apply_authoritative_mimo_payload(
             parse_source="mimo_authoritative",
         )
         entry_applied = False
-        if result.status == "是策略":
+        if result.status == "是策略" and not _strategy_names_a_stop_loss(payload):
+            # 有方向、没止损的策略不算新策略，不能下单 (user rule; first-pass
+            # contract design decision 2). Prompt v11 legitimately answers
+            # 是策略 for a take-profit-only message (raw 19016). The instruction
+            # contract (``authoritative_instructions._complete_strategy``)
+            # refuses it only when it builds the entry row itself: a payload
+            # carrying its own ``instructions`` -- or any mode other than
+            # ``live`` -- reached ``_persist_ai_result`` below, and
+            # ``_ensure_lifecycle_record`` asks for nothing but a symbol and a
+            # side. No candidate, no lifecycle; any management the same message
+            # carried was already applied above.
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message_id,
+                status="非策略",
+                reason=STRATEGY_WITHOUT_STOP_LOSS_REASON,
+                ai_payload=payload,
+                parse_source="mimo_authoritative",
+            )
+            _upsert_recognition(session, result, engine=model)
+        elif result.status == "是策略":
             conflict = _detect_strategy_symbol_price_scale_conflict(
                 payload.get("strategy") if isinstance(payload.get("strategy"), dict) else {},
                 raw_message.text or "",
