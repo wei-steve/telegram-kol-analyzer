@@ -17,6 +17,7 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionBackupStopOrder,
     PositionProtectionLeg,
     PositionTakeProfitOrder,
     RawMessage,
@@ -189,6 +190,7 @@ def _seed(
     stop="87000",
     strategy_take_profit="84000/82000",
     lifecycle_event=None,
+    backup_stop=None,
 ):
     """One entered strategy, its binding and legs, and one management message.
 
@@ -270,6 +272,41 @@ def _seed(
                 seen_at=NOW,
             )
             exchange_pending.append(_sl_row(stop_id, stop, side))
+            if backup_stop is not None:
+                backup_id = f"{pos_id}-backup"
+                upsert_protection_ledger_row(
+                    session,
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=strategy_instance_id,
+                    pos_id=pos_id,
+                    instrument_id=INST,
+                    side=side,
+                    order_id=backup_id,
+                    purpose="backup_stop",
+                    trigger_price=backup_stop,
+                    size_text="0",
+                    status="verified",
+                    evidence_source="test",
+                    evidence={},
+                    seen_at=NOW,
+                )
+                session.add(
+                    PositionBackupStopOrder(
+                        execution_binding_id=binding.id,
+                        execution_order_leg_id=leg.id,
+                        pos_id=pos_id,
+                        instrument_id=INST,
+                        side=side,
+                        trigger_price=backup_stop,
+                        order_id=backup_id,
+                        client_order_id=f"{backup_id}-client",
+                        status="active",
+                        request_json="{}",
+                    )
+                )
+                exchange_pending.append(_sl_row(backup_id, backup_stop, side))
             plan = []
             for tier, spec in enumerate(filter(None, take_profits.split(",")), start=1):
                 price, tp_size = spec.split(":")

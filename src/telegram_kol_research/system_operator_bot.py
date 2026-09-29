@@ -1972,6 +1972,8 @@ _SENSITIVE_MARKERS = (
 def format_strategy_management_notification(payload: dict[str, Any]) -> str:
     """Format only bounded, explicitly selected management business fields."""
 
+    if payload.get("intent") == "adjust_take_profit":
+        return _format_take_profit_adjustment_notification(payload)
     state = str(payload.get("state") or "-")
     mode = str(payload.get("mode") or "shadow")
     bypass = payload.get("protection_recovery_bypass")
@@ -2489,7 +2491,12 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
                     },
                 }
             )
-    return {
+    take_profit_adjustment = (
+        _take_profit_adjustment_payload(session, batch)
+        if str(batch.intent or "") == "adjust_take_profit"
+        else None
+    )
+    payload = {
         "batch_id": batch.id,
         "state": batch.status,
         "mode": mode if mode in {"disabled", "shadow", "live"} else "disabled",
@@ -2510,6 +2517,141 @@ def _management_payload_for_batch(session, batch, *, group_labels=None) -> dict[
         "deferred_entry_legs": deferred_entry_legs,
         "legs": legs,
     }
+    if take_profit_adjustment is not None:
+        payload["take_profit_adjustment"] = take_profit_adjustment
+    return payload
+
+
+def _take_profit_adjustment_payload(session, batch) -> dict[str, Any]:
+    """Bounded per-position plan of one take-profit adjustment batch.
+
+    Read from what the executor recorded on each leg, so the shadow report
+    shows exactly what would have been written.
+    """
+
+    from telegram_kol_research.models import StrategyManagementLeg
+
+    positions = []
+    for leg in (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch.id)
+        .order_by(StrategyManagementLeg.leg_index.asc(), StrategyManagementLeg.id.asc())
+        .limit(10)
+    ):
+        recorded = _decode_mapping(leg.request_json).get("take_profit_adjustment")
+        recorded = recorded if isinstance(recorded, dict) else {}
+        plan = recorded.get("plan") if isinstance(recorded.get("plan"), dict) else {}
+
+        def pairs(value) -> list[str]:
+            return [
+                _safe_management_text(
+                    f"{item[0]}×{item[1]}" if isinstance(item, list) and len(item) >= 2 else item,
+                    limit=48,
+                )
+                for item in (value if isinstance(value, list) else [])[:6]
+            ]
+
+        stop = recorded.get("stop") if isinstance(recorded.get("stop"), dict) else {}
+        positions.append(
+            {
+                "pos_id": _safe_management_text(leg.pos_id, limit=120),
+                "remaining_size": _safe_management_text(
+                    recorded.get("remaining_size"), limit=32
+                ),
+                "existing": pairs(recorded.get("existing_take_profits")),
+                "targets": pairs(plan.get("targets")),
+                "dropped_crossed": [
+                    _safe_management_text(item, limit=32)
+                    for item in (plan.get("dropped_crossed") or [])[:6]
+                ],
+                "stop": (
+                    _safe_management_text(stop.get("requested"), limit=32)
+                    if stop.get("requested") not in (None, "")
+                    else None
+                ),
+            }
+        )
+    return {"positions": positions}
+
+
+_TAKE_PROFIT_ADJUST_REASON_LABELS = {
+    "take_profit_adjust_price_missing": "消息没有给出止盈价位，也没有可用的策略价，未改动",
+    "take_profit_adjust_all_tiers_crossed": "新止盈价位已被现价越过，挂不上，未改动",
+    "take_profit_adjust_size_below_minimum": "剩余张数不够最小下单量，现有止盈保持不动",
+    "take_profit_adjust_already_satisfied": "现有止盈单已与新结构一致，无需改动",
+    "take_profit_adjust_allocation_invalid": "止盈比例无法对应到档位，未改动",
+    "take_profit_adjust_tier_count_ambiguous": "比例档数与策略止盈档数对不上，未改动",
+    "take_profit_adjust_tier_already_filled": "所说的止盈档已经成交，未改动",
+    "take_profit_adjust_size_invalid": "止盈张数无法按步长分配，未改动",
+    "take_profit_adjust_position_empty": "仓位已无剩余张数，未改动",
+    "take_profit_adjust_input_invalid": "仓位或合约参数不完整，未改动",
+    "take_profit_adjust_shadow_planned": "影子模式：只计算不下单（上面是本来会挂的止盈）",
+    "take_profit_adjust_applied": "已按新结构重挂止盈",
+    "take_profit_adjust_deadline_expired": "180 秒内未完成，已收口，请核对交易所止盈单",
+    "take_profit_adjust_disabled": "调整止盈开关为 disabled，未执行",
+    "take_profit_adjust_exchange_read_incomplete": "交易所仓位或挂单读取不完整，未改动",
+    "take_profit_adjust_quote_unavailable": "读不到可靠现价，未改动",
+    "take_profit_adjust_position_not_found": "交易所上找不到对应仓位，未改动",
+    "take_profit_adjust_protection_unresolved": "保护单归属无法解析，未改动",
+    "take_profit_adjust_stop_missing": "该仓位没有可确认的止损，不改止盈",
+    "take_profit_adjust_price_tick_invalid": "止盈价位不符合合约价格步长，未改动",
+    "take_profit_adjust_stop_replace_failed": "同条消息的止损改动失败，止盈未动",
+    "take_profit_replace_incomplete": "止盈撤单或挂单未完成（止损未动），请核对交易所",
+    "take_profit_adjust_snapshot_invalid": "批次快照不完整，未改动",
+    "take_profit_adjust_interrupted": "上一次执行中断，写入结果未知，请人工核对",
+    "take_profit_adjust_execution_error": "执行异常，已收口，请核对交易所止盈单",
+    "take_profit_adjust_instruction_unavailable": "无法从原文重新读出止盈指令，未改动",
+    "explicit_stop_adjustment_not_risk_tightening": "同条消息的止损不是收紧方向，整条未执行",
+    "prior_management_batch_unresolved": "同一策略还有未完成的管理批次",
+    "superseded_by_risk_reduction": "被后续的减风险指令取代",
+    "superseded_by_newer_take_profit_adjustment": "被更新的调止盈指令取代",
+}
+
+
+def _format_take_profit_adjustment_notification(payload: dict[str, Any]) -> str:
+    reason = str(payload.get("reason") or "-")
+    mode = str(payload.get("mode") or "shadow")
+    if reason == "take_profit_adjust_shadow_planned":
+        # The batch ran under live management; the take-profit switch itself
+        # was ``shadow``, and that is the mode the reader needs to see.
+        mode = "shadow"
+    state = str(payload.get("state") or "-")
+    lines = [
+        "【调整止盈】",
+        f"通知ID: {payload.get('notification_id') or '-'}",
+        f"batch #{payload.get('batch_id') or '-'} / 状态: {state}",
+        (
+            f"来源: {payload.get('source_chat_title') or '-'} / "
+            f"{payload.get('source_chat_id') or '-'} / "
+            f"#{payload.get('source_message_id') or '-'} / "
+            f"raw={payload.get('raw_message_id') or '-'}"
+        ),
+        (
+            f"归属: lifecycle={payload.get('lifecycle_id') or '-'} / "
+            f"strategy={payload.get('strategy_instance_id') or '-'}"
+        ),
+        "结果: "
+        + _TAKE_PROFIT_ADJUST_REASON_LABELS.get(reason, "未执行")
+        + f"（{_safe_management_text(reason)}）",
+        f"模式: {mode}" + (" / 未调用交易 API" if mode != "live" else ""),
+    ]
+    adjustment = payload.get("take_profit_adjustment")
+    positions = adjustment.get("positions") if isinstance(adjustment, dict) else []
+    for position in positions if isinstance(positions, list) else []:
+        if not isinstance(position, dict):
+            continue
+        lines.append(
+            f"- 仓位 {position.get('pos_id') or '-'} 剩余 {position.get('remaining_size') or '-'} 张"
+        )
+        lines.append("  现有止盈: " + (", ".join(position.get("existing") or []) or "-"))
+        lines.append("  目标止盈: " + (", ".join(position.get("targets") or []) or "-"))
+        if position.get("dropped_crossed"):
+            lines.append(
+                "  已被现价越过、去掉的档: " + ", ".join(position["dropped_crossed"])
+            )
+        if position.get("stop"):
+            lines.append(f"  同条消息止损: {position['stop']}")
+    return "\n".join(lines)
 
 
 def _management_protection_recovery_bypass(snapshot: dict[str, Any]) -> dict[str, Any] | None:
@@ -2576,15 +2718,20 @@ def _management_payload_fingerprint(payload: dict[str, Any]) -> str:
 
 
 def persist_strategy_management_notification_in_session(
-    session, batch, *, group_labels=None
+    session, batch, *, group_labels=None, force: bool = False
 ) -> bool:
-    """Write the alert outbox in the same transaction as an alert transition."""
+    """Write the alert outbox in the same transaction as an alert transition.
+
+    ``force`` writes it for a non-alert state too. Only the take-profit
+    adjustment executor passes it: its successes ("已一致", "已按新止盈结构
+    重挂") are reported as well as its refusals (design 3.3 / 3.6).
+    """
 
     from telegram_kol_research.models import StrategyManagementNotification
 
     payload = _management_payload_for_batch(session, batch, group_labels=group_labels)
     bypass = payload.get("protection_recovery_bypass")
-    if batch.status not in MANAGEMENT_ALERT_STATES and not (
+    if not force and batch.status not in MANAGEMENT_ALERT_STATES and not (
         isinstance(bypass, dict) and batch.status in _BYPASS_ALERT_STATES
     ):
         return False

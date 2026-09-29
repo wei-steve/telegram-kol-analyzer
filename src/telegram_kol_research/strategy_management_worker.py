@@ -19,6 +19,7 @@ from telegram_kol_research.runtime_worker_executor import (
 )
 from telegram_kol_research.management_recovery_timeout import (
     expire_stuck_management_recoveries,
+    expire_take_profit_adjustment_deadlines,
 )
 from telegram_kol_research.management_target_confirmation import (
     expire_stale_management_confirmations,
@@ -214,6 +215,10 @@ def run_strategy_management_worker_tick(
         )
     except Exception:
         logger.exception("management recovery timeout pass failed")
+    try:
+        expire_take_profit_adjustment_deadlines(session_factory, now=now)
+    except Exception:
+        logger.exception("take-profit adjustment deadline pass failed")
 
     # A-9 task 3. A question nobody answered must expire rather than wait
     # forever; an instruction parked two hours ago is stale enough that acting
@@ -591,6 +596,28 @@ def run_strategy_management_worker_tick(
 
     for batch in batches:
         try:
+            if getattr(batch, "intent", None) == "adjust_take_profit" and batch.status in {
+                "ready",
+                "executing",
+            }:
+                # Its own executor claims, runs to a terminal state and is
+                # safe to call again; the close/protection recovery lanes
+                # below do not apply to it.
+                if not allow_execution:
+                    counts["skipped"] += 1
+                    continue
+                from telegram_kol_research.take_profit_adjustment_executor import (
+                    execute_take_profit_adjustment_batch,
+                )
+
+                execute_take_profit_adjustment_batch(
+                    session_factory,
+                    batch_id=batch.id,
+                    deepcoin_client=get_client(),
+                    executed_at=now,
+                )
+                counts["executed"] += 1
+                continue
             if batch.status == "blocked" and batch.reason_code in TEMPORARY_VISIBILITY_REASONS:
                 if contract_spec_provider is None:
                     counts["skipped"] += 1

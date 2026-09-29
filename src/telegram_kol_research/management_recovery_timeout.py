@@ -155,6 +155,69 @@ def expire_stuck_management_recoveries(
     )
 
 
+#: 2026-09-29 take-profit adjustment (design 3.6). Unlike the recovery
+#: timeout above, this one is about batches that never reached
+#: ``recovery_required``: a take-profit adjustment carries its own
+#: ``execution_deadline_at`` (planned_at + 180 s), and whatever state it is in
+#: when that passes -- ``ready``, ``executing``, anything not terminal -- it is
+#: ended as ``blocked`` so it cannot hold the strategy's management slot. As
+#: above, it is never re-run.
+TAKE_PROFIT_ADJUST_DEADLINE_REASON = "take_profit_adjust_deadline_expired"
+
+
+def expire_take_profit_adjustment_deadlines(
+    session_factory,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, ...]:
+    """Block every take-profit adjustment batch past its execution deadline.
+
+    Runs under the position authority lock, the same lock the executor holds
+    for its whole run, so a batch is never ended underneath a write in flight
+    in this process. ``transition_batch`` writes the notification in the same
+    transaction.
+    """
+
+    from telegram_kol_research.position_authority_lock import (
+        position_authority_lock,
+    )
+
+    moment = now or datetime.now(UTC)
+    cutoff = _naive_utc(moment)
+    expired: list[int] = []
+    with position_authority_lock():
+        with session_factory() as session:
+            rows = [
+                (int(batch_id), str(status))
+                for batch_id, status in session.query(
+                    StrategyManagementBatch.id, StrategyManagementBatch.status
+                )
+                .filter(StrategyManagementBatch.intent == "adjust_take_profit")
+                .filter(
+                    StrategyManagementBatch.status.not_in(
+                        ("succeeded", "blocked", "resolved")
+                    )
+                )
+                .filter(StrategyManagementBatch.execution_deadline_at.is_not(None))
+                .filter(StrategyManagementBatch.execution_deadline_at <= cutoff)
+                .order_by(StrategyManagementBatch.id.asc())
+                .all()
+            ]
+        for batch_id, status in rows:
+            if transition_batch(
+                session_factory,
+                batch_id,
+                expected_statuses=(status,),
+                new_status="blocked",
+                transitioned_at=moment,
+                reason_code=TAKE_PROFIT_ADJUST_DEADLINE_REASON,
+            ):
+                expired.append(batch_id)
+    if expired:
+        logger.warning("take-profit adjustment deadline expired batches=%s", expired)
+    return tuple(expired)
+
+
 def _candidates(session_factory, *, cutoff: datetime) -> list[dict[str, Any]]:
     with session_factory() as session:
         batches = (

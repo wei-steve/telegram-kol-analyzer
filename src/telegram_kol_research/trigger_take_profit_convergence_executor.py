@@ -1891,6 +1891,13 @@ def _matching_take_profit_protection_legs(
         )
         .filter(PositionProtectionLeg.role == "take_profit")
         .filter(PositionProtectionLeg.pos_id == str(pos_id))
+        # A superseded leg is history, not an owner (the same rule
+        # ``position_take_profit_orders`` applies). Without this, a take-profit
+        # adjustment that re-places a tier at a price it already had leaves two
+        # legs at that price, and the convergence refuses the position as
+        # ``convergence_protection_leg_conflict`` -- R4 in the 2026-09-29
+        # take-profit adjustment design.
+        .filter(PositionProtectionLeg.status != "superseded")
         .order_by(PositionProtectionLeg.id.asc())
         .all()
     )

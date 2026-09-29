@@ -1413,6 +1413,19 @@ def execute_management_batch(
     now = executed_at or datetime.now(UTC)
     stop_checked_at = stop_gate_clock(now)
     batch = load_management_batch(session_factory, int(batch_id))
+    if batch.intent == "adjust_take_profit":
+        # 2026-09-29 take-profit adjustment: its own executor, which re-checks
+        # the stop gate itself and never reaches the close or protection paths.
+        from telegram_kol_research.take_profit_adjustment_executor import (
+            execute_take_profit_adjustment_batch,
+        )
+
+        return execute_take_profit_adjustment_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=deepcoin_client,
+            executed_at=now,
+        )
     if batch.status in {"ready", "protection_ready", "executing"}:
         stop_gate = validate_batch_stops(session_factory, batch=batch, client=deepcoin_client, now=now, now_provider=stop_checked_at)
         if stop_gate is not None:
