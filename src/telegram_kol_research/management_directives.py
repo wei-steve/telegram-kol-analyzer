@@ -318,6 +318,20 @@ def resolve_management_directive(
             strategy_thread_id=strategy_thread_id,
         )
 
+    # 2026-09-29 take-profit adjustment (design 3.5 / 5.5). Placed before the
+    # first use of ``has_partial``: "两个止盈位各50%" is a split of future take
+    # profits, not "close half now". Only positive evidence qualifies; the
+    # judgement itself lives in ``take_profit_adjustment``.
+    take_profit_directive = _take_profit_adjustment_directive(
+        text=str(text or ""),
+        lifecycle_event=lifecycle_event,
+        symbol=symbol,
+        side=side,
+        strategy_thread_id=strategy_thread_id,
+    )
+    if take_profit_directive is not None:
+        return take_profit_directive
+
     if (
         raw_action in {"adjust_stop_loss", "adjust_position_tpsl", "risk_update"}
         and not has_partial
@@ -512,6 +526,47 @@ def build_management_instruction_contract(
             "replace_remaining_protection",
         ),
         current_message_text=str(text or "").strip(),
+    )
+
+
+def _take_profit_adjustment_directive(
+    *,
+    text: str,
+    lifecycle_event: Mapping[str, Any],
+    symbol: str | None,
+    side: str | None,
+    strategy_thread_id: int | None,
+) -> ManagementDirective | None:
+    """The ``adjust_take_profit`` directive, when the text positively asks for one.
+
+    Risk is not increased (the stop is untouched unless the same message names
+    a new one in label form, and that one still passes the stop gate), so the
+    directive is risk-reducing for scope purposes; but it never fans out and
+    never cancels a deferred entry leg: it rearranges one strategy's exits.
+    """
+
+    from telegram_kol_research.take_profit_adjustment import (
+        TAKE_PROFIT_ADJUST_INTENT,
+        classify_take_profit_instruction,
+    )
+
+    instruction = classify_take_profit_instruction(text, lifecycle_event)
+    if instruction is None:
+        return None
+    return ManagementDirective(
+        intent=TAKE_PROFIT_ADJUST_INTENT,
+        fraction=None,
+        symbol=symbol,
+        side=side,
+        stop_loss=instruction.stop_loss,
+        risk_reducing=True,
+        fanout_allowed=False,
+        cancel_deferred_entries=False,
+        reason_code="take_profit_adjustment",
+        strategy_thread_id=strategy_thread_id,
+        stop_price_source=(
+            "current_message_text" if instruction.stop_loss is not None else None
+        ),
     )
 
 

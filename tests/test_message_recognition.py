@@ -4402,8 +4402,12 @@ def test_ai_lifecycle_event_explicit_stop_overrides_protection_price(tmp_path, m
     assert lifecycle.take_profit == "1845"
     assert lifecycle.management_note is None
     assert candidate.event_type == "position_update"
-    assert candidate.management_action == "adjust_stop_loss"
+    # 2026-09-29 take-profit adjustment: the 欧阳 template "止盈位：X 止损位：Y"
+    # is a take-profit adjustment carrying a stop, no longer a stop-only
+    # change that silently dropped the take profit (design 1.3 / 3.5).
+    assert candidate.management_action == "adjust_take_profit"
     assert candidate.stop_loss_text == "1725"
+    assert candidate.stop_price_source == "current_message_text"
     assert candidate.take_profit_text == "1845"
 
 

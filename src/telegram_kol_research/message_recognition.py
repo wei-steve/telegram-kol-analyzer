@@ -1805,7 +1805,12 @@ def _extract_explicit_stop_loss_from_management_text(text: str | None) -> float 
         return None
 
     patterns = [
-        r"(?:止损|损位|保护价|stop\s*loss|stop|sl)[^0-9]{0,20}([0-9]+(?:\.\d+)?)",
+        # R3 (2026-09-29 take-profit adjustment design): the heading
+        # "设置好止盈止损" is not a stop label, and the gap after a real label
+        # must not run into a take-profit label -- "止盈位：73070 止损位：
+        # 78700" used to return 73070 as the stop.
+        r"(?:(?<!止盈)止损|损位|保护价|stop\s*loss|stop|sl)"
+        r"(?:(?!止盈)[^0-9]){0,20}([0-9]+(?:\.\d+)?)",
         r"([0-9]+(?:\.\d+)?)[^0-9]{0,8}(?:附近)?[^0-9]{0,12}(?:止损|损位|保护价)",
     ]
     for pattern in patterns:
@@ -2566,6 +2571,7 @@ def _apply_deterministic_management_scope_if_matched(
             "adjust_stop_loss",
             "move_stop_to_break_even",
             "partial_then_break_even",
+            "adjust_take_profit",
         }:
             target_decision["stop_loss"] = directive.stop_loss
             target_decision["stop_price_source"] = directive.stop_price_source

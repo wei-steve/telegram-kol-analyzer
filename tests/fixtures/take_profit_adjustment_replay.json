@@ -1,0 +1,256 @@
+{
+ "source": "production snapshot 2026-09-29 (design docs/plans/2026-09-29-take-profit-adjustment-design.md); raw text and recognition payload only",
+ "messages": [
+  {
+   "raw_message_id": 18199,
+   "group": "比特币陈哥会员群-11分组",
+   "posted_at": "2026-09-21 16:15:25.000000",
+   "text": "比特币浮盈中，今晚暂时没有其他操作了，提前设置一下止盈位两个止盈位各50%，再次强调不要取整数不容易触发，上下几十点浮动都正常。\n@Tarderfengge QQ:158241758",
+   "observed_text": "比特币浮盈中，今晚暂时没有其他操作了，提前设置一下止盈位两个止盈位各50%，再次强调不要取整数不容易触发，上下几十点浮动都正常。",
+   "lifecycle_event": {
+    "confidence": 0.93,
+    "entry_price": null,
+    "event_type": "position_update",
+    "exit_price": null,
+    "management_action": "set_take_profit_plan, two_targets_50_percent_each",
+    "reason": "BTC已有做空策略处于entered状态，当前消息明确要求提前设置两个止盈位、各50%，但未给出具体价格。",
+    "side": "short",
+    "stop_loss": null,
+    "symbol": "BTC",
+    "take_profit": null,
+    "target_lifecycle_id": 1264
+   }
+  },
+  {
+   "raw_message_id": 13848,
+   "group": "欧阳火箭滚仓班🚀 11分组",
+   "posted_at": "2026-08-29 15:12:54.000000",
+   "text": "🔥设置好止盈止损持仓过夜！🔥\n止盈位：73070！！！\n止损位：78700！！！\n🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥\n@Tarderfengge QQ:158241758",
+   "observed_text": "🔥设置好止盈止损持仓过夜！🔥\n止盈位：73070！！！\n止损位：78700！！！\n🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥\n@Tarderfengge QQ:158241758",
+   "lifecycle_event": {
+    "confidence": 0.9,
+    "event_type": "position_update",
+    "management_action": "risk_update",
+    "reason": "消息设置止盈止损73070/78700，与已进入的BTC空单策略1030（thread_id 399）完全匹配，属于仓位管理操作。",
+    "target_lifecycle_id": 1030
+   }
+  },
+  {
+   "raw_message_id": 17745,
+   "group": "欧阳火箭滚仓班🚀 11分组",
+   "posted_at": "2026-09-19 13:40:10.000000",
+   "text": "🔥又是类似的情况，差两个点触发成本价！\n🔥剩余仓位继续持有，设置好止盈止损！\n止盈位：2710！！！\n止损位：2624！(成本价)\n🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥\n@Tarderfengge QQ:158241758",
+   "observed_text": "剩余仓位继续持有；止盈位2710；止损位2624（成本价）",
+   "lifecycle_event": {
+    "confidence": 0.99,
+    "event_type": "position_update",
+    "management_action": "move_stop_to_protect",
+    "reason": "消息明确表示剩余仓位继续持有，并将止损调整至成本价2624、止盈设为2710，唯一匹配已进入的ETH多单策略1238（thread_id 607），属于仓位管理。",
+    "target_lifecycle_id": 1238
+   }
+  },
+  {
+   "raw_message_id": 14306,
+   "group": "比特币陈哥会员群-11分组",
+   "posted_at": "2026-09-01 15:39:27.000000",
+   "text": "目前已经是东八区晚间23:40左右，多单正常持有过夜，小级别关注78500-78700附近，突破看第一止盈位79100提前设置好自动止盈50%，触发后可上移止损做成本保护，在看下一个止盈点位。\n@Tarderfengge QQ:158241758",
+   "observed_text": "目前已经是东八区晚间23:40左右，多单正常持有过夜，小级别关注78500-78700附近，突破看第一止盈位79100提前设置好自动止盈50%，触发后可上移止损做成本保护，在看下一个止盈点位。\n@Tarderfengge QQ:158241758",
+   "lifecycle_event": {
+    "confidence": 0.9,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit",
+    "reason": "消息明确指示对当前BTC多单设置部分止盈（50%在79100）并移动止损做成本保护，对应活跃策略thread_id 412（lifecycle_id 1043，pending_entry已通过消息10317确认入场），无多目标或冲突。",
+    "target_lifecycle_id": 1043
+   }
+  },
+  {
+   "raw_message_id": 18294,
+   "group": "比特币陈哥会员群-11分组",
+   "posted_at": "2026-09-22 04:59:49.000000",
+   "text": "比特币空单小级别关注84000-84400附近有支撑，如果是北美地区的朋友目前已经晚间了，可以提前设置一个止盈点位，至少50%自动止盈，做短线也可以提前设置好止盈位。\n@Tarderfengge QQ:158241758",
+   "observed_text": "比特币空单关注84000-84400附近支撑，建议提前设置止盈，至少50%自动止盈。",
+   "lifecycle_event": {
+    "confidence": 0.88,
+    "entry_price": null,
+    "event_type": "position_update",
+    "exit_price": null,
+    "management_action": "set_take_profit_plan, partial_take_profit_50_percent",
+    "reason": "BTC空单关注84000-84400附近支撑，并建议提前设置止盈且至少50%自动止盈，属于已有策略的部分止盈计划管理。",
+    "side": "short",
+    "stop_loss": null,
+    "symbol": "BTC",
+    "take_profit": "84000-84400附近",
+    "target_lifecycle_id": 1271
+   }
+  },
+  {
+   "raw_message_id": 17526,
+   "group": "颜驰 11分组",
+   "posted_at": "2026-09-18 09:24:52.000000",
+   "text": "视频内容重点提炼\n多单利润正在扩大，完成第一止盈后，剩下看向79400目标位即可！\nETH 有些争议，我本昨日观点是看个回调之后的上行，这个在昨日视频中有明确解读到。\n策略上给的建议是2480-2510空，回调其实产生了50点的利润，这种情况，你舍不得止盈，你也应该成本防守。而不是现在纠结怎么办🤷🏻‍♀️\n没有止盈没有防守的那部分人，建议是一会回落自行走掉，没有回落，那就该止损止损。\n@Tarderfengge QQ:158241758",
+   "observed_text": "BTC多单完成第一止盈，剩余看向79400；ETH回顾2480-2510空单并给出离场或止损建议。",
+   "lifecycle_event": {
+    "confidence": 0.91,
+    "entry_price": null,
+    "event_type": "position_update",
+    "exit_price": null,
+    "management_action": "partial_take_profit",
+    "reason": "BTC明确表示完成第一止盈并将剩余仓位看向79400；ETH是在回顾2480-2510空单后，建议未止盈者回落自行离场，否则止损，属于已有仓位管理。",
+    "side": null,
+    "stop_loss": null,
+    "symbol": null,
+    "take_profit": null,
+    "target_lifecycle_id": null,
+    "targets": [
+     {
+      "confidence": 0.98,
+      "management_action": "partial_take_profit",
+      "side": "long",
+      "symbol": "BTC",
+      "take_profit": "第一止盈已完成，剩余看向79400",
+      "target_lifecycle_id": 1207
+     },
+     {
+      "confidence": 0.82,
+      "management_action": "take_profit_or_stop_loss",
+      "side": "short",
+      "symbol": "ETH",
+      "target_lifecycle_id": 1220
+     }
+    ]
+   }
+  },
+  {
+   "raw_message_id": 18532,
+   "group": "比特币陈哥会员群-11分组",
+   "posted_at": "2026-09-23 08:55:39.000000",
+   "text": "这笔交易是短线回调空单，目前在支持附近跌破85200-85600这个位子就有机会去84200关键位，如果止跌准备做多，反之看完美止盈。\n@Tarderfengge QQ:158241758",
+   "observed_text": "已有BTC短线回调空单，关注85200-85600支撑，跌破看84200；止跌则准备做多。",
+   "lifecycle_event": {
+    "confidence": 0.8,
+    "entry_price": null,
+    "event_type": "position_update",
+    "exit_price": null,
+    "management_action": "set_take_profit_plan, monitor_support_break",
+    "reason": "已有BTC空单关注85200-85600支撑，跌破后看84200；未明确全平或立即反向做多。",
+    "side": "short",
+    "stop_loss": null,
+    "symbol": "BTC",
+    "take_profit": "84200",
+    "target_lifecycle_id": 1271
+   }
+  },
+  {
+   "raw_message_id": 19670,
+   "group": "大漂亮社区 11分组",
+   "posted_at": "2026-09-29 01:16:26.000000",
+   "text": "🧛‍♂️分析师—#Nick\n空单已经入场，最高上冲84300附近，有入场可以继续轻仓持有，82500附近可以止盈30%先\n@Tarderfengge QQ:158241758",
+   "observed_text": "BTC空单已入场，建议继续轻仓持有，82500附近止盈30%。",
+   "lifecycle_event": {
+    "confidence": 0.99,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit",
+    "reason": "消息明确针对已入场BTC空单（thread_id 721）发出部分止盈30%的指令，属于仓位管理动作，与策略生命周期1352匹配。",
+    "target_lifecycle_id": 1352
+   }
+  },
+  {
+   "raw_message_id": 13957,
+   "group": "比特币飞扬 11分组",
+   "posted_at": "2026-08-30 12:34:48.000000",
+   "text": "止盈30%，剩下的止损移动到78000\n@Tarderfengge QQ:158241758",
+   "observed_text": null,
+   "lifecycle_event": null
+  },
+  {
+   "raw_message_id": 17900,
+   "group": "米娅 vip会员群 11分组",
+   "posted_at": "2026-09-20 16:16:54.000000",
+   "text": "BTC多单目前获利600点，止盈40%，剩余仓位上移至80600，夜晚风险较大，做无风险持仓！\n@Tarderfengge QQ:158241758",
+   "observed_text": "BTC多单获利600点，止盈40%，剩余仓位止损上移至80600，做无风险持仓；图片显示BTCUSDT行情，最新价81146.2。",
+   "lifecycle_event": {
+    "confidence": 0.95,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit",
+    "reason": "当前消息明确管理已有的BTC多单策略（thread_id 619, lifecycle_id 1250），执行部分止盈40%并移动止损至80600，属于仓位管理操作，无冲突或新增风险。",
+    "target_lifecycle_id": 1250
+   }
+  },
+  {
+   "raw_message_id": 17901,
+   "group": "米娅 vip会员群 11分组",
+   "posted_at": "2026-09-20 16:17:09.000000",
+   "text": "BTC多单目前获利600点，止盈40%，剩余仓位止损位上移至80600，夜晚风险较大，做无风险持仓！\n@Tarderfengge QQ:158241758",
+   "observed_text": "BTC多单目前获利600点，止盈40%，剩余仓位止损位上移至80600，夜晚风险较大，做无风险持仓。",
+   "lifecycle_event": {
+    "confidence": 0.99,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit",
+    "reason": "当前消息明确管理已有BTC多单（thread_id 619）：部分止盈40%并将止损上移至80600，属于仓位管理指令，与候选策略匹配，且无冲突。",
+    "target_lifecycle_id": 1250
+   }
+  },
+  {
+   "raw_message_id": 18154,
+   "group": "米娅 vip会员群 11分组",
+   "posted_at": "2026-09-21 12:20:36.000000",
+   "text": "恭喜跟上BTC多单的朋友，目前获利1100点，止盈60%，剩余仓位止损位上移至64100，做无风险持仓！\n@Tarderfengge QQ:158241758",
+   "observed_text": "BTC多单获利1100点，止盈60%，剩余仓位止损上移至64100，做无风险持仓；图片显示BTCUSDT行情页面，最新价85195.3。",
+   "lifecycle_event": {
+    "confidence": 0.99,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit",
+    "reason": "消息明确管理已有BTC多单（thread_id 629），执行部分止盈60%并移动止损至64100，属于降风险仓位管理动作。",
+    "target_lifecycle_id": 1260
+   }
+  },
+  {
+   "raw_message_id": 19597,
+   "group": "米娅 vip会员群 11分组",
+   "posted_at": "2026-09-28 13:39:44.000000",
+   "text": "目前BTC现价83800，加仓后浮盈600点，相当于正常仓位1200点收益，加仓后仓位比较大，减50%仓位，剩余仓位止损位上移至83200！\n@Tarderfengge QQ:158241758",
+   "observed_text": "BTC现价83800；加仓后浮盈600点；减50%仓位；剩余仓位止损上移至83200。",
+   "lifecycle_event": {
+    "confidence": 0.99,
+    "entry_price": null,
+    "event_type": "position_update",
+    "exit_price": null,
+    "management_action": "partial_take_profit,move_stop_to_protect",
+    "reason": "明确表示减50%仓位，并将剩余仓位止损位上移至83200。",
+    "side": "long",
+    "stop_loss": "83200",
+    "symbol": "BTC",
+    "take_profit": null,
+    "target_lifecycle_id": 1343
+   }
+  },
+  {
+   "raw_message_id": 16873,
+   "group": "大镖客 11分组",
+   "posted_at": "2026-09-15 05:24:36.000000",
+   "text": "大镖客·Andy\n第一止盈位已到，注意锁定利润，及时移动止损！\n@Tarderfengge QQ:158241758",
+   "observed_text": "第一止盈位已到，注意锁定利润，及时移动止损",
+   "lifecycle_event": {
+    "confidence": 0.99,
+    "entry_price": null,
+    "event_type": "position_update",
+    "exit_price": null,
+    "management_action": "partial_take_profit,move_stop_to_protect",
+    "reason": "回复目标对应已entered的BTC空单，当前消息确认第一止盈位已到，并要求锁定利润及移动止损。",
+    "side": "short",
+    "stop_loss": null,
+    "symbol": "BTC",
+    "take_profit": null,
+    "target_lifecycle_id": 1196
+   }
+  },
+  {
+   "raw_message_id": 14085,
+   "group": "欧阳火箭滚仓班🚀 11分组",
+   "posted_at": "2026-08-31 09:50:19.000000",
+   "text": "🔥本轮多单现目前获利1100点！🔥\n🔥现目前持仓收益达到170％！🔥\n分批止盈30％！！！\n推保护价：77500！！！\n🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥\n@Tarderfengge QQ:158241758",
+   "observed_text": null,
+   "lifecycle_event": null
+  }
+ ]
+}
