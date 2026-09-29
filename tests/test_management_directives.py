@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from telegram_kol_research import management_directives as management_directives_module
@@ -7,6 +9,7 @@ from telegram_kol_research.management_directives import (
     DEFAULT_PARTIAL_CLOSE_FRACTION,
     DEFAULT_TAIL_CLOSE_FRACTION,
     build_management_instruction_contract,
+    future_take_profit_level,
     resolve_management_directive,
 )
 
@@ -1055,3 +1058,142 @@ def test_m8_negative_remaining_position_break_even_exit_is_not_full() -> None:
         lifecycle_event={"management_action": "partial_take_profit"},
     )
     assert directive.intent != "full_exit"
+
+# --- 2026-09-29 Mia design, M2: plain partial close copies no stop --------
+
+
+class _M2Leg:
+    def __init__(self, planned_tpsl):
+        self.planned_tpsl = planned_tpsl
+        self.avg_entry_price = "2785"
+
+
+class _M2Batch:
+    def __init__(self, *, legs, batch_id, raw_message_id):
+        self.intent = "partial_take_profit"
+        self.management_contract_json = None
+        self.legs = legs
+        self.id = batch_id
+        self.raw_message_id = raw_message_id
+        self.execution_binding_id = 1
+
+
+def _m2_session_factory(tmp_path, *, raw_message_id, text):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import ExecutionBinding, RawMessage
+
+    session_factory = create_session_factory(tmp_path / "m2-gate.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(id=raw_message_id, chat_id=1, message_id=raw_message_id, text=text)
+        )
+        session.add(
+            ExecutionBinding(
+                id=1,
+                kol_id="k",
+                chat_id=1,
+                message_id=raw_message_id,
+                symbol="ETH",
+                side="short",
+                venue="deepcoin",
+                status="entered",
+            )
+        )
+        session.commit()
+    return session_factory
+
+
+def test_m2_negative_plain_partial_close_copies_no_stop_via_gate(tmp_path) -> None:
+    # Batch 177 shape (#18543, "第一止盈位到了"), replayed to the gate. Before
+    # M2, the candidate's stop_loss_text held the strategy's *original* stop
+    # with no provenance tag, so the execution-side stop gate blocked the
+    # whole batch with management_stop_provenance_invalid even though the
+    # message never named a stop at all. After M2, a plain partial_take_profit
+    # batch that carries no stop_loss_text in its legs is not judged by the
+    # price gate at all (validate_batch_stops only inspects an explicit_price
+    # target) -- same fixture, same batch shape, only the leg's
+    # stop_loss_text differs.
+
+    from telegram_kol_research import management_stop_price_gate as gate
+
+    session_factory = _m2_session_factory(
+        tmp_path, raw_message_id=18543, text="第一止盈位到了"
+    )
+
+    # Before M2 (what the candidate used to carry): the strategy's original
+    # stop, copied in with no provenance tag.
+    before_batch = _M2Batch(
+        legs=[_M2Leg({"stop_loss_text": "2785", "stop_price_source": None})],
+        batch_id=177,
+        raw_message_id=18543,
+    )
+    before_result = gate.validate_batch_stops(
+        session_factory, batch=before_batch, client=None, now=datetime(2026, 9, 23, tzinfo=UTC)
+    )
+    assert before_result is not None
+    assert before_result.reason_code == "management_stop_provenance_invalid"
+
+    # After M2: the candidate carries no stop at all for this leg.
+    after_batch = _M2Batch(
+        legs=[_M2Leg({"stop_loss_text": None, "stop_price_source": None})],
+        batch_id=177,
+        raw_message_id=18543,
+    )
+
+    def refuse_any_session():
+        raise AssertionError("a batch with no explicit-price target needs no session")
+
+    after_result = gate.validate_batch_stops(
+        refuse_any_session, batch=after_batch, client=None, now=datetime(2026, 9, 23, tzinfo=UTC)
+    )
+    assert after_result is None
+
+
+def test_m2_negative_a_message_written_stop_is_still_judged(tmp_path) -> None:
+    # Fail-closed check: M2 must not blank a stop the message did name.
+
+    from telegram_kol_research import management_stop_price_gate as gate
+
+    session_factory = _m2_session_factory(
+        tmp_path, raw_message_id=18578, text="精准踩到第二止盈位"
+    )
+    batch = _M2Batch(
+        legs=[_M2Leg({"stop_loss_text": "2785", "stop_price_source": "context"})],
+        batch_id=178,
+        raw_message_id=18578,
+    )
+    result = gate.validate_batch_stops(
+        session_factory, batch=batch, client=None, now=datetime(2026, 9, 23, tzinfo=UTC)
+    )
+    assert result is not None
+    assert result.reason_code == "management_stop_provenance_invalid"
+
+
+# --- 2026-09-29 Mia design, M2 guardrail (Q5/7.1): future price level ------
+
+
+def test_m2_guardrail_19670_names_a_future_level() -> None:
+    # #19670 大漂亮, 2026-09-29 01:16Z: "82500附近可以止盈30%先" is a plan for
+    # when price gets there, not "reduce now".
+    text = (
+        "🧛‍♂️分析师—#Nick 空单已经入场，最高上冲84300附近，有入场可以继续轻仓持有，"
+        "82500附近可以止盈30%先 @Tarderfengge QQ:158241758"
+    )
+    assert future_take_profit_level(text) == 82500.0
+
+
+def test_m2_guardrail_negative_mia_standard_phrasing_is_not_a_future_level() -> None:
+    # Mia's "剩余仓位" idiom (M1's own case) must never trip this guardrail:
+    # it is Q6's "reduce now" signal, not a future level to wait for.
+    assert future_take_profit_level(_M1_17900_RAW) is None
+    assert future_take_profit_level(_M1_18154_RAW) is None
+
+
+def test_m2_guardrail_negative_profit_points_is_reduce_now() -> None:
+    # "目前获利600点" is Q6's profit-in-points "reduce now" signal even when a
+    # 附近-qualified number is also present.
+    assert (
+        future_take_profit_level("目前获利600点，82500附近可以止盈30%") is None
+    )
+
+

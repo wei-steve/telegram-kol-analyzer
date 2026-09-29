@@ -117,6 +117,8 @@ from telegram_kol_research.management_stop_price_gate import (
     validate_management_stop, read_stop_quote, record_stop_gate_rejection,
     stop_gate_clock,
 )
+from telegram_kol_research.management_directives import future_take_profit_level
+from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -535,6 +537,17 @@ def _plan_strategy_management_batch_locked(
             planned_at=now,
             execution_mode=execution_mode,
         )
+    if intent == "partial_take_profit":
+        future_level_result = _reject_partial_take_profit_future_level(
+            session_factory,
+            identity=identity,
+            raw_message_id=raw_message_id,
+            deepcoin_client=deepcoin_client,
+            planned_at=now,
+            execution_mode=execution_mode,
+        )
+        if future_level_result is not None:
+            return future_level_result
     (
         identity,
         price_plausibility,
@@ -2725,6 +2738,106 @@ def _leg_state(leg: ExecutionOrderLeg) -> tuple[Any, ...]:
         leg.last_verified_at,
         leg.status,
     )
+
+
+def _reject_partial_take_profit_future_level(
+    session_factory,
+    *,
+    identity: _PlanningIdentity,
+    raw_message_id: int,
+    deepcoin_client,
+    planned_at: datetime,
+    execution_mode: str,
+):
+    """M2 guardrail (2026-09-29 Mia design, Q5/7.1).
+
+    A partial-take-profit message that names a *future* price level
+    ("82500附近可以止盈30%先", #19670) is a plan for when the market gets
+    there, not an instruction to reduce right now. Blocks the batch and
+    always alerts -- unlike ``management_fraction_rejected``, a batch only
+    reaches this point once its execution binding exists, so there is no
+    notify_only case to suppress here.
+
+    Returns ``None`` when the guardrail does not apply (no future level
+    named, the level is within 0.3% of the current price), so the caller
+    falls through to ordinary planning.
+    """
+
+    text = identity.raw_message.text if identity.raw_message is not None else None
+    level = future_take_profit_level(text)
+    if level is None:
+        return None
+    instrument_id = f"{str(identity.lifecycle.symbol).upper()}-USDT-SWAP"
+    quote = read_stop_quote(deepcoin_client, instrument_id)
+    current_price = None
+    if isinstance(quote, dict):
+        try:
+            parsed = Decimal(str(quote.get("price")))
+            if parsed.is_finite() and parsed > 0:
+                current_price = parsed
+        except (InvalidOperation, TypeError, ValueError):
+            current_price = None
+    deviation_pct: str | None = None
+    within_tolerance = False
+    if current_price is not None:
+        deviation = abs(Decimal(str(level)) - current_price) / current_price * 100
+        deviation_pct = str(deviation)
+        within_tolerance = deviation <= Decimal("0.3")
+    if within_tolerance:
+        return None
+    result = _persist_blocked(
+        session_factory,
+        identity=identity,
+        raw_message_id=raw_message_id,
+        intent="partial_take_profit",
+        reason_code="partial_take_profit_future_level",
+        planned_at=planned_at,
+        execution_mode=execution_mode,
+        stop_gate_evidence={
+            "future_take_profit_level": str(level),
+            "current_price": str(current_price) if current_price is not None else None,
+            "deviation_pct": deviation_pct,
+        },
+    )
+    record_runtime_incident(
+        session_factory,
+        source_kind="strategy_management_batch",
+        source_record_id=str(result.batch_id),
+        incident_type="management_partial_take_profit_future_level_blocked",
+        severity="high",
+        fingerprint=hashlib.sha256(
+            f"management_partial_take_profit_future_level_blocked:"
+            f"{raw_message_id}:{identity.candidate.id}".encode()
+        ).hexdigest(),
+        redacted_summary=json.dumps(
+            {
+                "component": "strategy_management_planner",
+                "reason_code": "partial_take_profit_future_level",
+            }
+        ),
+        occurred_at=planned_at,
+        feature_policy_version="management-partial-take-profit-future-level-v1",
+        prompt_version="none",
+        tool_policy_version="no-exchange-write",
+        diagnosis_json=json.dumps(
+            {
+                "observed_state": {
+                    "future_take_profit_level": str(level),
+                    "current_price": (
+                        str(current_price) if current_price is not None else None
+                    ),
+                    "deviation_pct": deviation_pct,
+                }
+            }
+        ),
+        evidence_refs_json=json.dumps(
+            [
+                f"raw_message:{raw_message_id}",
+                f"strategy_management_batch:{result.batch_id}",
+            ]
+        ),
+    )
+    return result
 
 
 def _persist_stop_gate_rejection(session_factory, *, identity, raw_message_id,

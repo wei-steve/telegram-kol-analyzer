@@ -362,6 +362,17 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # silently changes an order's size, and because a miss here is the
         # same failure the rule exists to catch.
         "half_position_entry_confirmed_by_rule",
+        # M2 guardrail (2026-09-29 Mia design, Q5): a partial-take-profit
+        # instruction that names a *future* price level ("82500附近可以止盈
+        # 30%") rather than an instruction to reduce now must not be executed
+        # as an immediate close. The planner blocks it and this incident is
+        # what tells a person the message was withheld rather than silently
+        # dropped or, worse, executed against the wrong intent -- the
+        # production sample this guardrail exists for (#19670) happened to be
+        # caught only because M2's provenance defect was still live; once that
+        # defect is fixed, this is the only thing standing between "82500附近
+        # 可以止盈30%" and an immediate market close.
+        "management_partial_take_profit_future_level_blocked",
     }
 )
 

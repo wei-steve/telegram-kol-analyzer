@@ -5292,3 +5292,145 @@ def test_raw_15402_signature_number_keeps_its_own_high_severity_disposition(
     assert [
         (row.incident_type, row.severity) for row in incidents
     ] == [("management_price_implausible", "high")]
+
+
+# --- 2026-09-29 Mia design, M2 guardrail (Q5/7.1): future price level -----
+
+
+def test_m2_guardrail_blocks_a_future_level_partial_take_profit(monkeypatch, tmp_path):
+    """#19670 shape, replayed through the real planner.
+
+    "82500附近可以止盈30%先" names a future price level, not
+    "reduce now". The current-price read is unavailable here
+    (``_ReadOnlyDeepcoin.get_ticker_quote`` deliberately raises, and
+    ``read_stop_quote`` turns that into ``None``), so the guardrail must
+    fail closed rather than assume the level is safe.
+    """
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    text = (
+        "\U0001f9db\u200d\u2642\ufe0f\u5206\u6790\u5e08\u2014#Nick "
+        "\u7a7a\u5355\u5df2\u7ecf\u5165\u573a\uff0c\u6700\u9ad8\u4e0a\u51b284300\u9644\u8fd1\uff0c"
+        "\u6709\u5165\u573a\u53ef\u4ee5\u7ee7\u7eed\u8f7b\u4ed3\u6301\u6709\uff0c"
+        "82500\u9644\u8fd1\u53ef\u4ee5\u6b62\u76c830%\u5148 @Tarderfengge QQ:158241758"
+    )
+    raw_id, _lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=0.3,
+        side="short",
+        pos_ids=("pos-b",),
+        management_text=text,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin(
+        [_position("pos-b", size="10", avg_px="84000", side="short")],
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "partial_take_profit_future_level"
+    assert client.write_calls == []
+    with session_factory() as session:
+        from telegram_kol_research.models import RuntimeIncident
+
+        incidents = (
+            session.query(RuntimeIncident)
+            .filter_by(
+                incident_type=(
+                    "management_partial_take_profit_future_level_blocked"
+                )
+            )
+            .all()
+        )
+    assert len(incidents) == 1
+    assert incidents[0].severity == "high"
+
+
+def test_m2_guardrail_negative_ordinary_partial_take_profit_is_not_blocked(
+    monkeypatch, tmp_path
+):
+    """Same guardrail entry point, ordinary partial_take_profit text.
+
+    Only the message text changes from the blocking test above -- Mia's own
+    "\u5269\u4f59\u4ed3\u4f4d" idiom has no future-level phrasing -- giving the
+    ARCHITECTURE.md #6 positive/negative pair on one mechanism. Planning must
+    proceed past the guardrail (the ticker is never read, since the
+    guardrail only reads price once it has already found a future level).
+    """
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_take_profit",
+        management_fraction=0.4,
+        side="long",
+        pos_ids=("pos-b",),
+        management_text="\u6b62\u760040%\uff0c\u5269\u4f59\u4ed3\u4f4d\u6b62\u635f\u4f4d\u4e0a\u79fb\u81f380600\uff0c\u505a\u65e0\u98ce\u9669\u6301\u4ed3\uff01",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin(
+        [_position("pos-b", size="10", avg_px="80000", side="long")],
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.reason_code != "partial_take_profit_future_level"
+    assert client.ticker_reads == []
+
+
+def test_m2_guardrail_pure_function_allows_a_level_within_tolerance():
+    """Unit-level positive proof that the guardrail's own check passes.
+
+    Same message text as the blocking test above; only the ticker price
+    changes, from unavailable to within 0.3% of 82500. This isolates
+    ``_reject_partial_take_profit_future_level``'s own price-read and
+    deviation arithmetic from the rest of planning (whose ``ready`` outcome
+    for a real position needs a full protection-ledger fixture, exercised
+    elsewhere in this file).
+    """
+
+    planner = _planner()
+
+    class _Identity:
+        def __init__(self, raw_message, lifecycle):
+            self.raw_message = raw_message
+            self.lifecycle = lifecycle
+
+    class _RawMessage:
+        text = "82500\u9644\u8fd1\u53ef\u4ee5\u6b62\u76c830%\u5148"
+
+    class _Lifecycle:
+        symbol = "BTC"
+
+    class _NearTicker:
+        def get_ticker_quote(self, *, inst_id):
+            return {"price": "82600"}
+
+    def refuse_any_session():
+        raise AssertionError("must not persist a batch when the guardrail allows")
+
+    result = planner._reject_partial_take_profit_future_level(
+        refuse_any_session,
+        identity=_Identity(_RawMessage(), _Lifecycle()),
+        raw_message_id=1,
+        deepcoin_client=_NearTicker(),
+        planned_at=PLANNED_AT,
+        execution_mode="live",
+    )
+    assert result is None

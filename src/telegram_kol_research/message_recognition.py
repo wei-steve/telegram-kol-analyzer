@@ -1533,6 +1533,10 @@ def _apply_lifecycle_event_decision(
             management_contract_fingerprint=(
                 management_contract_fingerprint_value
             ),
+            # M2 (2026-09-29 Mia design): this is the AI/lifecycle_event path
+            # a plain partial close with no message-written stop must not
+            # borrow the strategy's original stop as if it were named here.
+            copy_lifecycle_stop_loss_when_silent=False,
         )
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
         return True
@@ -5024,11 +5028,8 @@ def _upsert_management_signal_candidate(
     requested_take_profit: str | None = None,
     management_contract_json: str | None = None,
     management_contract_fingerprint: str | None = None,
+    copy_lifecycle_stop_loss_when_silent: bool = True,
 ) -> SignalCandidate:
-    break_even_intent = str(management_action or "").lower() in {
-        "move_stop_to_break_even",
-        "partial_then_break_even",
-    }
     desired = {
         "symbol": lifecycle.symbol,
         "side": lifecycle.side,
@@ -5037,12 +5038,28 @@ def _upsert_management_signal_candidate(
         "management_action": management_action,
         "management_fraction": management_fraction,
         "entry_text": None,
+        # M2 (2026-09-29 Mia design): a non-protection partial close ("第一
+        # 止盈位到了") that names no stop of its own must not have the
+        # strategy's *original* stop copied in as if the message had written
+        # it -- that made every plain partial-close batch since 09-05 fail
+        # the execution-side stop gate with `management_stop_provenance_
+        # invalid` (batches 177, 178). Leaving it empty means "keep the
+        # existing protection, resize it to the remaining size", which the
+        # partial-take-profit maintenance path (`_resize_protection_rows_for_
+        # remaining_position`) already does from the live exchange rows, not
+        # from this field. Only the AI/lifecycle_event position_update path
+        # (`_apply_lifecycle_event_decision`) opts out of the copy with
+        # ``copy_lifecycle_stop_loss_when_silent=False`` -- the deterministic
+        # rule parsers (bitcoin_junzhang profile) that call this helper
+        # without a ``requested_stop_loss`` at all rely on the copy to record
+        # a stop they just wrote onto ``lifecycle.stop_loss`` one line above,
+        # which is a real stop move, not "nothing was said".
         "stop_loss_text": (
             _format_number(requested_stop_loss)
             if requested_stop_loss is not None
-            else None
-            if break_even_intent
             else _format_number(lifecycle.stop_loss)
+            if copy_lifecycle_stop_loss_when_silent
+            else None
         ),
         "stop_price_source": (
             stop_price_source

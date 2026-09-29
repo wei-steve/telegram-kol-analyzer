@@ -786,3 +786,55 @@ def _text_contains_explicit_stop_value(text: str, value: str) -> bool:
             ):
                 return True
     return False
+
+
+# M2 guardrail (2026-09-29 Mia design, Q5/7.1): a percentage preceded by a
+# *future* price level ("82500附近可以止盈30%先", #19670) names a plan for
+# when the market gets there, not an instruction to reduce right now. This is
+# distinct from M1's "剩余仓位止损位上移至P": that phrase is about the stop on
+# what remains *after* an immediate reduction, never a price to wait for.
+_FUTURE_TAKE_PROFIT_LEVEL_RE = re.compile(
+    r"([0-9]+(?:\.\d+)?)附近[^0-9%％]{0,8}止盈"
+    r"|到([0-9]+(?:\.\d+)?)[^0-9%％]{0,8}止盈"
+    r"|([0-9]+(?:\.\d+)?)位置[^0-9%％]{0,8}止盈"
+    r"|([0-9]+(?:\.\d+)?)止盈"
+)
+#: Q5/7.1: these say "reduce now", so a future-level match beside one of them
+#: is not this guardrail's business -- ordinary planning handles it.
+_IMMEDIATE_REDUCTION_TERMS = ("现价", "目前", "市价", "现在", "先出", "平掉")
+#: Q6/7.1: "剩余仓位/剩余持仓" or an explicit profit-in-points phrase in the
+#: same message also says "reduce now" -- this is M1's idiom, not a future
+#: price to wait for.
+_CURRENT_REDUCTION_SCOPE_TERMS = ("剩余仓位", "剩余持仓")
+_PROFIT_POINTS_RE = re.compile(r"(?:获利|浮盈)[^0-9]{0,4}[0-9]+(?:\.\d+)?\s*点")
+
+
+def future_take_profit_level(text: str) -> float | None:
+    """The future price level a percentage is waiting for, or ``None``.
+
+    Pure function: no market read, no lifecycle lookup. Returns ``None``
+    whenever any Q6 "reduce now" signal is present (an immediate-action term,
+    "剩余仓位/剩余持仓", or an explicit profit-in-points phrase), so the
+    strategy_management_planner guardrail (M2/Q5) only fires for a message
+    that names a level with none of those -- the #19670 shape, not Mia's
+    standard "剩余仓位止损位上移至P" one.
+    """
+
+    normalized = str(text or "")
+    if any(term in normalized for term in _IMMEDIATE_REDUCTION_TERMS):
+        return None
+    if any(term in normalized for term in _CURRENT_REDUCTION_SCOPE_TERMS):
+        return None
+    if _PROFIT_POINTS_RE.search(normalized):
+        return None
+    match = _FUTURE_TAKE_PROFIT_LEVEL_RE.search(normalized)
+    if not match:
+        return None
+    token = next((group for group in match.groups() if group is not None), None)
+    if token is None:
+        return None
+    try:
+        value = float(token)
+    except ValueError:
+        return None
+    return value if value > 0 else None
