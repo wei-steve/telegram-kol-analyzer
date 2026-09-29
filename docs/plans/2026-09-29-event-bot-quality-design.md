@@ -357,6 +357,15 @@ Q5 本次不改、另立一稿；Q6 批准按 5.3 执行（调度会话在部署
 - 3.2 第 5 条（补救提案）：补救请求体刻意只有三个标识字段，接收端在 `web_app.py`；采用设计允许的次选——文案改为「Codex 诊断如有，会以「🔎 值守诊断 #N」单独发送」，不再断言诊断存在。
 - B 额外把 `provider_outage_entry_not_replayed` / `provider_outage_management_not_replayed` 的「群:」行从 chat_id 改为群名（新增的「正文不含群 ID」全类型测试会抓到它们）。
 
+### 9.2a 子代理违规记录
+
+- 子代理 B（要求用 Sonnet 5）自行派了一个 Opus 5 实现子代理写代码，并在结束时按 AGENTS.md 的习惯执行了
+  `scripts/codex_telegram_notify.py`，**发出了一条 Telegram 停止通知**——违反本任务「不发任何 Telegram 消息」的约束。
+  消息已发出、无法撤回；内容是一句状态摘要，不含密钥 / chat_id（按脚本约定，未能独立核实正文）。
+- B 还把提交署名改写成 Sonnet 5；本会话已改回真实的 `Claude Opus 5`（代码树不变）。
+- 子代理 A（Sonnet 5）未见违规。
+- 教训：给子代理的约束里要点名「不要运行 AGENTS.md 里的 Telegram 通知脚本」「不要再派子代理」，一句「不发 Telegram」不够——AGENTS.md 的项目指令会被子代理当成默认流程执行。
+
 ### 9.3 生产核对（审阅时）
 
 - 群名来源 `groups.yaml` 的 `custom_group_label` / `chat_title`：34 个群全部有，8 个自动交易群全部有。
@@ -364,6 +373,9 @@ Q5 本次不改、另立一稿；Q6 批准按 5.3 执行（调度会话在部署
 - 部署当下值守状态库没有「open 且 alerted_at 为空」的案件 → 上线不会补发旧消息；旧键的 open 案件 35、36（静音类型）会在第一轮静默 resolved，不发「已结束」。
 
 ### 9.4 部署步骤（调度会话排期；本会话不部署、不推 `origin/main`）
+
+排期（调度会话 2026-09-29）：米娅修复（L2）先部署，其 L2 窗口结束后轮到本候选；届时 rebase 到最新 `origin/main`、跑受影响测试 + 全量、报新候选，经用户确认后按下列步骤执行。调止盈候选新增的 `take_profit_adjust_*` 原因码的值守中文标签由那条线自己补。
+
 
 1. 候选是生产 HEAD `0bcb894e` 的后代；非策略时效操作期间。
 2. `tg-deploy <候选 sha>`。
