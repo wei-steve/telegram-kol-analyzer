@@ -664,6 +664,17 @@ def _maybe_send_diagnosis(
         # still worth keeping; telling somebody about a solved problem is not.
         store.set_diagnosis_message_state(case.id, MESSAGE_SUPPRESSED)
         return
+    if case.alerted_at is None:
+        # 2026-09-29 fix (coordinator review of 2887cc09): the opening alert
+        # for this case has not gone out -- most likely capped by the daily
+        # limit, since 0bcb894e made diagnosis alerts exempt from that same
+        # cap. Sending the diagnosis here would put "🔎 值守诊断 #N" in front
+        # of a case nobody has ever heard of. Leave ``message_state`` at
+        # whatever it already is (the default is ``'none'``, never touched by
+        # this branch) rather than marking it -- ``compose_backfill_alerts``
+        # sends this diagnosis immediately after the backfilled opening,
+        # using exactly the same "status done, not queued/suppressed" test.
+        return
     if compose_diagnosis_alert(
         store, case=case, verdict=verdict, now=now, policy=policy
     ):

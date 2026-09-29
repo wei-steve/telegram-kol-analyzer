@@ -615,6 +615,101 @@ def test_a_case_that_resolves_before_the_verdict_gets_no_diagnosis_message(
         assert store.get_diagnosis(1).status == "done", "still recorded"
 
 
+def test_a_diagnosis_is_not_sent_ahead_of_a_capped_opening_alert(tmp_path):
+    """2026-09-29 fix (coordinator review of 2887cc09): since 0bcb894e a
+    diagnosis alert is exempt from the daily cap while an opening alert is
+    not -- so a case capped away at open time would have its diagnosis reach
+    Telegram *first*, "🔎 值守诊断 #N" naming a case nobody has heard of yet.
+    Before the fix this call enqueues the diagnosis message right away.
+    """
+    from telegram_kol_research.oncall_service import (
+        MODE_NOTIFY,
+        CODEX_MODE_ON,
+        OncallConfig,
+        _maybe_send_diagnosis,
+    )
+    from telegram_kol_research.oncall_alerts import AlertPolicy
+    from telegram_kol_research.oncall_state import OncallStateStore
+
+    verdict = {
+        "urgency": "immediate",
+        "category": "missed_execution",
+        "what_message_wanted_zh": "全平",
+        "explanation_zh": "预检拒绝",
+        "recommended_action_zh": "到交易所核对",
+        "should_have_executed": "yes",
+        "confidence": "high",
+    }
+    config = OncallConfig(mode=MODE_NOTIFY, bot_token="t", chat_id="1", codex_mode=CODEX_MODE_ON)
+    with OncallStateStore(tmp_path / "state.db") as store:
+        case, _ = store.upsert_case(
+            case_key="mgmt:1:full_exit",
+            rule="D1a",
+            severity="medium",
+            now=NOW,
+            raw_message_id=1,
+        )
+        assert case.alerted_at is None  # never announced -- e.g. capped
+
+        _maybe_send_diagnosis(
+            store, case=case, verdict=verdict, config=config, now=NOW, policy=AlertPolicy()
+        )
+
+        assert store.pending_alerts() == ()
+
+
+def test_a_backfilled_diagnosis_follows_its_backfilled_opening_in_order(tmp_path):
+    """The other half: once the opening alert is finally backfilled, the
+    diagnosis that was waiting follows it -- never the reverse.
+    """
+    from telegram_kol_research.oncall_service import (
+        MODE_NOTIFY,
+        CODEX_MODE_ON,
+        OncallConfig,
+        _maybe_send_diagnosis,
+    )
+    from telegram_kol_research.oncall_alerts import AlertPolicy, compose_backfill_alerts
+    from telegram_kol_research.oncall_state import OncallStateStore
+
+    verdict = {
+        "urgency": "immediate",
+        "category": "missed_execution",
+        "what_message_wanted_zh": "全平",
+        "explanation_zh": "预检拒绝",
+        "recommended_action_zh": "到交易所核对",
+        "should_have_executed": "yes",
+        "confidence": "high",
+    }
+    config = OncallConfig(mode=MODE_NOTIFY, bot_token="t", chat_id="1", codex_mode=CODEX_MODE_ON)
+    with OncallStateStore(tmp_path / "state.db") as store:
+        case, _ = store.upsert_case(
+            case_key="mgmt:1:full_exit",
+            rule="D1a",
+            severity="medium",
+            now=NOW,
+            raw_message_id=1,
+        )
+        store.record_diagnosis_request(
+            case_id=case.id, attempt=1, fingerprint="fp", prompt_version="v1", now=NOW
+        )
+        store.record_diagnosis_result(
+            case_id=case.id, status="done", now=NOW, verdict=verdict
+        )
+        _maybe_send_diagnosis(
+            store, case=case, verdict=verdict, config=config, now=NOW, policy=AlertPolicy()
+        )
+        assert store.pending_alerts() == ()
+        assert store.get_diagnosis(case.id).message_state == "none"
+
+        queued = compose_backfill_alerts(store, now=NOW + timedelta(hours=11))
+
+        assert queued == 1
+        ordered = sorted(store.pending_alerts(limit=10), key=lambda alert: alert.id)
+        assert len(ordered) == 2
+        assert ordered[0].body.startswith("（补发：原")
+        assert "🔎 值守诊断" in ordered[1].body
+
+
 def test_a_health_case_waits_ten_minutes_before_spending_a_token(
     production, tmp_path, spool
 ):

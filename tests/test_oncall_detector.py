@@ -1831,6 +1831,109 @@ def test_r1f_the_quiet_constant_matches_config():
     assert D6C_QUIET_BY_DESIGN_INCIDENT_TYPES == config.TELEGRAM_QUIET_INCIDENT_TYPES
 
 
+# ------------------------------------ D6c type-key reopen (coordinator review)
+#
+# A per-incident-id case is "one story, told once" -- an instruction case
+# never re-opens because its key names one message and one action, and that
+# story ends (``OncallStateStore.upsert_case`` docstring). A per-*type* D6c
+# case is not that: the same type going unheard again after resolving (or
+# going stale) is a fresh problem, not a continuation of an old one. Before
+# this fix, once a type's case resolved or went stale, ``upsert_case``'s
+# default (``reopen=False``) meant that type could never open a D6c case
+# again -- silently, forever.
+
+
+def test_d6c_type_case_reopens_after_resolving(production, store):
+    run_round(production, store)
+    _still_shouting(
+        production, incident_type="management_fraction_rejected", source_record_id="1"
+    )
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+    case_id = opened.new_case_ids[0]
+
+    resolved = run_round(production, store, now=NOW + timedelta(hours=3))
+    assert resolved.resolved_case_ids == (case_id,)
+    assert store.get_case(case_id).status == "resolved"
+
+    # A fresh incident of the same type, still unheard.
+    later = NOW + timedelta(hours=6)
+    _still_shouting(
+        production,
+        incident_type="management_fraction_rejected",
+        source_record_id="2",
+        first_occurred_at=later - timedelta(minutes=20),
+        last_occurred_at=later - timedelta(minutes=2),
+    )
+    reopened = run_round(production, store, now=later)
+
+    assert reopened.new_case_ids == (case_id,)
+    case = store.get_case(case_id)
+    assert case.status == "open"
+    assert case.alerted_at is None  # a fresh episode, not yet announced
+
+
+def test_d6c_type_case_reopens_after_going_stale(production, store):
+    """The alarm never stops (kept inside D6c's own one-hour window every
+    round, so it is never a "clear") for long enough that the *case's own*
+    generic 6-hour staleness timer (``case_stale_after``, unrelated to D6c's
+    windows) marks it stale anyway. The type keeps ringing after that, so it
+    must be able to open again rather than sit silently under a stale case.
+    """
+
+    run_round(production, store)
+    incident_id = _still_shouting(
+        production, incident_type="management_fraction_rejected", source_record_id="1"
+    )
+    opened = run_round(production, store)
+    case_id = opened.new_case_ids[0]
+
+    crossing = NOW + timedelta(hours=6, minutes=1)
+    production.set_runtime_incident(incident_id, last_occurred_at=crossing - timedelta(minutes=2))
+    stale = run_round(production, store, now=crossing)
+    assert case_id in stale.stale_case_ids
+    assert store.get_case(case_id).status == "stale"
+
+    later = crossing + timedelta(minutes=1)
+    production.set_runtime_incident(incident_id, last_occurred_at=later - timedelta(minutes=2))
+    reopened = run_round(production, store, now=later)
+
+    assert reopened.new_case_ids == (case_id,)
+    assert store.get_case(case_id).status == "open"
+
+
+def test_d6c_type_case_does_not_reopen_every_round_while_still_open(
+    production, store
+):
+    """``reopen=True`` must never turn a still-ringing type into a fresh case
+    every round -- only a resolved/stale case reopens once.
+    """
+
+    run_round(production, store)
+    ids = [
+        _still_shouting(
+            production,
+            incident_type="management_fraction_rejected",
+            source_record_id=str(index),
+        )
+        for index in range(3)
+    ]
+    opened = run_round(production, store)
+    case_id = opened.new_case_ids[0]
+
+    for index, incident_id in enumerate(ids):
+        # Keep the incident's own "still occurring" window fresh so the type
+        # keeps qualifying every round, the way a genuinely ongoing failure
+        # would.
+        production.set_runtime_incident(
+            incident_id, last_occurred_at=NOW + timedelta(minutes=index + 1, seconds=-2)
+        )
+        again = run_round(production, store, now=NOW + timedelta(minutes=index + 1))
+        assert again.new_case_ids == ()
+        case = store.get_case(case_id)
+        assert case.status == "open"
+
+
 # ------------------------------------------------------- read discipline
 
 

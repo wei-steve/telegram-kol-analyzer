@@ -889,6 +889,60 @@ def test_r1d_resolved_and_stale_cases_are_never_backfilled(store):
     )
 
 
+def test_r1d_an_eligible_case_behind_five_ineligible_ones_is_still_backfilled(store):
+    """2026-09-29 fix (coordinator review of 2887cc09): ``compose_backfill_alerts``
+    used to slice to ``limit`` *before* checking eligibility -- with the
+    oldest five backlogged cases all still capped (ordinary, medium
+    severity), a cap-exempt sixth case (high severity, names a message) right
+    behind it was never even examined, for the rest of the day.
+
+    The sixth case is built the way this actually happens in production: it
+    is capped *at open time* while still medium severity (case 32's own
+    shape before 0bcb894e), and only escalates to high severity -- and so to
+    cap-exempt -- on a later round that re-observes the same still-open case.
+    That re-observation is a merge into an already-open case
+    (``store.upsert_case`` with an existing, open row), never a fresh
+    ``new_case_ids`` entry, so :func:`compose_case_alerts` never revisits it
+    and it is ``compose_backfill_alerts`` that must notice the case's *current*
+    severity is now exempt.
+    """
+    from telegram_kol_research.oncall_alerts import compose_backfill_alerts
+
+    _fill_cap_with_ordinary_openings(store)
+    ordinary_ids = []
+    for index in range(5):
+        case = open_capped_case(
+            store, key=f"mgmt:{200 + index}:full_exit", chat_id=-200 - index
+        )
+        compose_case_alerts(
+            store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[]
+        )
+        assert store.get_case(case.id).alerted_at is None  # still capped
+        ordinary_ids.append(case.id)
+
+    escalating = open_capped_case(store, key="mgmt:999:full_exit", chat_id=-999)
+    compose_case_alerts(
+        store, now=NOW, new_case_ids=[escalating.id], resolved_case_ids=[]
+    )
+    assert store.get_case(escalating.id).alerted_at is None  # capped at open
+    store.upsert_case(  # a later round's re-observation escalates it
+        case_key="mgmt:999:full_exit",
+        rule="D1a",
+        severity="high",
+        now=NOW,
+        raw_message_id=15660,
+        chat_id=-999,
+    )
+    assert store.get_case(escalating.id).severity == "high"
+    assert store.get_case(escalating.id).alerted_at is None  # still un-announced
+
+    queued = compose_backfill_alerts(store, now=NOW, limit=5)
+
+    assert queued == 1
+    assert store.get_case(escalating.id).alerted_at is not None
+    assert all(store.get_case(case_id).alerted_at is None for case_id in ordinary_ids)
+
+
 def test_r3c_follow_ups_neither_wait_on_nor_spend_the_cap(store):
     from telegram_kol_research.oncall_alerts import (
         ALERT_KIND_CASE_RESOLVED,

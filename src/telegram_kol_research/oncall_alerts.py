@@ -1135,13 +1135,18 @@ def compose_backfill_alerts(
         ),
         key=lambda case: case.id,
     )
-    for case in candidates[: max(0, int(limit))]:
-        if not (
-            _case_open_bypasses_cap(case) or not _cap_reached(store, now, settings)
-        ):
-            # Still capped, or not exempt: leave it open and unalerted for the
-            # next round to try again.
-            continue
+    # 2026-09-29 fix (coordinator review of 2887cc09): filter to this round's
+    # *eligible* cases before slicing to ``limit`` -- slicing first meant that
+    # if the oldest five capped cases were all still capped (ordinary,
+    # medium-severity), a sixth, cap-exempt one right behind them (high
+    # severity, names a message) would never even be looked at, potentially
+    # for the rest of the day.
+    eligible = [
+        case
+        for case in candidates
+        if _case_open_bypasses_cap(case) or not _cap_reached(store, now, settings)
+    ]
+    for case in eligible[: max(0, int(limit))]:
         original_body = _format_open_alert(case, is_health=False)
         backfill_note = (
             f"（补发：原 {beijing_time(case.first_seen_at)} "

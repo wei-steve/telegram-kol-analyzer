@@ -904,6 +904,20 @@ def run_detection_round(
                     reason_code=merged.reason_code,
                     target_uncertain=merged.target_uncertain,
                     evidence=evidence,
+                    # 2026-09-29 fix: a type-keyed D6c case is not "one story,
+                    # told once" the way a per-message case is -- the same
+                    # type going unheard is a fresh problem every time it
+                    # happens, even if this exact type already opened and
+                    # resolved (or went stale) once before. Without this,
+                    # ``upsert_case``'s default (an instruction case's key
+                    # "never re-opens") would mean a type that had ever been
+                    # resolved could never open a D6c case again, silently,
+                    # forever. ``reopen=True`` only changes anything when the
+                    # existing row's status is not "open" (see
+                    # ``OncallStateStore.upsert_case``), so a still-open case
+                    # is refreshed exactly as before -- one case per still-
+                    # ongoing episode, not a new one every round.
+                    reopen=case_key.startswith(UNHEARD_INCIDENT_TYPE_CASE_PREFIX),
                 )
                 if created:
                     new_cases.append(case.id)
