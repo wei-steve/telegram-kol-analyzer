@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -563,3 +564,220 @@ def _aggregate_canonical_item_effect(
     if len(exchange_effects) == 1:
         return next(iter(exchange_effects))
     return "outcome_unknown"
+
+
+#: 2026-09-29 management preflight refusal design, section 3.1. A management
+#: batch's own ledger is a write-before-log: every branch of
+#: ``strategy_management_executor.execute_management_batch`` transitions a leg
+#: to ``reserved`` (with its ``client_order_id``/``request_json`` committed),
+#: reserves a component, records a market decision, or writes a "reserved"
+#: ``execution_events`` row *before* the corresponding Deepcoin write method is
+#: called -- see the audit table in
+#: ``docs/management-preflight-refusal-status.md`` for every call site. So a
+#: message whose every management item failed with
+#: ``ManagementBatchExecutionError`` and whose batch(es) are still entirely at
+#: their initial state proves, structurally, that no request ever left this
+#: process for that message -- independent of which of the executor's 100+
+#: raise sites produced the refusal.
+#:
+#: One exception the audit found and does not fix here (Q4): the deferred-entry
+#: cancel path (``_cancel_deferred_entry_legs``) calls
+#: ``deepcoin_client.cancel_trigger_order`` / ``cancel_order`` directly, with no
+#: ledger write beforehand -- the leg is only marked ``cancelled`` (and an
+#: ``execution_events`` row written) *after* the call returns, and the
+#: exception path writes a diagnostic ``execution_events`` row only when the
+#: call itself raises. So the only situation this proof would ever wrongly
+#: accept is a process crash between that call returning and its own follow-up
+#: commit -- a general durability question, not specific to this design -- and
+#: it is excluded from the proof the same way any other reachable write is:
+#: this function requires there be **no** ``execution_events`` row for the
+#: message at all, and every code path through the deferred-cancel branch that
+#: does not crash mid-flight leaves one (either the diagnostic on failure or
+#: the success record). A batch that reached that branch with anything to
+#: cancel therefore already fails this proof.
+def management_batches_prove_no_exchange_contact(
+    session_factory: Any,
+    *,
+    raw_message_id: int,
+) -> tuple[bool, tuple[dict[str, Any], ...]]:
+    """Structural proof, from the management batch ledger, of no exchange contact.
+
+    All of the following must hold, or the proof does not go through and the
+    caller must keep freezing the attempt as ``uncertain``:
+
+    1. Every ``message_instruction_items`` row for this message is
+       ``instruction_kind='management'``, ``status='failed'``, with an
+       ``error_json`` naming ``ManagementBatchExecutionError`` -- one entry
+       item, one input error, or any other error class and nothing is proven.
+    2. At least one ``strategy_management_batches`` row exists for the message,
+       and every one of its legs is still ``planned`` with no
+       ``client_order_id``/``exchange_order_id``/``request_json``/
+       ``response_json``.
+    3. Every component on those batches is still ``pending`` with
+       ``attempt_count=0`` and an empty ``evidence_json``.
+    4. No ``strategy_management_market_decisions`` row exists for those
+       batches.
+    5. No ``trigger_protection_stop_rescues`` row past ``ready`` names one of
+       those legs' ``pos_id`` or ``execution_order_leg_id`` (defensive: the
+       audit found this code path never actually creates one -- rescues are
+       planned from a saved ``trigger_protection_intents`` row by
+       ``plan_trigger_protection_stop_rescue``, a wholly separate entry point
+       -- but the check costs nothing and the design calls for it explicitly).
+    6. No ``execution_events`` row exists for the message at all (matched by
+       ``source_message_id`` or by the raw message's own ``(chat_id,
+       message_id)``, since not every writer sets the former).
+
+    Any read failure, missing row, or unexpected shape returns ``(False, ())``:
+    this is a proof, not a heuristic, and "I could not tell" must mean "treat
+    it as contact happened" exactly like every other path through the
+    boundary.
+    """
+
+    try:
+        from sqlalchemy import and_, or_
+
+        from telegram_kol_research.models import (
+            ExecutionEvent,
+            MessageInstructionItem,
+            RawMessage,
+            StrategyManagementBatch,
+            StrategyManagementComponent,
+            StrategyManagementLeg,
+            StrategyManagementMarketDecision,
+            TriggerProtectionStopRescue,
+        )
+
+        with session_factory() as session:
+            items = (
+                session.query(MessageInstructionItem)
+                .filter(
+                    MessageInstructionItem.raw_message_id == int(raw_message_id)
+                )
+                .all()
+            )
+            if not items:
+                return False, ()
+            for item in items:
+                if str(item.instruction_kind or "") != "management":
+                    return False, ()
+                if str(item.status or "") != "failed":
+                    return False, ()
+                try:
+                    error_payload = json.loads(item.error_json or "")
+                except (TypeError, ValueError):
+                    return False, ()
+                if (
+                    not isinstance(error_payload, dict)
+                    or error_payload.get("type") != "ManagementBatchExecutionError"
+                ):
+                    return False, ()
+
+            batches = (
+                session.query(StrategyManagementBatch)
+                .filter(
+                    StrategyManagementBatch.raw_message_id == int(raw_message_id)
+                )
+                .all()
+            )
+            if not batches:
+                return False, ()
+
+            raw = session.get(RawMessage, int(raw_message_id))
+            if raw is None:
+                return False, ()
+
+            event_exists = (
+                session.query(ExecutionEvent.id)
+                .filter(
+                    or_(
+                        ExecutionEvent.source_message_id == int(raw_message_id),
+                        and_(
+                            ExecutionEvent.chat_id == raw.chat_id,
+                            ExecutionEvent.message_id == raw.message_id,
+                        ),
+                    )
+                )
+                .first()
+            )
+            if event_exists is not None:
+                return False, ()
+
+            refs: list[dict[str, Any]] = []
+            for batch in batches:
+                legs = (
+                    session.query(StrategyManagementLeg)
+                    .filter(StrategyManagementLeg.management_batch_id == batch.id)
+                    .all()
+                )
+                if not legs:
+                    return False, ()
+                for leg in legs:
+                    if (
+                        str(leg.status or "") != "planned"
+                        or leg.client_order_id is not None
+                        or leg.exchange_order_id is not None
+                        or leg.request_json is not None
+                        or leg.response_json is not None
+                    ):
+                        return False, ()
+
+                components = (
+                    session.query(StrategyManagementComponent)
+                    .filter(
+                        StrategyManagementComponent.management_batch_id == batch.id
+                    )
+                    .all()
+                )
+                for component in components:
+                    if (
+                        str(component.status or "") != "pending"
+                        or int(component.attempt_count or 0) != 0
+                    ):
+                        return False, ()
+                    try:
+                        evidence = json.loads(component.evidence_json or "[]")
+                    except (TypeError, ValueError):
+                        return False, ()
+                    if evidence:
+                        return False, ()
+
+                market_decision_exists = (
+                    session.query(StrategyManagementMarketDecision.id)
+                    .filter(
+                        StrategyManagementMarketDecision.management_batch_id
+                        == batch.id
+                    )
+                    .first()
+                )
+                if market_decision_exists is not None:
+                    return False, ()
+
+                pos_ids = {str(leg.pos_id) for leg in legs}
+                leg_ids = {int(leg.execution_order_leg_id) for leg in legs}
+                rescue_exists = (
+                    session.query(TriggerProtectionStopRescue.id)
+                    .filter(
+                        TriggerProtectionStopRescue.status != "ready",
+                        or_(
+                            TriggerProtectionStopRescue.pos_id.in_(pos_ids),
+                            TriggerProtectionStopRescue.execution_order_leg_id.in_(
+                                leg_ids
+                            ),
+                        ),
+                    )
+                    .first()
+                )
+                if rescue_exists is not None:
+                    return False, ()
+
+                refs.append(
+                    {
+                        "kind": "management_batch_no_contact",
+                        "management_batch_id": int(batch.id),
+                        "leg_count": len(legs),
+                        "note": "all_legs_planned_no_request",
+                    }
+                )
+            return True, tuple(refs)
+    except Exception:
+        return False, ()

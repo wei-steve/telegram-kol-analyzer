@@ -98,11 +98,15 @@ from telegram_kol_research.authoritative_execution_attempts import (
     mark_authoritative_side_effect_started,
     record_authoritative_automation_outcome,
     record_authoritative_deterministic_refusal,
+    record_management_preflight_refusal,
 )
 from telegram_kol_research.authoritative_execution_schema import (
     require_recognition_execution_schema,
 )
-from telegram_kol_research.execution_boundary import ExecutionBoundaryOutcome
+from telegram_kol_research.execution_boundary import (
+    ExecutionBoundaryOutcome,
+    management_batches_prove_no_exchange_contact,
+)
 from telegram_kol_research.recognition_execution_runtime import (
     periodic_lease_heartbeat,
 )
@@ -2296,6 +2300,48 @@ def _lifecycle_not_applied_reason(recognition: Any) -> str | None:
     return None
 
 
+def _management_preflight_refusal_reason_code(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> str:
+    """The refusal code(s) named by this message's failed management items.
+
+    ``management_batches_prove_no_exchange_contact`` already verified every
+    item's ``error_json`` is a ``ManagementBatchExecutionError`` payload; this
+    reads it again to build the single reason string the decision row and the
+    incident summary carry. Only the part before the first ``:`` is kept --
+    the executor's own reason codes are colon-prefixes of a longer diagnostic
+    string (e.g. ``protection_rows_unattributed_on_exchange:<pos_id>:<order
+    ids>``), and everything after the first colon can be a position or order
+    id, never fit for a summary field. Multiple items with different codes are
+    joined, sorted, so the string is deterministic; one item is the common
+    case and needs no joining.
+    """
+
+    from telegram_kol_research.models import MessageInstructionItem
+
+    codes: set[str] = set()
+    with session_factory() as session:
+        items = (
+            session.query(MessageInstructionItem)
+            .filter(MessageInstructionItem.raw_message_id == int(raw_message_id))
+            .all()
+        )
+        for item in items:
+            try:
+                payload = json.loads(item.error_json or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            message = str(payload.get("message") or "")
+            code = message.split(":", 1)[0].strip()
+            if code:
+                codes.add(code)
+    return ",".join(sorted(codes)) or "management_preflight_refused"
+
+
 def process_authoritative_message(
     session_factory: sessionmaker,
     *,
@@ -2840,6 +2886,34 @@ def _run_leased_authoritative_execution(
                 raise RuntimeError("authoritative_deterministic_refusal_cas_failed")
             return recognition, automation, assessment
         if boundary.exchange_effect == "outcome_unknown":
+            # 2026-09-29 management preflight refusal design, section 3.1/3.2.
+            # A-6's own-payload proof (above, inside ``boundary``) cannot read
+            # the management batch ledger, so a batch refused before any
+            # exchange write still lands here with no evidence. Try the
+            # structural ledger proof before freezing: if every item and every
+            # batch for this message proves no contact, this is a fact
+            # (``closed_no_write``), not an unknown, and the message stays
+            # eligible for another try -- exactly like A-6's ``failed_safe``,
+            # just for a proof the boundary itself cannot see.
+            proven, management_refs = management_batches_prove_no_exchange_contact(
+                session_factory,
+                raw_message_id=raw_message_id,
+            )
+            if proven:
+                if not record_management_preflight_refusal(
+                    session_factory,
+                    attempt_id=lease_claim.attempt_id,
+                    claim_token=lease_claim.claim_token,
+                    reason_code=_management_preflight_refusal_reason_code(
+                        session_factory, raw_message_id=raw_message_id
+                    ),
+                    evidence_refs=list(management_refs),
+                    refused_at=datetime.now(UTC),
+                ):
+                    raise RuntimeError(
+                        "management_preflight_refusal_cas_failed"
+                    )
+                return recognition, automation, assessment
             if not mark_authoritative_execution_uncertain(
                 session_factory,
                 attempt_id=lease_claim.attempt_id,

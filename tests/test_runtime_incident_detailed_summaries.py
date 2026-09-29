@@ -167,6 +167,15 @@ _CASES: dict[str, tuple[str, dict]] = {
             error_summary="no exchange write was attempted",
         ),
     ),
+    "capture_management_refused_before_write": (
+        "management_refused_before_write",
+        dict(
+            attempt_id=4631,
+            raw_message_id=19598,
+            reason_code="protection_rows_unattributed_on_exchange",
+            management_batch_id=184,
+        ),
+    ),
     "capture_deferred_instruction_expired": (
         "deferred_instruction_expired",
         dict(raw_message_id=19073, deferred_minutes=360),

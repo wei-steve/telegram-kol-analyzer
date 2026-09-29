@@ -572,6 +572,10 @@ INCIDENT_ACTION_HINTS: dict[str, str] = {
     "management_partial_take_profit_future_level_blocked": (
         "这条「到某价位再止盈」的指令未立即执行；如需在该价位止盈，请手动挂单。"
     ),
+    # 2026-09-29 management preflight refusal design, Q2.
+    "management_refused_before_write": (
+        "这条管理指令在下单前被拒、没有执行；请决定是否手动处理。"
+    ),
 }
 #: An event-handling type nobody has written a sentence for yet. Deliberately
 #: still an instruction: a new type defaults to the event bot, and the event

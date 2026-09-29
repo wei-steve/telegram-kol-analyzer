@@ -431,13 +431,163 @@ NO_WRITE_TRACKED = "no_exchange_write_tracked"
 
 #: The two 2026-09-26 closeout terminals. Declared here, next to every other
 #: status this table can hold, so an online consumer does not have to import the
-#: operator tool that writes them (``uncertain_attempt_closeout``). Nothing in
-#: this module ever writes them: an execution reaching ``uncertain`` is still
-#: frozen, and only the audited operator tool may decide a frozen row's exposure
-#: is settled.
+#: operator tool that writes them (``uncertain_attempt_closeout``).
+#:
+#: 2026-09-29 management preflight refusal design, section 3.2 (Q1=B): this
+#: module now writes ``CLOSED_NO_WRITE`` itself, from
+#: ``record_management_preflight_refusal``, for one specific case --
+#: an execution that crossed the side-effect boundary, and whose management
+#: batch ledger then *proved*, structurally, that no exchange write was ever
+#: attempted. That is different from every other writer of this status: the
+#: 2026-09-26 operator tool closes an attempt that already sat frozen as
+#: ``uncertain`` for a while, by auditing settled exposure after the fact; this
+#: module closes one at the moment it would otherwise freeze, using proof the
+#: boundary itself produced in the same transaction. ``error_class`` tells the
+#: two apart on a row: ``ManagementPreflightRefusal`` here, whatever the
+#: operator tool recorded there. Every other reachable ``uncertain`` row is
+#: still frozen, and still only the audited operator tool may decide its
+#: exposure is settled.
 CLOSED_NO_WRITE = "closed_no_write"
 CLOSED_SETTLED_BINDING = "closed_settled_binding"
 CLOSEOUT_STATUSES = frozenset({CLOSED_NO_WRITE, CLOSED_SETTLED_BINDING})
+
+
+def record_management_preflight_refusal(
+    session_factory,
+    *,
+    attempt_id: int,
+    claim_token: str,
+    reason_code: str,
+    evidence_refs: list[dict[str, Any]],
+    refused_at: datetime,
+) -> bool:
+    """Close an attempt whose management batch ledger proved no exchange write.
+
+    2026-09-29 management preflight refusal design, section 3.2 (Q1=B). This is
+    ``record_authoritative_deterministic_refusal``'s sibling for a refusal the
+    execution boundary's own per-item proof cannot see: a management batch
+    rejected before any Deepcoin write, whose ``strategy_management_legs`` /
+    ``_components`` / ``_market_decisions`` ledger structurally proves it
+    (``execution_boundary.management_batches_prove_no_exchange_contact``). The
+    same CAS discipline applies -- only an ``executing`` attempt whose decision
+    is still ``execution_running`` under this exact generation -- but the
+    terminal differs on purpose: ``closed_no_write``, not ``failed_safe``. A
+    ``failed_safe`` attempt is eligible for an automatic retry within minutes
+    (``AutomaticRetryBlocked`` only holds ``claimed``/``executing``/
+    ``uncertain``); ``closed_no_write`` is one of the ``RETRY_BLOCKING_ATTEMPT_
+    STATUSES`` in ``authoritative_recognition``, so this message is never
+    retried automatically, exactly like today's frozen ``uncertain`` -- only
+    the account of *why* changes, from "unknown" to "proven not sent". The
+    decision row's own lock (``comparison_status``) is released to
+    ``completed`` regardless, the same way ``failed_safe`` releases it: the
+    attempt-status lock is what actually blocks retries, and leaving the
+    decision row frozen too would (per A-6c's own rationale) require any future
+    unfreeze decision to say so about both rows.
+    """
+
+    require_recognition_execution_schema(session_factory)
+    if not evidence_refs:
+        raise ValueError("a management preflight refusal must carry its evidence")
+    with session_factory() as session:
+        row = session.get(AuthoritativeExecutionAttempt, int(attempt_id))
+        if (
+            row is None
+            or row.claim_token != str(claim_token)
+            or row.status != "executing"
+        ):
+            return False
+        decision_result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == int(row.raw_message_id),
+                RecognitionDecision.comparison_status == "execution_running",
+                RecognitionDecision.comparison_claim_token
+                == str(row.authoritative_generation),
+            )
+            .values(
+                comparison_status="completed",
+                agreement_status="review_disabled",
+                comparison_claim_token=None,
+                comparison_started_at=None,
+                automation_status="failed",
+                automation_reason=_bounded(reason_code, 256),
+                updated_at=refused_at,
+            )
+        )
+        if int(decision_result.rowcount or 0) != 1:
+            session.rollback()
+            return False
+        row.status = CLOSED_NO_WRITE
+        row.exchange_effect = "not_started"
+        row.automation_status = "failed"
+        row.automation_reason = _bounded(reason_code, 256)
+        row.evidence_refs_json = _evidence_json(evidence_refs)
+        row.error_class = "ManagementPreflightRefusal"
+        row.error_summary = _bounded(f"{reason_code}:refused_before_write", 512)
+        row.completed_at = refused_at
+        row.updated_at = refused_at
+        session.commit()
+        raw_message_id = int(row.raw_message_id)
+    _capture_management_refused_before_write(
+        session_factory,
+        attempt_id=int(attempt_id),
+        raw_message_id=raw_message_id,
+        reason_code=reason_code,
+        evidence_refs=evidence_refs,
+        occurred_at=refused_at,
+    )
+    return True
+
+
+def _capture_management_refused_before_write(
+    session_factory,
+    *,
+    attempt_id: int,
+    raw_message_id: int,
+    reason_code: str,
+    evidence_refs: list[dict[str, Any]],
+    occurred_at: datetime,
+) -> None:
+    """Record the refusal as a runtime incident, never failing the closeout.
+
+    Unlike an ``uncertain`` freeze, nothing here is a contradiction or an
+    unknown -- it is a fact the ledger just proved. It is still always-notified
+    (2026-09-29 design, Q2): the automatic path stopped and did not retry, and
+    a person has to decide by hand whether to act on the instruction manually.
+    Like the other capture helpers, this runs after the attempt's own commit
+    and swallows its own errors so an incident-ledger problem can never turn a
+    settled closeout back into an exception at the call site.
+    """
+
+    management_batch_id = None
+    for ref in evidence_refs:
+        if isinstance(ref, dict) and ref.get("kind") == "management_batch_no_contact":
+            candidate = ref.get("management_batch_id")
+            if isinstance(candidate, int) and not isinstance(candidate, bool):
+                management_batch_id = candidate
+                break
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_management_refused_before_write,
+        )
+
+        capture_management_refused_before_write(
+            session_factory,
+            config=load_runtime_incident_config(),
+            attempt_id=attempt_id,
+            raw_message_id=raw_message_id,
+            reason_code=reason_code,
+            management_batch_id=management_batch_id,
+            occurred_at=occurred_at,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Management-preflight-refusal incident capture failed open: "
+            "attempt=%s error=%s",
+            attempt_id,
+            type(exc).__name__,
+        )
 
 
 def mark_authoritative_execution_uncertain(

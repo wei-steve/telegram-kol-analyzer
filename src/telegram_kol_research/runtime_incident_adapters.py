@@ -1102,6 +1102,61 @@ def capture_uncertain_without_write(
     )
 
 
+def capture_management_refused_before_write(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    attempt_id: int,
+    raw_message_id: int,
+    reason_code: str,
+    management_batch_id: int | None,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a management instruction refused before any exchange write (2026-09-29).
+
+    ``record_management_preflight_refusal`` only reaches this once the
+    management batch ledger has *proven*, structurally, that nothing was sent
+    -- so this is not a contradiction like ``uncertain_without_write``, it is a
+    fact. It is still always-notified: the automatic path stopped and the
+    instruction was never executed, and a person has to decide whether to act
+    on it by hand. Never silenced by an environment whitelist for the same
+    reason values D1/D2 only cover auto-trade groups with a live position and
+    the executor's individual refusal reasons are not all covered by their own
+    incident type.
+    """
+
+    if not config.captures("management_refused_before_write"):
+        return None
+    fixed = {
+        "component": "authoritative_execution",
+        "source_status": "closed_no_write",
+        "reason_code": _safe_label(reason_code),
+        "operation": (
+            f"management_batch_{int(management_batch_id)}"
+            if management_batch_id is not None
+            else f"raw_message_{int(raw_message_id)}"
+        ),
+        "raw_message_id": int(raw_message_id),
+        "attempt_id": int(attempt_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="authoritative_execution_attempt",
+        source_record_id=str(int(attempt_id)),
+        incident_type="management_refused_before_write",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            impact="management_instruction_withheld_before_exchange_contact",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_deferred_instruction_expired(
     session_factory: sessionmaker,
     *,

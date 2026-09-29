@@ -373,6 +373,14 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # defect is fixed, this is the only thing standing between "82500附近
         # 可以止盈30%" and an immediate market close.
         "management_partial_take_profit_future_level_blocked",
+        # 2026-09-29 management preflight refusal design, Q2: a management
+        # batch's own ledger proved -- structurally, not by inference -- that
+        # it was refused before any Deepcoin write. The attempt closes
+        # ``closed_no_write`` instead of freezing ``uncertain``, so nothing
+        # else reports this instruction was withheld: D1/D2 only cover
+        # auto-trade groups holding a live position, and not every refusal
+        # reason has its own incident type. Never silenced.
+        "management_refused_before_write",
     }
 )
 
