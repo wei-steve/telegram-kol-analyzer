@@ -231,10 +231,29 @@ def requires_context_resolution(
         if classes_usable
         else ()
     )
+    # Old-field fallback: an event with no exact target anywhere. A multi-target
+    # event (raw 19741) names its lifecycles in ``targets[]`` under either key
+    # (``authoritative_instructions`` reads both), so a top-level id is not the
+    # only way the first pass can have named its targets exactly.
+    old_field_targets = lifecycle_event.get("targets")
+    old_field_has_exact_targets = isinstance(old_field_targets, list) and bool(
+        old_field_targets
+    ) and all(
+        isinstance(item, Mapping)
+        and (
+            item.get("target_lifecycle_id") not in (None, "")
+            or item.get("lifecycle_id") not in (None, "")
+        )
+        for item in old_field_targets
+    )
     if any(
         element.target.resolution == RESOLUTION_UNKNOWN
         for element in management_elements
-    ) or (event_type != "none" and target_lifecycle_id in (None, "")):
+    ) or (
+        event_type != "none"
+        and target_lifecycle_id in (None, "")
+        and not old_field_has_exact_targets
+    ):
         reasons.add("management_without_exact_target")
     if management_elements:
         candidates_by_lifecycle = {
@@ -261,8 +280,6 @@ def requires_context_resolution(
                 and status == "pending_entry"
             ):
                 reasons.add("exact_target_not_manageable")
-    if len(candidates) > 1:
-        reasons.add("multiple_same_source_candidates")
     if len(candidates) > 1:
         reasons.add("multiple_same_source_candidates")
 

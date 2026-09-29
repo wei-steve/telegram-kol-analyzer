@@ -1016,3 +1016,39 @@ def test_new_trigger_names_have_chinese_labels_and_old_ones_are_kept():
     for historical in ("revision_language", "cancellation_language", "entered_holder_language"):
         assert f"'{historical}':" in template
         assert f"{historical}:" in script
+
+
+def test_old_field_multi_target_event_with_exact_ids_is_not_targetless():
+    """Review fix: raw 19741's old field names both lifecycles in ``targets[]``."""
+
+    from telegram_kol_research.authoritative_recognition import (
+        requires_context_resolution,
+    )
+
+    payload = {
+        "recognition_result": "非策略",
+        "lifecycle_event": {
+            "event_type": "position_update",
+            "target_lifecycle_id": None,
+            "targets": [{"lifecycle_id": 1365}, {"target_lifecycle_id": 1361}],
+        },
+    }
+    candidates = [
+        {"thread_id": 1, "lifecycle_id": 1365, "status": "pending_entry", "reasons": ()},
+    ]
+    _, reasons = requires_context_resolution(
+        first_pass_payload=payload,
+        evidence={},
+        context_window={"current": {"text": "两笔空单统一上调止损位到84600"}},
+        candidates=candidates,
+    )
+    assert "management_without_exact_target" not in reasons
+
+    payload["lifecycle_event"]["targets"].append({"symbol": "BTC"})
+    _, reasons = requires_context_resolution(
+        first_pass_payload=payload,
+        evidence={},
+        context_window={"current": {"text": "两笔空单统一上调止损位到84600"}},
+        candidates=candidates,
+    )
+    assert "management_without_exact_target" in reasons
