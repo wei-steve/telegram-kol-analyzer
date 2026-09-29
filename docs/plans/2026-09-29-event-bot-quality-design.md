@@ -8,7 +8,7 @@
   `execution_events.action` / `source_message_id`、`strategy_lifecycles` 主键与 `(chat_id, message_id)` 唯一键）；
   值守状态库只读；worker 日志 `journalctl` 按时间窗；`/etc/telegram-kol-*.env` 只读了**键名**和两个
   incident 类型清单的值。没有全表扫描、没有交易所调用、没有发任何 Telegram 消息。
-- 状态：**已批准（2026-09-29，用户：第 8 节全部按推荐）**；实施中
+- 状态：**已批准（2026-09-29，用户：第 8 节全部按推荐）**；代码候选 `d835c941`，全量通过，**未部署、未推 origin/main**
 
 ## 0. 结论速览
 
@@ -327,3 +327,56 @@ D6c 的「从未通知过」判据对它们**恒成立**。
 
 Q1 选 A（按规则分流）；Q2 四条一起做；Q3 只补发 open、每轮最多 5 条、带「补发」前缀；Q4 同一尝试只留一条；
 Q5 本次不改、另立一稿；Q6 批准按 5.3 执行（调度会话在部署窗口外做，不在本候选里）；Q7 只认 `entry_price_geometry_rejected`。
+
+## 9. 实施记录（2026-09-29）
+
+两个子代理并行：A＝值守（第 1 节 + 3.2 第 5 条 + 第 6 节），B＝worker（第 2、3、4 节）。
+本会话审阅后按顺序 cherry-pick 到 `claude/eager-dubinsky-44265c`。
+
+| 提交 | 内容 |
+|---|---|
+| `1576ccda` | B1：同一执行尝试只写一条 incident（无写入 → `uncertain_without_write`，有写入 → `authoritative_execution_uncertain`） |
+| `dbc5cdae` | B3：`management_recovery_timeout` 摘要不再带含群 ID 的 `strategy_instance_id`，改为 `symbol` / `side` / `origin_message_id`；详细摘要测试改用生产形状值 |
+| `48abd5f4` | B2+B4：事件处理类型结尾改「需要你：…」；投递时补群名 / 原文 / 仓位 / 关联；几何拒绝后到期静默收口；几何拒绝通知与两条供应商故障「未重放」通知显示群名不显示 chat_id |
+| `9de778a1` | A：D6c 排除静音类型 + 10 分钟宽限 + 按类型合并 + 不请 Codex；补发；两 bot 分流；补救提案文案 |
+| `d835c941` | A（审阅修正）：按类型的 D6c 案件结束后可重开；开案未发时诊断不先发；补发先判资格再取前 5 |
+
+### 9.0 测试
+
+- 最终候选 `d835c941` 全量：**10428 passed / 4 skipped / 0 failed**（`uv run python -B -m pytest -q`，20 分 48 秒）。
+- 每项回放用例（R1-a～f、R2-a/b、R3-a～d、R4-a～d 及审阅补的三条）均由子代理在未修改代码上先跑出失败、修复后通过。
+
+### 9.1 审阅时发现并修正的三处（A）
+
+1. 按类型键的 D6c 案件沿用了「消息类案件不重开」的 upsert 语义——某类型第一次 resolved 以后就再也开不了案。改为该前缀 `reopen=True`（仍 open 时不会每轮重开，有测试）。
+2. 0bcb894e 让诊断不受上限，于是开案被压掉的案件会先单独收到一条诊断；改为开案未发时诊断等补发。
+3. 补发先切片后判资格，排在后面的可豁免案件可能整天轮不到；改为先过滤。
+
+### 9.2 偏离设计之处
+
+- 3.2 第 5 条（补救提案）：补救请求体刻意只有三个标识字段，接收端在 `web_app.py`；采用设计允许的次选——文案改为「Codex 诊断如有，会以「🔎 值守诊断 #N」单独发送」，不再断言诊断存在。
+- B 额外把 `provider_outage_entry_not_replayed` / `provider_outage_management_not_replayed` 的「群:」行从 chat_id 改为群名（新增的「正文不含群 ID」全类型测试会抓到它们）。
+
+### 9.3 生产核对（审阅时）
+
+- 群名来源 `groups.yaml` 的 `custom_group_label` / `chat_title`：34 个群全部有，8 个自动交易群全部有。
+- 几何收口的两次查询走 `ix_raw_messages_chat_id` / `ix_raw_messages_message_id` 与 `ix_execution_events_source_message_id`。
+- 部署当下值守状态库没有「open 且 alerted_at 为空」的案件 → 上线不会补发旧消息；旧键的 open 案件 35、36（静音类型）会在第一轮静默 resolved，不发「已结束」。
+
+### 9.4 部署步骤（调度会话排期；本会话不部署、不推 `origin/main`）
+
+1. 候选是生产 HEAD `0bcb894e` 的后代；非策略时效操作期间。
+2. `tg-deploy <候选 sha>`。
+3. Q1＝A（分流）：把运行通知 bot 的两行配置复制进值守 env（不打印值）：
+   ```bash
+   grep -E '^TELEGRAM_KOL_NOTIFICATION_BOT_(TOKEN|CHAT_ID)=' /etc/telegram-kol-worker.env \
+     | sed -E 's/^TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID=/TELEGRAM_KOL_ONCALL_NOTIFY_CHAT_ID=/; s/^TELEGRAM_KOL_NOTIFICATION_BOT_TOKEN=/TELEGRAM_KOL_ONCALL_NOTIFY_BOT_TOKEN=/' \
+     >> /etc/telegram-kol-oncall.env
+   grep -cE '^TELEGRAM_KOL_ONCALL_NOTIFY_(BOT_TOKEN|CHAT_ID)=.+' /etc/telegram-kol-oncall.env   # 期望 2
+   ```
+   执行前先确认 worker env 里这两个键的名字（只看键名）。
+4. **单独** `systemctl restart telegram-kol-oncall.service`。
+5. L1 观察：15 分钟或 5 条真实消息。看：没有新开静音类型的 D6c 案；事件处理 bot 新通知带群名 / 原文 / 「需要你」；worker 日志没有新的「详细摘要被拒」。
+6. 回滚：`tg-deploy 0bcb894e9280d273e145eb44e99d24d14c6870a7`；删掉 oncall env 里新增的两行；重启值守。
+   注意：回滚后按类型键开的 D6c 案件（`unheard_type:`）旧代码不认识其前缀的格式化，会走通用格式；无害，但会一直 open 到 stale。
+7. 执行尝试 4631 的数据收口按第 5.3 节单独做（L3，已批准，不在本候选里）。
