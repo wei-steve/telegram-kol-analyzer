@@ -8,7 +8,7 @@
   `strategy_management_market_decisions.management_batch_id`、`execution_events` 经 `raw_messages (chat_id, message_id)`）；
   代码读 `execution_boundary.py`、`authoritative_recognition.py`、`authoritative_execution_attempts.py`、
   `strategy_management_executor.py`。没有交易所调用。
-- 状态：**已批准（2026-09-29，用户：第 7 节全部按推荐）**；**已部署 `d244dfeb`（2026-09-29 13:15Z）**，L2 观察进行中，见第 9 节
+- 状态：**已批准（2026-09-29，用户：第 7 节全部按推荐）**；**已部署 `d244dfeb`（2026-09-29 13:15Z），L2 窗口通过**，见第 9 节
 - 风险级别：**L3**（改的是「跨过副作用边界之后的结果如何定性」，属 AGENTS.md 所说的交易所写入语义；
   **不改表结构、不修生产数据、不改任何真实下单 / 撤单代码**）
 
@@ -234,3 +234,8 @@ Q1＝B（`closed_no_write`，不可自动重试）；Q2 新增 `management_refus
 - L2 观察：只读监视 `/root/observe-q5-preflight.sh`（`systemd-run` 单元 `observe-q5-preflight`），13:17:48Z 起，
   证据 `/var/lib/telegram-kol-evidence/20260929-q5-preflight/`。基线：raw 19790、attempt 4830、incident 2434。
   不健康即重置窗口：服务 / HEAD、部署后新增 uncertain、`management_refused_before_write` 10 分钟未送达、submit_unknown、critical。
+- **L2 窗口通过**：13:17:48Z → 13:47:52Z 连续 30 分钟，7 条真实消息、5 个群；31 次采样全部健康、0 次重置。
+  部署后 8 次执行尝试：7 次 `succeeded`、1 次 `failed_safe`（A-6 原有路径），**0 次 `uncertain`**；submit_unknown 0、critical 0；
+  部署后 worker / web / ingest 日志无 Traceback、无 ERROR、无 `management_preflight_refusal_cas_failed`。
+- **局限**：窗口内没有管理预检被拒的样本，新证明的正向路径（`closed_no_write` + `management_refused_before_write`）**还没有生产样本**。
+  首个样本出现时按 8.3 第 3 条核对；7 天内（至 10-06）没有样本记为待验证。
