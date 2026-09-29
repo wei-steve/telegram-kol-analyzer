@@ -241,6 +241,38 @@ REASON_LABELS = {
     "deferred_expired": "被删除退出挡下，等到超时，系统把这条消息作废了（永不执行）",
     "runtime_incident_never_notified": "这条告警一直在发生，但从来没有通知过任何人",
     "runtime_incident_notification_stale": "这条告警还在发生，但上次通知已经很久以前了",
+    # --- take-profit adjustment (2026-09-29, design
+    # docs/plans/2026-09-29-take-profit-adjustment-design.md). A batch that
+    # ends ``blocked`` with one of these left the existing take profits as
+    # they were; ``shadow_planned`` / ``applied`` / ``already_satisfied`` end
+    # resolved or succeeded and are listed only so no code shows as 未收录.
+    "take_profit_adjust_price_missing": "调止盈：消息没给止盈价位，也没有可用的策略价，未改动",
+    "take_profit_adjust_all_tiers_crossed": "调止盈：新止盈价位已被现价越过，挂不上，未改动",
+    "take_profit_adjust_size_below_minimum": "调止盈：剩余张数不够最小下单量，现有止盈保持不动",
+    "take_profit_adjust_already_satisfied": "调止盈：现有止盈单已与新结构一致，无需改动",
+    "take_profit_adjust_allocation_invalid": "调止盈：止盈比例无法对应到档位，未改动",
+    "take_profit_adjust_tier_count_ambiguous": "调止盈：比例档数与策略止盈档数对不上，未改动",
+    "take_profit_adjust_tier_already_filled": "调止盈：所说的止盈档已经成交，未改动",
+    "take_profit_adjust_size_invalid": "调止盈：止盈张数无法按步长分配，未改动",
+    "take_profit_adjust_position_empty": "调止盈：仓位已无剩余张数，未改动",
+    "take_profit_adjust_input_invalid": "调止盈：仓位或合约参数不完整，未改动",
+    "take_profit_adjust_shadow_planned": "调止盈影子模式：只计算不下单",
+    "take_profit_adjust_applied": "调止盈：已按新结构重挂止盈",
+    "take_profit_adjust_deadline_expired": "调止盈 180 秒内未完成，已收口，请核对交易所止盈单",
+    "take_profit_adjust_disabled": "调止盈开关为 disabled，未执行",
+    "take_profit_adjust_exchange_read_incomplete": "调止盈：交易所仓位或挂单读取不完整，未改动",
+    "take_profit_adjust_quote_unavailable": "调止盈：读不到可靠现价，未改动",
+    "take_profit_adjust_position_not_found": "调止盈：交易所上找不到对应仓位，未改动",
+    "take_profit_adjust_protection_unresolved": "调止盈：保护单归属无法解析，未改动",
+    "take_profit_adjust_stop_missing": "调止盈：该仓位没有可确认的止损，不改止盈",
+    "take_profit_adjust_price_tick_invalid": "调止盈：止盈价位不符合合约价格步长，未改动",
+    "take_profit_adjust_stop_replace_failed": "调止盈：同条消息的止损改动失败，止盈未动",
+    "take_profit_adjust_snapshot_invalid": "调止盈：批次快照不完整，未改动",
+    "take_profit_adjust_interrupted": "调止盈上一次执行中断，写入结果未知，请人工核对",
+    "take_profit_adjust_execution_error": "调止盈执行异常，已收口，请核对交易所止盈单",
+    "take_profit_adjust_instruction_unavailable": "调止盈：无法从原文重新读出止盈指令，未改动",
+    "take_profit_adjust_unfilled_leg_plan_invalid": "调止盈：未成交入场腿的原止盈计划无法解析，未改动",
+    "take_profit_replace_incomplete": "止盈撤单或挂单未完成（止损未动），请核对交易所",
     # --- the watcher's own codes ---
     "instruction_stuck_pending": "指令一直排队，没有开始执行",
     "instruction_stuck_executing": "指令开始执行后没有下文",
