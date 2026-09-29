@@ -40,12 +40,17 @@ from telegram_kol_research.oncall_codex import (
     URGENCY_LABELS_ZH,
 )
 from telegram_kol_research.oncall_state import (
+    DIAGNOSIS_DONE,
     LANE_STALL_ACTIVE,
     LANE_STALL_CHURNING,
+    MESSAGE_QUEUED,
+    MESSAGE_SUPPRESSED,
     RECOGNITION_CASE_PREFIX,
     SEALED_LANE_CASE_PREFIX,
     UNHEARD_INCIDENT_CASE_PREFIX,
+    UNHEARD_INCIDENT_TYPE_CASE_PREFIX,
     VOIDED_MESSAGE_CASE_PREFIX,
+    AlertRecord,
     CaseRecord,
     OncallStateStore,
     isoformat,
@@ -92,6 +97,67 @@ CAPPED_ALERT_KINDS = (
 GROUP_MERGE_WINDOW = timedelta(minutes=10)
 GROUP_MERGE_THRESHOLD = 3
 HEALTH_ALERT_COOLDOWN = timedelta(minutes=15)
+
+# --------------------------------------------------------------------------
+# 2026-09-29 (event-bot quality design 1.2 A.3): which bot an alert goes to.
+#
+# ``/etc/telegram-kol-oncall.env`` has no ``TELEGRAM_KOL_ONCALL_BOT_TOKEN``, so
+# the watcher falls back to the worker's own "Kol事件处理" bot for *every*
+# message -- health, D6c, the daily all-clear, all of it -- burying the few
+# messages that actually need a human decision (D1-D3, D6a, D6b and their
+# diagnosis/resolved/remediation-failure) under noise that only needs
+# acknowledging. Kinds that carry no case (health, cap-reached, daily
+# summary, Codex up/down) are routed by kind alone; a case-carrying kind
+# (open/resolved/diagnosis) is routed by *the case's own rule*, never by the
+# alert's kind alone, so one case's opening, diagnosis and "ended" always
+# travel together (design section 6: "同一个案件的开案、诊断、已结束始终走同
+# 一个 bot").
+# --------------------------------------------------------------------------
+
+#: Always the "运行通知" (notify) bot when configured: nothing here names one
+#: message or asks anyone to decide anything.
+_NOTIFY_ONLY_ALERT_KINDS = frozenset(
+    {
+        ALERT_KIND_HEALTH_OPEN,
+        ALERT_KIND_HEALTH_RESOLVED,
+        ALERT_KIND_DAILY_SUMMARY,
+        ALERT_KIND_CODEX_DOWN,
+        ALERT_KIND_CODEX_RECOVERED,
+        ALERT_KIND_CAP_REACHED,
+    }
+)
+#: Always the "事件处理" bot: a group-merge notice and a remediation-request
+#: failure both only ever arise from a message-scoped case (D1-D3/D6a/D6b) --
+#: D6c cases carry no ``chat_id`` and are never merged, and remediation is
+#: only ever requested for a case with a ``raw_message_id``.
+_EVENT_ONLY_ALERT_KINDS = frozenset(
+    {ALERT_KIND_GROUP_MERGED, ALERT_KIND_REMEDIATION_REQUEST_FAILED}
+)
+#: The one rule the design sends to the notify bot among the case-carrying
+#: kinds. Every other case-carrying rule (D1-D3, D6a, D6b) stays on the event
+#: bot -- see :func:`alert_wants_notify_bot`.
+_NOTIFY_BUCKET_RULE = "D6c"
+
+
+def alert_wants_notify_bot(store: OncallStateStore, alert: AlertRecord) -> bool:
+    """Whether ``alert`` belongs on the "运行通知" bot rather than "Kol事件处理".
+
+    Only ever consulted by the caller when a second bot is actually
+    configured; with no ``TELEGRAM_KOL_ONCALL_NOTIFY_BOT_*`` this function is
+    not called and every alert keeps going to the one bot, unchanged.
+    """
+
+    if alert.kind in _NOTIFY_ONLY_ALERT_KINDS:
+        return True
+    if alert.kind in _EVENT_ONLY_ALERT_KINDS:
+        return False
+    if alert.case_id is None:
+        return False
+    case = store.get_case(alert.case_id)
+    if case is None:
+        return False
+    rules = str(case.rule or "").split("+")
+    return _NOTIFY_BUCKET_RULE in rules
 
 ACTION_LABELS = {
     "full_exit": "全部平仓 / 离场",
@@ -546,8 +612,28 @@ def format_voided_message_resolved_alert(case: CaseRecord) -> str:  # pragma: no
     )
 
 
+def _unheard_incident_ids_line(evidence: Mapping[str, Any]) -> str:
+    """The record numbers a D6c case names (2026-09-29: one case per type).
+
+    Falls back to the pre-2026-09-29 single-id evidence shape
+    (``incident_id``) so a case that is still open under the old case-key
+    generation at deploy time still formats correctly.
+    """
+
+    ids = evidence.get("incident_ids")
+    if isinstance(ids, list) and ids:
+        shown = ", ".join(f"#{int(i)}" for i in ids[:10])
+        count = evidence.get("incident_count")
+        if isinstance(count, int) and count > len(ids[:10]):
+            shown += f" 等 {count} 条"
+        return shown
+    legacy_id = evidence.get("incident_id")
+    return f"#{legacy_id}" if legacy_id is not None else "#?"
+
+
 def format_unheard_incident_alert(case: CaseRecord) -> str:
-    """Rule D6c's opening alert (design 2026-09-26, section 3).
+    """Rule D6c's opening alert (design 2026-09-26, section 3;
+    2026-09-29 grouped by incident type, section 1.2 A.1.3).
 
     The one fact that makes it worth sending: this is happening *now*, and the
     last time anybody was told about it was long ago -- or never.
@@ -578,7 +664,7 @@ def format_unheard_incident_alert(case: CaseRecord) -> str:
             f"⚠️ 值守提醒 #{case.id}（告警在喊，没人听见）",
             f"告警：{evidence.get('incident_type') or '未知类型'}"
             f"（严重度 {evidence.get('incident_severity') or '未记录'}，"
-            f"记录 #{evidence.get('incident_id', '?')}）",
+            f"记录 {_unheard_incident_ids_line(evidence)}）",
             f"对象：{evidence.get('source_kind') or '未记录'} "
             f"{evidence.get('source_record_id') or ''}".strip(),
             still_line,
@@ -594,7 +680,7 @@ def format_unheard_incident_resolved_alert(case: CaseRecord) -> str:
         [
             f"✅ 值守提醒 #{case.id} 已结束",
             f"告警 {evidence.get('incident_type') or '未知类型'}"
-            f"（记录 #{evidence.get('incident_id', '?')}）"
+            f"（记录 {_unheard_incident_ids_line(evidence)}）"
             "已经不再发生，或者已经重新通知过了。",
         ]
     )
@@ -786,22 +872,32 @@ def deliver_pending_alerts(
     now: datetime,
     sender: Callable[[str], None] | None,
     max_attempts: int = 5,
+    sender_for: Callable[[AlertRecord], Callable[[str], None] | None] | None = None,
 ) -> tuple[int, int]:
     """Send what is queued. Returns ``(sent, failed)``; never raises.
 
     ``sender`` of ``None`` is dry-run: the alert stays in the state database
     and the log, and nothing is sent.
+
+    ``sender_for`` (2026-09-29, event-bot quality design 1.2 A.3) picks a
+    per-alert sender -- the "运行通知" bot for :func:`alert_wants_notify_bot`,
+    the plain ``sender`` for everything else. Its absence, or its returning
+    ``None`` for a given alert, means "use ``sender``", so a watcher with no
+    second bot configured behaves exactly as before.
     """
 
     sent = 0
     failed = 0
     for alert in store.pending_alerts(max_attempts=max_attempts):
-        if sender is None:
+        active_sender = sender
+        if sender_for is not None:
+            active_sender = sender_for(alert) or sender
+        if active_sender is None:
             store.mark_alert_dry_run(alert.id, now)
             logger.info("oncall dry-run alert id=%s kind=%s", alert.id, alert.kind)
             continue
         try:
-            sender(alert.body)
+            active_sender(alert.body)
         except AlertDeliveryError as exc:
             failed += 1
             store.mark_alert_failed(
@@ -976,6 +1072,14 @@ def compose_case_alerts(
         if case is None or case.alerted_at is None:
             # Never announce the recovery of a problem nobody was told about.
             continue
+        if case.case_key.startswith(UNHEARD_INCIDENT_CASE_PREFIX):
+            # 2026-09-29: a case still open under the pre-2026-09-29 per-id
+            # D6c key is resolved normally (the state machine must not get
+            # stuck on a retired key format), but never announced -- the
+            # object it names should never have opened a case in the first
+            # place (event-bot quality design 1.2 A.1.3), so telling anyone it
+            # "ended" is exactly the noise this change removes.
+            continue
         is_health = case.case_key.startswith("health:")
         # A follow-up, not a new problem: it only ever trails an opening that
         # was sent, so it neither waits on the daily cap nor spends it
@@ -990,6 +1094,85 @@ def compose_case_alerts(
             dedupe_key=_episode_key(kind, case),
         ) is not None:
             queued += 1
+    return queued
+
+
+def compose_backfill_alerts(
+    store: OncallStateStore,
+    *,
+    now: datetime,
+    policy: AlertPolicy | None = None,
+    limit: int = 5,
+) -> int:
+    """Give a case a second chance once its opening alert was capped away.
+
+    2026-09-29 (event-bot quality design 1.2 A.2). In this codebase
+    ``alerted_at`` is left ``NULL`` for exactly one reason: the opening alert
+    was suppressed by the daily cap in :func:`compose_case_alerts` above --
+    every other path that touches a case either writes it (``mark_case_alerted``
+    on an opening that was sent, or on one merged into a group notice) or never
+    reaches a non-health case in the first place (health cooldown only ever
+    concerns ``health:``-prefixed cases, excluded below). Case 32 (2026-09-28,
+    陈哥 #19598, 保本可补救) sat ``open`` from 13:25 Beijing, capped and
+    unannounced, until it went ``stale`` at midnight with no second chance --
+    this function is that second chance, called once a round right after
+    :func:`compose_case_alerts`.
+
+    Resolved and stale cases are not backfilled on purpose: the moment has
+    passed, and telling somebody about a problem that is already over (or that
+    the watcher itself gave up watching) is exactly the noise rule D6c exists
+    to remove elsewhere. Capped at ``limit`` per round so that a cap reset does
+    not dump a whole day's backlog into one message burst.
+    """
+
+    settings = policy or AlertPolicy()
+    queued = 0
+    candidates = sorted(
+        (
+            case
+            for case in store.open_cases()
+            if case.alerted_at is None and not case.case_key.startswith("health:")
+        ),
+        key=lambda case: case.id,
+    )
+    for case in candidates[: max(0, int(limit))]:
+        if not (
+            _case_open_bypasses_cap(case) or not _cap_reached(store, now, settings)
+        ):
+            # Still capped, or not exempt: leave it open and unalerted for the
+            # next round to try again.
+            continue
+        original_body = _format_open_alert(case, is_health=False)
+        backfill_note = (
+            f"（补发：原 {beijing_time(case.first_seen_at)} "
+            "时因当日告警上限未发出）"
+        )
+        body = f"{backfill_note}\n{original_body}"
+        if store.enqueue_alert(
+            kind=ALERT_KIND_CASE_OPEN,
+            body=body,
+            now=now,
+            case_id=case.id,
+            dedupe_key=_episode_key(ALERT_KIND_CASE_OPEN, case),
+        ) is not None:
+            queued += 1
+            _note_capped_alert(store, now)
+        store.mark_case_alerted(case.id, now)
+
+        diagnosis = store.get_diagnosis(case.id)
+        if (
+            diagnosis is not None
+            and diagnosis.status == DIAGNOSIS_DONE
+            and diagnosis.message_state not in (MESSAGE_QUEUED, MESSAGE_SUPPRESSED)
+            and diagnosis.verdict is not None
+        ):
+            # Same path a fresh "done" diagnosis takes (``_maybe_send_diagnosis``
+            # in oncall_service.py) -- reused rather than re-implemented so the
+            # two can never format the message differently.
+            if compose_diagnosis_alert(
+                store, case=case, verdict=diagnosis.verdict, now=now, policy=settings
+            ):
+                store.set_diagnosis_message_state(case.id, MESSAGE_QUEUED)
     return queued
 
 
@@ -1070,6 +1253,15 @@ _CASE_FORMATTERS = (
         format_voided_message_resolved_alert,
     ),
     (
+        UNHEARD_INCIDENT_TYPE_CASE_PREFIX,
+        format_unheard_incident_alert,
+        format_unheard_incident_resolved_alert,
+    ),
+    (
+        # Legacy per-id key (pre-2026-09-29): only reachable for an opening
+        # alert composed before the deploy that retired it; kept so any such
+        # case in flight at cutover still formats. Its resolved alert is never
+        # reached -- the resolved loop above returns before formatting.
         UNHEARD_INCIDENT_CASE_PREFIX,
         format_unheard_incident_alert,
         format_unheard_incident_resolved_alert,

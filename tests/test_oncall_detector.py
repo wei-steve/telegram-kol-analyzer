@@ -1577,13 +1577,17 @@ def test_d6c_opens_a_case_for_an_alarm_still_ringing_that_nobody_was_told_about(
 
     case = only_case(store)
     assert outcome.new_case_ids == (case.id,)
-    assert case.case_key == f"unheard:{incident_id}"
+    # 2026-09-29: keyed by incident *type*, not by row id -- see the D6c
+    # regrouping tests below.
+    assert case.case_key == "unheard_type:source_deletion_exit_stuck"
     assert case.rule == "D6c"
     assert case.severity == "high"
     assert case.reason_code == "runtime_incident_never_notified"
     assert case.evidence["incident_type"] == "source_deletion_exit_stuck"
     assert case.evidence["repeat_count"] == 356933
     assert case.evidence["minutes_since_last_occurrence"] == 2
+    assert case.evidence["incident_ids"] == [incident_id]
+    assert case.evidence["incident_count"] == 1
 
 
 def test_d6c_opens_a_case_when_the_last_notification_is_three_days_old(
@@ -1713,6 +1717,118 @@ def test_the_sql_cutoff_is_spelled_the_way_production_stores_a_timestamp():
     from telegram_kol_research.oncall_detector import as_production_text
 
     assert as_production_text(NOW) == "2026-09-19 06:00:00.000000"
+
+
+# ---------------------------------------- D6c, 2026-09-29 quality fixes
+#
+# Event-bot quality design (docs/plans/2026-09-29-event-bot-quality-design.md),
+# section 1.2 A, replays R1-a/b/c/e/f: production incidents 2396-2406 alone
+# opened nine D6c cases in a nine-hour window on 2026-09-28, all of them the
+# two types that are pending/never-notified *by design*.
+
+
+def test_r1a_quiet_by_design_types_never_open_a_d6c_case(production, store):
+    """R1-a: incidents 2396-2406's shape (before the fix: 9 cases; after: 0)."""
+
+    run_round(production, store)
+    for i in range(4):
+        _still_shouting(
+            production,
+            incident_type="authoritative_recognition_failed",
+            source_kind="raw_message",
+            source_record_id=str(19501 + i),
+            first_occurred_at=NOW - timedelta(minutes=30),
+            last_occurred_at=NOW - timedelta(minutes=2),
+        )
+    for i in range(5):
+        _still_shouting(
+            production,
+            incident_type="context_worker_exhausted",
+            source_kind="message_processing_job",
+            source_record_id=str(9001 + i),
+            first_occurred_at=NOW - timedelta(minutes=30),
+            last_occurred_at=NOW - timedelta(minutes=2),
+        )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_r1b_a_ten_minute_grace_period_precedes_never_notified(production, store):
+    """R1-b: 2407/2417/2418's shape -- worker delivery measured 2-42 seconds,
+    not "nobody heard it". Before the fix this opened a case within seconds;
+    after, it waits out the grace period.
+    """
+
+    run_round(production, store)
+    incident_id = _still_shouting(
+        production,
+        incident_type="protection_adopted_from_exchange",
+        first_occurred_at=NOW - timedelta(seconds=42),
+        last_occurred_at=NOW - timedelta(seconds=2),
+    )
+
+    outcome = run_round(production, store)
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+    later = run_round(production, store, now=NOW + timedelta(minutes=11))
+    assert len(later.new_case_ids) == 1
+    case = store.get_case(later.new_case_ids[0])
+    assert case.evidence["incident_ids"] == [incident_id]
+
+
+def test_r1c_same_type_incidents_merge_into_one_case(production, store):
+    """R1-c: 5 same-type, unheard incidents -> 1 case naming all 5."""
+
+    run_round(production, store)
+    ids = [
+        _still_shouting(
+            production,
+            incident_type="management_fraction_rejected",
+            source_record_id=str(3001 + i),
+            first_occurred_at=NOW - timedelta(minutes=20),
+            last_occurred_at=NOW - timedelta(minutes=2),
+        )
+        for i in range(5)
+    ]
+
+    outcome = run_round(production, store)
+
+    assert len(outcome.new_case_ids) == 1
+    case = store.get_case(outcome.new_case_ids[0])
+    assert case.case_key == "unheard_type:management_fraction_rejected"
+    assert sorted(case.evidence["incident_ids"]) == sorted(ids)
+    assert case.evidence["incident_count"] == 5
+
+
+def test_r1c_a_type_case_clears_once_no_incident_of_that_type_still_qualifies(
+    production, store
+):
+    run_round(production, store)
+    _still_shouting(production, incident_type="management_fraction_rejected")
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    resolved = run_round(production, store, now=NOW + timedelta(hours=3))
+
+    assert resolved.resolved_case_ids == opened.new_case_ids
+
+
+def test_r1f_the_quiet_constant_matches_config():
+    """R1-f: the module-local copy must never drift from config.py's list --
+    this module may not import config.py (architecture boundary), so this
+    test is the only thing keeping the two in sync.
+    """
+
+    from telegram_kol_research import config
+    from telegram_kol_research.oncall_detector import (
+        D6C_QUIET_BY_DESIGN_INCIDENT_TYPES,
+    )
+
+    assert D6C_QUIET_BY_DESIGN_INCIDENT_TYPES == config.TELEGRAM_QUIET_INCIDENT_TYPES
 
 
 # ------------------------------------------------------- read discipline

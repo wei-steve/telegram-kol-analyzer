@@ -13,11 +13,17 @@ from oncall_test_support import NOW
 from telegram_kol_research.oncall_alerts import (
     ALERT_KIND_CAP_REACHED,
     ALERT_KIND_CASE_OPEN,
+    ALERT_KIND_CASE_RESOLVED,
+    ALERT_KIND_CODEX_DOWN,
     ALERT_KIND_DAILY_SUMMARY,
+    ALERT_KIND_DIAGNOSIS,
     ALERT_KIND_GROUP_MERGED,
+    ALERT_KIND_HEALTH_OPEN,
+    ALERT_KIND_REMEDIATION_REQUEST_FAILED,
     AlertDeliveryError,
     AlertPolicy,
     TelegramAlertSender,
+    alert_wants_notify_bot,
     compose_case_alerts,
     deliver_pending_alerts,
     format_case_alert,
@@ -29,7 +35,7 @@ from telegram_kol_research.oncall_alerts import (
     message_excerpt,
     reason_label,
 )
-from telegram_kol_research.oncall_state import OncallStateStore
+from telegram_kol_research.oncall_state import AlertRecord, OncallStateStore
 
 
 BEIJING_0930 = datetime(2026, 9, 19, 1, 30, tzinfo=UTC)
@@ -399,10 +405,21 @@ def test_a_voided_message_is_composed_with_its_own_wording(store):
     assert "识别结果" not in body
 
 
-def open_unheard_incident_case(store, *, now=NOW, reason=None, **evidence):
+def open_unheard_incident_case(
+    store, *, now=NOW, reason=None, case_key="unheard_type:source_deletion_exit_stuck", **evidence
+):
+    """2026-09-29: default case key is the post-fix, per-type shape.
+
+    ``incident_ids``/``incident_count`` is what :func:`_unheard_incident_observations`
+    writes now; the formatter also falls back to a lone ``incident_id`` so a
+    case still open under the pre-2026-09-29 per-id key formats identically --
+    see :func:`test_the_pre_fix_unheard_case_key_still_formats`.
+    """
+
     payload = {
-        "kind": "unheard_incident",
-        "incident_id": 1841,
+        "kind": "unheard_incident_type",
+        "incident_ids": [1841],
+        "incident_count": 1,
         "incident_type": "source_deletion_exit_stuck",
         "incident_severity": "high",
         "source_kind": "source_deletion_exit",
@@ -416,7 +433,7 @@ def open_unheard_incident_case(store, *, now=NOW, reason=None, **evidence):
     }
     payload.update(evidence)
     case, _created = store.upsert_case(
-        case_key="unheard:1841",
+        case_key=case_key,
         rule="D6c",
         severity="high",
         now=now,
@@ -467,6 +484,38 @@ def test_an_unheard_incident_is_composed_and_recovers_with_its_own_wording(store
 
     bodies = [alert.body for alert in store.pending_alerts()]
     assert any("已经不再发生，或者已经重新通知过了" in body for body in bodies)
+
+
+def test_the_pre_fix_unheard_case_key_still_formats(store):
+    """A case still open under the pre-2026-09-29 per-id key opens normally."""
+
+    case = open_unheard_incident_case(
+        store,
+        case_key="unheard:1841",
+        incident_ids=None,
+        incident_id=1841,
+    )
+    text = format_unheard_incident_alert(case)
+    assert "记录 #1841" in text
+
+
+def test_a_legacy_keyed_case_resolves_silently(store):
+    """2026-09-29 (event-bot quality design 1.2 A.1.3): a case still open under
+    the retired per-id key at deploy time (e.g. production's cases 35/36, both
+    quiet-by-design types) must still be resolved by the state machine, but
+    its "ended" message is noise -- the object should never have opened a case
+    to begin with -- so it is never sent.
+    """
+
+    case = open_unheard_incident_case(store, case_key="unheard:2422")
+    store.mark_case_alerted(case.id, NOW)  # it *was* announced when it opened
+
+    queued = compose_case_alerts(
+        store, now=NOW, new_case_ids=[], resolved_case_ids=[case.id]
+    )
+
+    assert queued == 0
+    assert store.pending_alerts() == ()
 
 
 @pytest.mark.parametrize(
@@ -763,6 +812,81 @@ def test_r3b_a_merged_d6c_rule_list_still_counts_as_d6c(store):
     assert compose_case_alerts(
         store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[]
     ) == 1
+
+
+def test_r1d_a_capped_case_is_backfilled_after_the_beijing_day_resets(store):
+    """R1-d (event-bot quality design 1.2 A.2, case 32 / 2026-09-28): a case
+    capped away stays ``alerted_at IS NULL`` forever before the fix -- nothing
+    ever revisits it once the round that opened it has passed. After the fix,
+    the next round past the cap reset backfills it, prefixed, with its
+    already-finished diagnosis right behind it.
+    """
+    from telegram_kol_research.oncall_alerts import compose_backfill_alerts
+
+    _fill_cap_with_ordinary_openings(store)
+    capped = open_capped_case(store, key="mgmt:19598:move_stop_to_break_even", chat_id=-19598)
+    queued = compose_case_alerts(
+        store, now=NOW, new_case_ids=[capped.id], resolved_case_ids=[]
+    )
+    assert queued == 0  # capped away, exactly like case 32
+    assert store.get_case(capped.id).alerted_at is None
+
+    # Before the fix: nothing ever revisits a capped case.
+    before_fix = compose_case_alerts(
+        store, now=NOW + timedelta(hours=11), new_case_ids=[], resolved_case_ids=[]
+    )
+    assert before_fix == 0
+    assert store.get_case(capped.id).alerted_at is None
+    assert store.get_case(capped.id).status != "resolved"
+
+    # A diagnosis that finished while the opening alert was still capped.
+    store.record_diagnosis_request(
+        case_id=capped.id, attempt=1, fingerprint="fp", prompt_version="v1", now=NOW
+    )
+    store.record_diagnosis_result(
+        case_id=capped.id,
+        status="done",
+        now=NOW,
+        verdict={
+            "urgency": "immediate",
+            "category": "missed_execution",
+            "what_message_wanted_zh": "把 BTC 多单止损移到保本",
+            "explanation_zh": "预检拒绝，从未接触交易所",
+            "recommended_action_zh": "到交易所核对仓位止损",
+            "should_have_executed": "yes",
+            "confidence": "high",
+        },
+    )
+
+    # Past midnight Beijing (NOW is 2026-09-19 06:00Z == 14:00 Beijing).
+    next_day = NOW + timedelta(hours=11)
+    queued = compose_backfill_alerts(store, now=next_day)
+
+    assert queued == 1
+    case = store.get_case(capped.id)
+    assert case.alerted_at is not None
+    bodies = [alert.body for alert in store.pending_alerts(limit=100)]
+    opening = next(body for body in bodies if body.startswith("（补发：原"))
+    assert "时因当日告警上限未发出）" in opening
+    assert "值守提醒" in opening
+    assert any("🔎 值守诊断" in body for body in bodies)
+
+
+def test_r1d_resolved_and_stale_cases_are_never_backfilled(store):
+    from telegram_kol_research.oncall_alerts import compose_backfill_alerts
+
+    _fill_cap_with_ordinary_openings(store)
+    capped = open_capped_case(store, key="mgmt:1:full_exit", chat_id=-1)
+    compose_case_alerts(store, now=NOW, new_case_ids=[capped.id], resolved_case_ids=[])
+    assert store.get_case(capped.id).alerted_at is None
+    store.resolve_case(capped.id, NOW)
+
+    queued = compose_backfill_alerts(store, now=NOW + timedelta(hours=11))
+
+    assert queued == 0
+    assert not any(
+        alert.case_id == capped.id for alert in store.pending_alerts(limit=100)
+    )
 
 
 def test_r3c_follow_ups_neither_wait_on_nor_spend_the_cap(store):
@@ -1063,3 +1187,148 @@ def test_the_three_stall_classes_do_not_read_the_same(store):
         assert "这个方向的新策略现在一条都进不来" in text
         assert "群：龚有财群    被封的方向：BTC 多" in text
         assert "封了多久：11 天 3 小时" in text
+
+
+# ---------------------------------------- A3: which bot (2026-09-29)
+#
+# Event-bot quality design section 6 / 1.2 A.3: an optional second bot for
+# alerts that only need acknowledging. Absent (the default in every test
+# above, and in production until the two extra env keys are set), nothing
+# here is even consulted -- ``deliver_pending_alerts`` falls back to the one
+# ``sender`` exactly as before.
+
+
+def _alert(*, kind, case_id=None):
+    return AlertRecord(
+        id=1,
+        case_id=case_id,
+        kind=kind,
+        dedupe_key=None,
+        body="x",
+        status="pending",
+        attempts=0,
+        delivery_error=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        ALERT_KIND_HEALTH_OPEN,
+        ALERT_KIND_DAILY_SUMMARY,
+        ALERT_KIND_CODEX_DOWN,
+        ALERT_KIND_CAP_REACHED,
+    ],
+)
+def test_alert_wants_notify_bot_for_kinds_that_carry_no_case(store, kind):
+    assert alert_wants_notify_bot(store, _alert(kind=kind)) is True
+
+
+@pytest.mark.parametrize(
+    "kind", [ALERT_KIND_GROUP_MERGED, ALERT_KIND_REMEDIATION_REQUEST_FAILED]
+)
+def test_alert_wants_notify_bot_is_false_for_message_scoped_kinds(store, kind):
+    assert alert_wants_notify_bot(store, _alert(kind=kind, case_id=1)) is False
+
+
+@pytest.mark.parametrize(
+    "kind", [ALERT_KIND_CASE_OPEN, ALERT_KIND_CASE_RESOLVED, ALERT_KIND_DIAGNOSIS]
+)
+def test_alert_wants_notify_bot_follows_the_cases_own_rule(store, kind):
+    d6c, _ = store.upsert_case(
+        case_key="unheard_type:management_fraction_rejected",
+        rule="D6c",
+        severity="high",
+        now=NOW,
+    )
+    d1a, _ = store.upsert_case(
+        case_key="mgmt:1:full_exit",
+        rule="D1a",
+        severity="high",
+        now=NOW,
+        raw_message_id=1,
+    )
+
+    assert alert_wants_notify_bot(store, _alert(kind=kind, case_id=d6c.id)) is True
+    assert alert_wants_notify_bot(store, _alert(kind=kind, case_id=d1a.id)) is False
+
+
+def test_alert_wants_notify_bot_follows_a_merged_rule_list(store):
+    """A case that D6c and another rule share must still travel as one -- the
+    design's "同一个案件的开案、诊断、已结束始终走同一个 bot" rule reads the
+    case's combined ``rule`` string, not just its first component.
+    """
+
+    case, _ = store.upsert_case(
+        case_key="unheard_type:x", rule="D5b", severity="high", now=NOW
+    )
+    store.upsert_case(
+        case_key="unheard_type:x",
+        rule="D6c",
+        severity="high",
+        now=NOW,
+        evidence={"rules": ["D5b", "D6c"]},
+    )
+    refreshed = store.get_case(case.id)
+    assert "D6c" in refreshed.rule.split("+")
+
+    assert (
+        alert_wants_notify_bot(store, _alert(kind=ALERT_KIND_CASE_OPEN, case_id=case.id))
+        is True
+    )
+
+
+def test_alert_wants_notify_bot_defaults_false_for_an_unknown_case(store):
+    assert (
+        alert_wants_notify_bot(store, _alert(kind=ALERT_KIND_CASE_OPEN, case_id=99999))
+        is False
+    )
+
+
+def test_deliver_pending_alerts_uses_the_default_sender_with_no_router(store):
+    store.enqueue_alert(kind=ALERT_KIND_CASE_OPEN, body="a", now=NOW, dedupe_key="a")
+    sent = []
+
+    deliver_pending_alerts(store, now=NOW, sender=sent.append)
+
+    assert sent == ["a"]
+
+
+def test_deliver_pending_alerts_routes_each_alert_through_sender_for(store):
+    d6c, _ = store.upsert_case(
+        case_key="unheard_type:x", rule="D6c", severity="high", now=NOW
+    )
+    d1a, _ = store.upsert_case(
+        case_key="mgmt:1:full_exit",
+        rule="D1a",
+        severity="high",
+        now=NOW,
+        raw_message_id=1,
+    )
+    store.enqueue_alert(
+        kind=ALERT_KIND_CASE_OPEN,
+        body="d6c body",
+        now=NOW,
+        case_id=d6c.id,
+        dedupe_key="d6c",
+    )
+    store.enqueue_alert(
+        kind=ALERT_KIND_CASE_OPEN,
+        body="d1a body",
+        now=NOW,
+        case_id=d1a.id,
+        dedupe_key="d1a",
+    )
+    event_sent, notify_sent = [], []
+
+    deliver_pending_alerts(
+        store,
+        now=NOW,
+        sender=event_sent.append,
+        sender_for=lambda alert: (
+            notify_sent.append if alert_wants_notify_bot(store, alert) else None
+        ),
+    )
+
+    assert notify_sent == ["d6c body"]
+    assert event_sent == ["d1a body"]

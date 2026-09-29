@@ -54,6 +54,7 @@ from telegram_kol_research.oncall_state import (
     RECOGNITION_CASE_PREFIX,
     SEALED_LANE_CASE_PREFIX,
     UNHEARD_INCIDENT_CASE_PREFIX,
+    UNHEARD_INCIDENT_TYPE_CASE_PREFIX,
     VOIDED_MESSAGE_CASE_PREFIX,
     OncallStateStore,
 )
@@ -166,6 +167,21 @@ SEALED_LANE_RELEASED_STATE = "succeeded"
 #: up, and the severities worth waking somebody for.
 INCIDENT_PENDING_STATUS = "pending"
 INCIDENT_LOUD_SEVERITIES = frozenset({"high", "critical"})
+
+#: 2026-09-29 (event-bot quality design, section 1.2 A.1): two incident types
+#: are *deliberately* never pushed to Telegram
+#: (``config.TELEGRAM_QUIET_INCIDENT_TYPES``, since 2026-09-22), and their
+#: ``notification_status``/``notified_at`` therefore never moves. D6c's "never
+#: notified" test was reading that as "nobody was told" forever -- production
+#: incidents 2396-2406 opened nine D6c cases in one nine-hour window purely
+#: because ``authoritative_recognition_failed`` and ``context_worker_exhausted``
+#: rows exist by design in that state. This module may not import
+#: ``config.py`` (architecture boundary), so the two strings are repeated here;
+#: ``test_oncall_detector.py::test_d6c_quiet_types_match_config`` imports both
+#: modules and pins them equal so the two lists cannot drift apart.
+D6C_QUIET_BY_DESIGN_INCIDENT_TYPES = frozenset(
+    {"authoritative_recognition_failed", "context_worker_exhausted"}
+)
 
 #: D6a's horizon, and the only one: all three classes of sealed lane use it, and
 #: both of the rule's age tests (``updated_at`` for "nothing has happened" and
@@ -343,6 +359,12 @@ class DetectorConfig:
     sealed_lane_stuck_after: timedelta = SEALED_LANE_STUCK_AFTER
     incident_still_occurring_within: timedelta = INCIDENT_STILL_OCCURRING_WITHIN
     incident_notification_silence: timedelta = INCIDENT_NOTIFICATION_SILENCE
+    #: 2026-09-29 (event-bot quality design 1.2 A.2). Worker delivery of a
+    #: freshly-written incident measured 9-42 seconds in production
+    #: (incidents 2407/2417/2418); D6c and the delivery loop were racing, not
+    #: "nobody heard it". Ten minutes is comfortably past that and still far
+    #: inside the one-hour "still occurring" window.
+    incident_never_notified_grace: timedelta = timedelta(minutes=10)
     case_stale_after: timedelta = timedelta(hours=6)
     #: How recently reconcile must have rewritten a binding for "open" to be a
     #: verified fact rather than an assumption. Matches
@@ -1551,6 +1573,14 @@ def _unheard_incident_observations(
     consistent with a failure that stopped a week ago, and nobody needs waking
     for that. ``last_occurred_at`` inside the window is the fact that makes it
     urgent.
+
+    2026-09-29: one case per *incident type*, not per incident row (event-bot
+    quality design 1.2 A.1.3) -- "X 类告警送不出去" is a fact about the type,
+    and five incidents of the same type inside the window used to open five
+    cases (09-28 case 17-25 alone were nine cases for two types). Rows are
+    grouped by ``incident_type`` here; each group's evidence lists up to ten
+    incident ids and carries the *latest* row's severity/summary/timestamps
+    plus the *earliest* ``first_occurred_at`` in the group.
     """
 
     rows = reader.query(
@@ -1562,46 +1592,64 @@ def _unheard_incident_observations(
             int(config.incident_limit),
         ),
     )
-    observations: list[_Observation] = []
-    seen: set[int] = set()
+    hits_by_type: dict[str, list[tuple[sqlite3.Row, str]]] = {}
     for row in rows:
         reason_code = _unheard_incident_reason(row, now=now, config=config)
         if reason_code is None:
             continue
-        incident_id = int(row["id"])
-        seen.add(incident_id)
-        notified_at = as_utc(row["notified_at"])
+        incident_type = str(row["incident_type"] or "")
+        hits_by_type.setdefault(incident_type, []).append((row, reason_code))
+
+    observations: list[_Observation] = []
+    for incident_type, hits in hits_by_type.items():
+        # ``rows`` is ordered by id ascending, so the last hit for this type
+        # is the newest incident -- its summary/severity/notified_at are what
+        # the alert should show.
+        latest_row, latest_reason = hits[-1]
+        incident_ids = sorted(int(row["id"]) for row, _reason in hits)
+        first_occurred_values = [
+            as_utc(row["first_occurred_at"])
+            for row, _reason in hits
+            if row["first_occurred_at"] is not None
+        ]
+        earliest_first_occurred = (
+            min(first_occurred_values) if first_occurred_values else None
+        )
+        notified_at = as_utc(latest_row["notified_at"])
         observations.append(
             _Observation(
-                case_key=_unheard_incident_case_key(incident_id),
+                case_key=_unheard_incident_type_case_key(incident_type),
                 rule="D6c",
                 severity="high",
-                reason_code=reason_code,
+                reason_code=latest_reason,
                 evidence={
-                    "kind": "unheard_incident",
-                    "reason_code": reason_code,
-                    "incident_id": incident_id,
-                    "incident_type": str(row["incident_type"] or ""),
-                    "incident_severity": str(row["severity"] or ""),
-                    "source_kind": str(row["source_kind"] or ""),
-                    "source_record_id": str(row["source_record_id"] or "")[:64],
+                    "kind": "unheard_incident_type",
+                    "reason_code": latest_reason,
+                    "incident_type": incident_type,
+                    # Capped at ten (design 1.2 A.1.3): the alert names what
+                    # is happening, not an exhaustive audit trail.
+                    "incident_ids": incident_ids[:10],
+                    "incident_count": len(incident_ids),
+                    "incident_severity": str(latest_row["severity"] or ""),
+                    "source_kind": str(latest_row["source_kind"] or ""),
+                    "source_record_id": str(latest_row["source_record_id"] or "")[:64],
                     "repeat_count": (
-                        int(row["repeat_count"])
-                        if row["repeat_count"] is not None
+                        int(latest_row["repeat_count"])
+                        if latest_row["repeat_count"] is not None
                         else None
                     ),
-                    "first_occurred_at": _isoformat(as_utc(row["first_occurred_at"])),
-                    "last_occurred_at": _isoformat(as_utc(row["last_occurred_at"])),
+                    "first_occurred_at": _isoformat(earliest_first_occurred),
+                    "last_occurred_at": _isoformat(as_utc(latest_row["last_occurred_at"])),
                     "notified_at": _isoformat(notified_at),
                     "minutes_since_last_occurrence": _minutes(
-                        _age(now, as_utc(row["last_occurred_at"]))
+                        _age(now, as_utc(latest_row["last_occurred_at"]))
                     ),
                     "minutes_since_notified": _minutes(_age(now, notified_at)),
-                    "summary": str(row["redacted_summary"] or "")[:400],
+                    "summary": str(latest_row["redacted_summary"] or "")[:400],
                 },
             )
         )
-    observations.extend(_unheard_incident_clears(reader, store, now, config, seen))
+    observations.extend(_unheard_incident_clears(reader, store, now, config, hits_by_type))
     return observations
 
 
@@ -1617,12 +1665,27 @@ def _unheard_incident_reason(
         return None
     if str(row["severity"] or "").strip().lower() not in INCIDENT_LOUD_SEVERITIES:
         return None
+    incident_type = str(row["incident_type"] or "").strip()
+    if incident_type in D6C_QUIET_BY_DESIGN_INCIDENT_TYPES:
+        # 2026-09-29: these two types are pending/never-notified *by design*
+        # (see the constant's docstring) -- D6c saying so every round is not
+        # news. authoritative_recognition_failed is covered by D3 when the
+        # group holds a position; context_worker_exhausted's consequence (the
+        # message never got processed) is covered by D4/D1/D2.
+        return None
     last_occurred = as_utc(row["last_occurred_at"])
     age = _age(now, last_occurred)
     if age is None or age > config.incident_still_occurring_within:
         return None
     notified_at = as_utc(row["notified_at"])
     if notified_at is None:
+        first_occurred = as_utc(row["first_occurred_at"])
+        grace_age = _age(now, first_occurred)
+        # An unreadable first_occurred_at fails toward reporting, not toward
+        # silence -- this module would rather over-alert than hide a real
+        # "never notified" row behind a timestamp it could not parse.
+        if grace_age is not None and grace_age < config.incident_never_notified_grace:
+            return None
         return REASON_INCIDENT_NEVER_NOTIFIED
     silence = _age(now, notified_at)
     if silence is not None and silence >= config.incident_notification_silence:
@@ -1635,27 +1698,42 @@ def _unheard_incident_clears(
     store: OncallStateStore,
     now: datetime,
     config: DetectorConfig,
-    exclude: set[int],
+    hits_by_type: dict[str, list[tuple[sqlite3.Row, str]]],
 ) -> list[_Observation]:
-    """Stopped happening, or somebody was told: either way the case is over."""
+    """Stopped happening, or somebody was told: either way the case is over.
+
+    Handles both case-key generations at once (2026-09-29): a type-keyed case
+    clears when this round's sweep found no more qualifying incidents of that
+    type (the same bounded-sweep tolerance every other D6 rule already
+    accepts); an id-keyed case from before the 2026-09-29 change is rechecked
+    by point query exactly as before, so incidents already open under the old
+    key -- including ones that are now quiet-by-design and would otherwise
+    never clear -- still resolve normally. Their "already ended" alert is
+    suppressed at compose time (``oncall_alerts``), not here: the object never
+    should have opened a case, so telling anyone it closed is noise.
+    """
 
     clears: list[_Observation] = []
     for case in store.open_cases():
-        if not case.case_key.startswith(UNHEARD_INCIDENT_CASE_PREFIX):
-            continue
-        incident_id = _case_key_object_id(case.case_key, UNHEARD_INCIDENT_CASE_PREFIX)
-        if incident_id is None or incident_id in exclude:
-            continue
-        row = reader.read_one("runtime_incidents", _INCIDENT_COLUMNS, incident_id)
-        if (
-            row is not None
-            and _unheard_incident_reason(row, now=now, config=config) is not None
-        ):
-            # The sweep's limit hid it this round; the condition still holds.
-            continue
-        clears.append(
-            _Observation(case_key=case.case_key, rule=None, cleared=True)
-        )
+        if case.case_key.startswith(UNHEARD_INCIDENT_TYPE_CASE_PREFIX):
+            incident_type = case.case_key.removeprefix(UNHEARD_INCIDENT_TYPE_CASE_PREFIX)
+            if incident_type in hits_by_type:
+                continue
+            clears.append(_Observation(case_key=case.case_key, rule=None, cleared=True))
+        elif case.case_key.startswith(UNHEARD_INCIDENT_CASE_PREFIX):
+            incident_id = _case_key_object_id(case.case_key, UNHEARD_INCIDENT_CASE_PREFIX)
+            if incident_id is None:
+                continue
+            row = reader.read_one("runtime_incidents", _INCIDENT_COLUMNS, incident_id)
+            if (
+                row is not None
+                and _unheard_incident_reason(row, now=now, config=config) is not None
+            ):
+                # The sweep's limit hid it this round; the condition still holds.
+                continue
+            clears.append(
+                _Observation(case_key=case.case_key, rule=None, cleared=True)
+            )
     return clears
 
 
@@ -2488,6 +2566,10 @@ def _voided_message_case_key(raw_message_id: Any) -> str:
 
 def _unheard_incident_case_key(incident_id: Any) -> str:
     return f"{UNHEARD_INCIDENT_CASE_PREFIX}{int(incident_id)}"
+
+
+def _unheard_incident_type_case_key(incident_type: str) -> str:
+    return f"{UNHEARD_INCIDENT_TYPE_CASE_PREFIX}{incident_type}"
 
 
 def _case_key_object_id(case_key: str, prefix: str) -> int | None:

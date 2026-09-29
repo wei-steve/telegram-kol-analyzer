@@ -335,6 +335,88 @@ def test_the_existing_system_bot_is_used_when_no_oncall_bot_is_configured():
     assert (explicit.bot_token, explicit.chat_id) == ("oncall-token", "7")
 
 
+def test_the_notify_bot_is_absent_unless_both_of_its_keys_are_set():
+    """2026-09-29 (event-bot quality design section 6): the pair is optional
+    and its absence must reproduce today's one-bot behaviour exactly.
+    """
+    from telegram_kol_research.oncall_service import load_oncall_config
+
+    neither = load_oncall_config({"TELEGRAM_KOL_ONCALL_MODE": "notify"})
+    assert neither.can_send_notify is False
+
+    only_token = load_oncall_config(
+        {
+            "TELEGRAM_KOL_ONCALL_MODE": "notify",
+            "TELEGRAM_KOL_ONCALL_NOTIFY_BOT_TOKEN": "notify-token",
+        }
+    )
+    assert only_token.can_send_notify is False
+
+    both = load_oncall_config(
+        {
+            "TELEGRAM_KOL_ONCALL_MODE": "notify",
+            "TELEGRAM_KOL_ONCALL_NOTIFY_BOT_TOKEN": "notify-token",
+            "TELEGRAM_KOL_ONCALL_NOTIFY_CHAT_ID": "99",
+        }
+    )
+    assert both.can_send_notify is True
+    assert (both.notify_bot_token, both.notify_chat_id) == ("notify-token", "99")
+
+
+def test_a_round_routes_a_d6c_case_to_the_notify_sender_and_d1_to_the_default(
+    production, tmp_path
+):
+    """End-to-end through ``run_oncall_round``: with both bots configured, a
+    D6c opening reaches the notify sender and a message-scoped opening reaches
+    the default one -- and neither reaches the other.
+    """
+    from telegram_kol_research.oncall_service import OncallConfig, run_oncall_round
+    from telegram_kol_research.oncall_detector import DetectorConfig
+    from telegram_kol_research.oncall_state import OncallStateStore
+
+    config = OncallConfig(mode=MODE_NOTIFY, bot_token="t", chat_id="1")
+    with OncallStateStore(tmp_path / "state.db") as store:
+        run_oncall_round(
+            store=store,
+            database_path=production.path,
+            config=config,
+            detector_config=DetectorConfig(),
+            now=NOW,
+            sender=lambda _t: None,
+            worker_health_probe=None,
+        )  # prime watermarks + absorb the daily "all clear"
+        production.add_runtime_incident(
+            source_kind="raw_message",
+            source_record_id="1",
+            incident_type="management_fraction_rejected",
+            severity="high",
+            status="pending",
+            first_occurred_at=NOW - timedelta(minutes=20),
+            last_occurred_at=NOW - timedelta(minutes=2),
+            notified_at=None,
+        )
+        build_open_position_case(production)
+
+        event_sent, notify_sent = [], []
+        run_oncall_round(
+            store=store,
+            database_path=production.path,
+            config=config,
+            detector_config=DetectorConfig(),
+            now=NOW + timedelta(minutes=1),
+            sender=event_sent.append,
+            notify_sender=notify_sent.append,
+            worker_health_probe=None,
+        )
+
+    assert any("告警在喊，没人听见" in body for body in notify_sent)
+    assert not any("告警在喊，没人听见" in body for body in event_sent)
+    # The D1a/D1d management case (build_open_position_case) is message-scoped
+    # and must stay on the default (event) sender, never the notify one.
+    assert any("2484" in body for body in event_sent)
+    assert not any("2484" in body for body in notify_sent)
+
+
 # ------------------------------------------------------ codex (phase 2)
 #
 # The real ``codex`` binary is never invoked: every test below drives the
@@ -588,6 +670,32 @@ def run_detection(production, store, now):
     return run_detection_round(
         reader_factory=lambda: ProductionReader(production.path), store=store, now=now
     )
+
+
+def test_r1e_a_d6c_case_never_enters_the_codex_queue(production, tmp_path, spool):
+    """R1-e (event-bot quality design 1.2 A.1.4): D6c's problem is a delivery
+    gap, not anything a message/position read can diagnose -- 2026-09-28 spent
+    17 of the day's Codex calls on D6c alone (normal: 2-3). Before the fix
+    this case would be queued like any other open case; after, it never is.
+    """
+    from telegram_kol_research.oncall_service import run_codex_cycle
+    from telegram_kol_research.oncall_state import OncallStateStore
+
+    config = codex_config(spool_path=str(spool.root))
+    with OncallStateStore(tmp_path / "state.db") as store:
+        store.upsert_case(
+            case_key="unheard_type:management_fraction_rejected",
+            rule="D6c",
+            severity="high",
+            now=NOW,
+            evidence={"kind": "unheard_incident_type", "incident_type": "x"},
+        )
+        run_codex_cycle(
+            store, config=config, database_path=production.path, now=NOW, spool=spool
+        )
+
+        assert store.queued_diagnoses() == ()
+        assert store.get_diagnosis(1) is None
 
 
 def test_only_one_call_is_ever_outstanding(production, tmp_path, spool):

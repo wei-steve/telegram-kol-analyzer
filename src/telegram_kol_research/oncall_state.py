@@ -50,7 +50,17 @@ VOIDED_MESSAGE_CASE_PREFIX = "voided:"
 #: Rule D6c: one case per runtime incident that is still happening and that
 #: nobody has been told about lately. Keyed by incident id, not fingerprint:
 #: the id is what the operator bot's own reports show.
+#:
+#: 2026-09-29: superseded by :data:`UNHEARD_INCIDENT_TYPE_CASE_PREFIX` for new
+#: cases (event-bot quality design, section 1.2 A.3) -- D6c is a statement
+#: about a *type* of alarm going unheard, and five incidents of the same type
+#: inside one hour used to open five cases. The old prefix is kept so that
+#: cases already open in production under it can still be found and resolved
+#: by :func:`_unheard_incident_clears`; no new case is ever created under it.
 UNHEARD_INCIDENT_CASE_PREFIX = "unheard:"
+#: Rule D6c, 2026-09-29 on: one case per *incident type* that is still
+#: happening and unheard, not one per incident row. See the note above.
+UNHEARD_INCIDENT_TYPE_CASE_PREFIX = "unheard_type:"
 
 #: Rule D6a's three ways for one lane to stay shut. They are the same problem --
 #: nothing of this group, symbol and side can get in -- but not the same cause,

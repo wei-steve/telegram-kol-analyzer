@@ -506,7 +506,18 @@ def _format_proposal_text(
         f"消息：{group_label} #{raw_message_id}（{_beijing_hhmm(posted_at)}）",
         f"将执行：{symbol} {side} {action_zh}",
         "依据：这些数字由系统从生产数据重算，不来自 AI",
-        f"参考：Codex 意见见值守 #{case_no} 的诊断消息（仅供参考，不影响按钮）",
+        # 2026-09-29 (event-bot quality design 1.2 A.4): this used to promise
+        # a diagnosis exists ("见值守 #N 的诊断消息") -- 09-28 case 32 proved
+        # that wrong: its diagnosis finished but its message never went out
+        # (capped), so the proposal pointed at a message nobody ever got. The
+        # watcher's remediation request carries exactly three identifier
+        # fields on purpose (``oncall_service._request_remediation_proposal``
+        # docstring); teaching the worker "was this case's diagnosis queued"
+        # would mean widening that contract and touching the endpoint that
+        # reads it on the other side, which is out of this change's scope. So
+        # the line makes no promise: it names what a diagnosis would look
+        # like if one shows up, without asserting one is coming.
+        f"参考：Codex 诊断如有，会以「🔎 值守诊断 #{case_no}」单独发送（仅供参考，不影响按钮）",
     ]
     if shadow:
         lines.append(f"消息的补救窗口到 {_beijing_hhmm(window_end)}")

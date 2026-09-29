@@ -34,9 +34,11 @@ from telegram_kol_research.oncall_alerts import (
     ALERT_KIND_REMEDIATION_REQUEST_FAILED,
     AlertPolicy,
     TelegramAlertSender,
+    alert_wants_notify_bot,
     beijing_date,
     codex_daily_cap_note,
     codex_unavailable_note,
+    compose_backfill_alerts,
     compose_case_alerts,
     compose_codex_state_alert,
     compose_diagnosis_alert,
@@ -97,6 +99,15 @@ ENV_CHAT_ID = "TELEGRAM_KOL_ONCALL_CHAT_ID"
 #: process, which is the independence that matters.
 ENV_SYSTEM_BOT_TOKEN = "TELEGRAM_KOL_SYSTEM_BOT_TOKEN"
 ENV_SYSTEM_BOT_CHAT_ID = "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID"
+#: 2026-09-29 (event-bot quality design 1.2 A.3 / section 6). Optional: when
+#: either half is blank the watcher sends everything through the one bot
+#: above, exactly as before this pair existed. Configured, the two bots split
+#: by rule (:func:`telegram_kol_research.oncall_alerts.alert_wants_notify_bot`)
+#: -- D6c/health/daily-summary/Codex-state/cap-reached go here ("Kol运行通
+#: 知"), and D1-D3/D6a/D6b and their diagnosis/resolved/remediation-failure
+#: stay on the bot above ("Kol事件处理").
+ENV_NOTIFY_BOT_TOKEN = "TELEGRAM_KOL_ONCALL_NOTIFY_BOT_TOKEN"
+ENV_NOTIFY_CHAT_ID = "TELEGRAM_KOL_ONCALL_NOTIFY_CHAT_ID"
 EXIT_CONFIG = 78  # EX_CONFIG; the unit lists it in RestartPreventExitStatus
 ENV_WORKER_HEALTH_URL = "TELEGRAM_KOL_ONCALL_WORKER_HEALTH_URL"
 ENV_DAILY_CAP = "TELEGRAM_KOL_ONCALL_DAILY_ALERT_CAP"
@@ -154,6 +165,10 @@ class OncallConfig:
     mode: str = MODE_OFF
     bot_token: str = ""
     chat_id: str = ""
+    #: 2026-09-29. Both blank (the default) means "no second bot" -- see
+    #: :data:`ENV_NOTIFY_BOT_TOKEN`.
+    notify_bot_token: str = ""
+    notify_chat_id: str = ""
     worker_health_url: str = ""
     daily_alert_cap: int = 30
     codex_mode: str = CODEX_MODE_OFF
@@ -170,6 +185,16 @@ class OncallConfig:
     @property
     def can_send(self) -> bool:
         return self.mode == MODE_NOTIFY and bool(self.bot_token) and bool(self.chat_id)
+
+    @property
+    def can_send_notify(self) -> bool:
+        """Whether the second ("运行通知") bot is configured and usable."""
+
+        return (
+            self.mode == MODE_NOTIFY
+            and bool(self.notify_bot_token)
+            and bool(self.notify_chat_id)
+        )
 
     @property
     def remediation_enabled(self) -> bool:
@@ -245,6 +270,8 @@ def load_oncall_config(env: Mapping[str, str] | None = None) -> OncallConfig:
             str(source.get(ENV_CHAT_ID, "") or "").strip()
             or str(source.get(ENV_SYSTEM_BOT_CHAT_ID, "") or "").strip()
         ),
+        notify_bot_token=str(source.get(ENV_NOTIFY_BOT_TOKEN, "") or "").strip(),
+        notify_chat_id=str(source.get(ENV_NOTIFY_CHAT_ID, "") or "").strip(),
         worker_health_url=str(source.get(ENV_WORKER_HEALTH_URL, "") or "").strip(),
         daily_alert_cap=max(1, cap),
         codex_mode=codex_mode,
@@ -462,6 +489,16 @@ def _diagnosis_candidates(store: OncallStateStore, *, now: datetime) -> list[Any
             opened = case.first_seen_at
             if opened is None or (now - opened) < HEALTH_DIAGNOSIS_DELAY:
                 continue
+        if "D6c" in str(case.rule or "").split("+"):
+            # 2026-09-29 (event-bot quality design 1.2 A.1.4): D6c's problem
+            # is "this alert type's delivery/configuration is broken", not
+            # anything about a message or a position. Codex reads messages and
+            # bindings and has nothing useful to say about a delivery gap; on
+            # 2026-09-28 D6c cases alone drove 17 of the day's Codex calls
+            # (normal days: 2-3), most of it wasted diagnosis budget. The
+            # opening alert already states the type, the record ids and how
+            # long it has gone unheard.
+            continue
         candidates.append(case)
     return candidates
 
@@ -991,6 +1028,7 @@ def run_oncall_round(
     spool: Spool | None = None,
     casefile_config: CasefileConfig | None = None,
     journal_runner: Callable[..., str] | None = None,
+    notify_sender: Callable[[str], None] | None = None,
 ) -> RoundOutcome:
     """Detect, compose, deliver. One round, no sleeping, no process concerns.
 
@@ -1022,6 +1060,16 @@ def run_oncall_round(
         policy=policy,
         codex_note=codex_note,
     )
+    try:
+        # 2026-09-29 (event-bot quality design 1.2 A.2): a second chance, every
+        # round, for a case whose opening alert was capped away and is still
+        # open. Never a gate on the round -- a bug here must not stop the
+        # normal open/resolved alerts composed just above.
+        compose_backfill_alerts(store, now=now, policy=policy)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - a missed backfill is not a missed alert
+        logger.exception("oncall backfill alert composition failed")
     try:
         # Deliberately *after* the case-open alert is composed (spec 3.2 /
         # 5.1: "先建案告警，再请求") and independently wrapped: a network
@@ -1061,7 +1109,15 @@ def run_oncall_round(
             "read_failed_rounds": store.get_int_meta(COUNTER_READ_FAILED_ROUNDS, 0),
         },
     )
-    deliver_pending_alerts(store, now=now, sender=sender)
+    sender_for = None
+    if notify_sender is not None:
+        # 2026-09-29 (event-bot quality design 1.2 A.3): route each pending
+        # alert by its own kind/case rule, not by a blanket switch -- see
+        # ``alert_wants_notify_bot``'s docstring for the exact split.
+        def sender_for(alert: Any) -> Callable[[str], None] | None:
+            return notify_sender if alert_wants_notify_bot(store, alert) else None
+
+    deliver_pending_alerts(store, now=now, sender=sender, sender_for=sender_for)
     return outcome
 
 
@@ -1077,6 +1133,7 @@ def run_oncall_watch(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleeper: Callable[[float], None] = time.sleep,
     sender: Callable[[str], None] | None = None,
+    notify_sender: Callable[[str], None] | None = None,
     spool: Spool | None = None,
     journal_runner: Callable[..., str] | None = None,
 ) -> dict[str, Any]:
@@ -1106,6 +1163,16 @@ def run_oncall_watch(
         ).send
     elif settings.mode != MODE_NOTIFY:
         sender = None
+    if notify_sender is None and settings.can_send_notify:
+        # 2026-09-29: the second, optional bot -- absent unless both
+        # TELEGRAM_KOL_ONCALL_NOTIFY_BOT_TOKEN/_CHAT_ID are set, in which case
+        # every alert is routed (``alert_wants_notify_bot``); left ``None``
+        # here, every alert keeps going through ``sender`` alone.
+        notify_sender = TelegramAlertSender(
+            bot_token=settings.notify_bot_token, chat_id=settings.notify_chat_id
+        ).send
+    elif settings.mode != MODE_NOTIFY:
+        notify_sender = None
 
     probe = build_worker_health_probe(settings.worker_health_url)
     database = Path(database_path)
@@ -1127,6 +1194,7 @@ def run_oncall_watch(
                     detector_config=detector,
                     now=now,
                     sender=sender,
+                    notify_sender=notify_sender,
                     worker_health_probe=probe,
                     spool=spool,
                     journal_runner=journal_runner,
