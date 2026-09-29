@@ -101,6 +101,11 @@ from telegram_kol_research.break_even_reference import (
     planned_tpsl_reference_fields,
     resolve_break_even_reference,
 )
+from telegram_kol_research.management_add_position_rejection import (
+    explicit_stop_worse_than_fill,
+    find_rejected_add_position_before,
+)
+from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.management_price_plausibility import (
     dispose_pending_break_even_prices,
     record_price_disposed,
@@ -870,8 +875,32 @@ def _plan_strategy_management_batch_locked(
     else:
         effective_action_name, effective_fraction = intent, None
 
+    add_position_rejection_evidence = None
+    if (
+        intent == "adjust_stop_loss"
+        and effective_action_name == "adjust_stop_loss"
+        and candidate.stop_loss_text not in (None, "")
+    ):
+        effective_action_name, add_position_rejection_evidence = (
+            _redirect_stop_worse_than_fill_after_rejected_add(
+                session_factory,
+                identity=identity,
+                lifecycle=lifecycle,
+                economics=economics,
+                candidate=candidate,
+                default_effective_action=effective_action_name,
+                now=now,
+            )
+        )
+        if add_position_rejection_evidence is not None:
+            effective_fraction = None
+
     stop_gate_evidence = None
-    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
+    if (
+        intent == "adjust_stop_loss"
+        and effective_action_name == "adjust_stop_loss"
+        and candidate.stop_loss_text not in (None, "")
+    ):
         gate = validate_management_stop(
             action=intent, stop_mode="explicit_price", stop_price=candidate.stop_loss_text,
             stop_price_source=candidate.stop_price_source,
@@ -1202,7 +1231,11 @@ def _plan_strategy_management_batch_locked(
             if pos_id not in capability_deferred_pos_ids
         }
 
-    if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
+    if (
+        intent == "adjust_stop_loss"
+        and effective_action_name == "adjust_stop_loss"
+        and candidate.stop_loss_text not in (None, "")
+    ):
         explicit_stop = Decimal(str(candidate.stop_loss_text))
         verified_stops: list[Decimal] = []
         for protection in protection_by_pos_id.values():
@@ -1232,7 +1265,18 @@ def _plan_strategy_management_batch_locked(
 
     break_even_reference = None
     stop_ladder_evidence = None
-    if intent in IMPLICIT_STOP_ACTIONS:
+    if (
+        intent in IMPLICIT_STOP_ACTIONS
+        # Q1 patch: an ``adjust_stop_loss`` redirected to the break-even-by-
+        # market action still carries the original ``intent``, so it is not
+        # itself a member of ``IMPLICIT_STOP_ACTIONS`` -- but it needs the
+        # exact same strategy-price reference the native
+        # ``move_stop_to_break_even`` path computes here, or the leg's
+        # ``planned_tpsl_json`` would carry no reference at all and
+        # ``break_even_target_price`` would fall back to our own fill, which
+        # is precisely the price this redirect exists to avoid.
+        or effective_action_name == BREAK_EVEN_BY_MARKET_ACTION
+    ):
         (
             break_even_reference,
             price_plausibility,
@@ -1838,6 +1882,99 @@ def _stop_ladder_evidence_for_batch(
     except Exception:  # pragma: no cover - evidence never blocks a batch
         logger.warning("stop ladder evidence unavailable", exc_info=True)
         return None
+
+
+def _redirect_stop_worse_than_fill_after_rejected_add(
+    session_factory: sessionmaker,
+    *,
+    identity: _PlanningIdentity,
+    lifecycle: StrategyLifecycle,
+    economics,
+    candidate: SignalCandidate,
+    default_effective_action: str,
+    now: datetime,
+):
+    """Q1 patch: only ``adjust_stop_loss`` with an explicit price is in scope.
+
+    Two independent facts must both hold, or nothing changes and
+    ``adjust_stop_loss`` behaves exactly as it does today:
+
+    1. this lifecycle has an earlier rejected add-position instruction
+       (``management_add_position_rejection.find_rejected_add_position_before``,
+       reading only ``recognition_decisions``/``raw_messages`` -- never
+       ``resolve_management_directive`` again, and never a write); and
+    2. the message's explicit stop is worse than our own average fill --
+       lower than it for a long, higher for a short.
+
+    When both hold, the KOL's number is superseded by the strategy's
+    break-even price (the same ``BREAK_EVEN_BY_MARKET_ACTION`` path
+    ``move_stop_to_break_even`` already uses, so a target on the wrong side of
+    the market already closes the remainder at market instead of arming an
+    instantly-triggering stop -- unchanged, reused verbatim). A single ``high``
+    incident is always raised so the override is never silent.
+    """
+
+    side = str(lifecycle.side or "").lower()
+    avg_entry_price = _most_protective_entry_price(economics, side=side)
+    if avg_entry_price is None or not explicit_stop_worse_than_fill(
+        side=side, stop_price=candidate.stop_loss_text, avg_entry_price=avg_entry_price,
+    ):
+        return default_effective_action, None
+
+    with session_factory() as session:
+        evidence = find_rejected_add_position_before(
+            session,
+            chat_id=int(identity.raw_message.chat_id),
+            target_lifecycle_id=int(lifecycle.id),
+            signal_at=lifecycle.signal_at,
+        )
+    if evidence is None:
+        return default_effective_action, None
+
+    summary = json.dumps(
+        {
+            "component": "strategy_management",
+            "reason_code": "management_add_position_rejected_stop_superseded",
+            "raw_message_id": int(identity.raw_message.id),
+            "operation": f"raw_message_{int(identity.raw_message.id)}",
+            "impact": (
+                f"explicit_stop_superseded_by_strategy_price:"
+                f"rejected_add_raw_message_{evidence.raw_message_id}"
+            ),
+        },
+        ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+    )
+    record_runtime_incident(
+        session_factory,
+        source_kind="signal_candidate",
+        source_record_id=str(int(candidate.id)),
+        incident_type="management_add_position_rejected_stop_superseded",
+        severity="high",
+        fingerprint=hashlib.sha256(
+            f"management_add_position_rejected_stop_superseded:"
+            f"{int(candidate.id)}:{evidence.raw_message_id}".encode()
+        ).hexdigest(),
+        redacted_summary=summary,
+        occurred_at=now,
+        feature_policy_version="mia-add-position-rejection-guard-v1",
+        prompt_version="none",
+        tool_policy_version="no-exchange-write",
+        diagnosis_json=json.dumps(
+            {
+                "observed_state": {
+                    "rejected_add_position": evidence.as_evidence(),
+                    "message_stop_price": candidate.stop_loss_text,
+                    "our_avg_entry_price": avg_entry_price,
+                    "side": side,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        evidence_refs_json=json.dumps(
+            [f"raw_message:{evidence.raw_message_id}"]
+        ),
+    )
+    return BREAK_EVEN_BY_MARKET_ACTION, evidence
 
 
 def _identity_without_explicit_break_even_prices(

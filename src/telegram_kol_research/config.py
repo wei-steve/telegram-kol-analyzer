@@ -346,6 +346,16 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # ``management_fraction_gate.record_fraction_rejection``, so this
         # adds no delivery for them.
         "management_fraction_rejected",
+        # 2026-09-29 Mia design Q1 patch: a strategy that already had a
+        # rejected add-position instruction (``risk_increasing_fanout_
+        # forbidden`` / ``lifecycle_apply_failed``) later gets an explicit
+        # ``adjust_stop_loss`` price worse than our own fill -- the exact
+        # shape that would have left binding 385 on a loss the KOL never
+        # intended once it added at a worse price than we did. The stop is
+        # redirected to the strategy's break-even price instead of the
+        # message's number, so a person must see every occurrence rather than
+        # discover it from the fill.
+        "management_add_position_rejected_stop_superseded",
     }
 )
 
