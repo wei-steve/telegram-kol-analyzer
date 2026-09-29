@@ -20,7 +20,7 @@
 |---|---|---|
 | 阶段 1 · 影子 | L1（additive dormant） | `completed`（代码 `5ca19513`，提示词 v9 = `ai_prompt_versions.id=10` 已发布，观察窗通过） |
 | 阶段 2 · 观察与人工核准 | L0 | `completed`（2026-09-29：四张表已出；A、B 两组共 44 条人工核准已写入标注表） |
-| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 代码候选已变基到 `c40fb421` 之上，末个代码提交 `386bf8d7` 全量通过，未部署；批次 B 提示词待 v11 满一周） |
+| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 代码候选已变基到 `c40fb421` 之上，末个代码提交 `2cdb8de4` 全量通过，未部署；批次 B 提示词待 v11 满一周） |
 | 阶段 4 · 收口 | 以后 | `planned` |
 
 **仓库层面的一件事（2026-09-24，与本设计无关但影响所有会话）**：
@@ -680,6 +680,24 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
 | 18602 | `策略管理 / exact / 1291`，`cancel_entry → 1291`（0.99），与 v9 一致 | R1 仍成立：首轮自带撤单目标，`cancellation_language` 可删 |
 | 19016 | `是策略`（strategy 完整、止损 null）+ `[策略管理 / forthcoming / ETH short]` + `entry_context.risk_multiplier = 0.1` | 违规只有 `strategy_not_allowed`，**非致命**；校验器通过，不被 fail-closed；forthcoming 不触发上下文。这正是方案 §3.1 把 `strategy_not_allowed` 定为非致命的那个形状——若判致命，v11 下每条「无止损的是策略」都会被整条丢掉，也会毁掉 §11 的恢复统计 |
 | 7929 / 12042 | `[闲话]`（v9 下是 `策略管理/unknown`，12042 另有 `仓位管理`） | 不再触发 `management_without_exact_target`；旧字段 `event_type = none`，兜底判据也不触发。v9 下阶段 3 会为它们各调一次上下文，v11 下不会——方向与本阶段一致（没有定量的半截消息不进管理链路） |
+
+**部署前核对：「有方向、没止损的策略不算新策略，不能下单」（调度会话要求，2026-09-29 夜）。**
+v11 下 19016 被判「是策略、止损 null」，这是提示词【两套判据刻意不一致】的合法答案，所以必须由下游确定性地拦住。逐层核对：
+
+| 层 | 位置 | 生产上是否生效 | 拦住什么 |
+|---|---|---|---|
+| 1 | `authoritative_instructions._complete_strategy`（要求 symbol/side/entry/stop_loss），经 `message_recognition.apply_authoritative_mimo_payload` 的指令契约调用 | **生效**：生产 `trading_settings` `global` 里 `multi_instruction_mode = live`、生效起点 raw 10027（按主键点查）。v8 时期的 18453/18257/17955/17956/17896 都是 `skipped / contract_invalid`，一条候选都没建，这就是观察文档 §4「8 月 4 日以后没建过生命周期」的原因 | 在建候选、建 lifecycle **之前**，整条落 `识别失败 / authoritative_instruction_contract_invalid:…strategy_incomplete` |
+| **缺口** | 同上 | payload **自带 `instructions` 列表**时，契约按给定行规范化，不从 `strategy` 造入场行，止损根本不检查；`disabled`/`shadow` 模式同理 | 之后 `_persist_ai_result` → `_ensure_lifecycle_record` 只要求 symbol 和 side，**会建出止损为空的 lifecycle** |
+| **2（新增，`2cdb8de4`）** | `message_recognition.apply_authoritative_mimo_payload` 的「是策略」分支：`_strategy_names_a_stop_loss` 为假就不调用 `_persist_ai_result`，记 `非策略 / strategy_without_stop_loss` | 所有模式、带不带 `instructions` 都生效；同一条消息里已经应用的管理动作不受影响 | 不建候选、不建 lifecycle |
+| 3 | `auto_trade_execution._auto_process_single_message_trade_signal` → `entry_price_geometry.validate_candidate_entry_price_geometry`（`REQUIRED_VALUE_MISSING`）→ `_record_entry_geometry_rejection` | 生效 | 在任何下单之前 `skipped / entry_price_geometry_required_value_missing` |
+| 4 | `deepcoin_order_builder._blocking_reason_codes`（`missing_stop_loss`）、`deepcoin_limit_entry`（`missing_stop_loss_for_protection`） | 生效 | 草稿阻断、发送前再拒一次 |
+
+新测试 `tests/test_strategy_without_stop_loss_never_opens.py`（7 条，用 19016 在 v11 下的真实输出形状）：
+- live / live + 显式 `instructions` / disabled / shadow 四种情况都**不建候选、不建 lifecycle**。其中后三种在补丁前失败（建出了候选和 lifecycle），证实了缺口。
+- 自动交易执行一遍：`orders`、`trigger_orders`、`protections` 全空，`ExecutionBinding` 为 0。这两条补丁前就通过（第 3 层拦住）。
+- 对照：同一条消息补上止损 2900 就正常建 lifecycle，证明拦的是止损而不是消息形状。
+
+全量（新的最终候选 `2cdb8de4`）：`10841 passed, 4 skipped`（886 s）。
 
 **回放 R1（18602）已完成，`cancellation_language` 可以删。** 2026-09-29 在服务器上以只读库连接、生产 v9（shared id=10、vision id=2）、`gpt-5.6-luna` 让模型重答一次，**不写任何表**（比方案批准的「提示词中心对照测试写一行」更轻）。结果：`message_classes = [策略管理 / exact / 1291 / BTC long]`，`lifecycle_event = cancel_entry → 1291`（0.99）。1291 在消息时刻（09-23 14:21:29）仍是 `pending_entry`，两分钟后（14:23:18）才入场。新判据下首轮自己就给出了撤单目标，不需要关键词触发；如果目标届时已不在候选或已终态，由两条新判据接住。
 
