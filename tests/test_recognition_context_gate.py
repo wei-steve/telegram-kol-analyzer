@@ -192,7 +192,21 @@ def test_sqlite_compat_adds_the_gate_column_to_an_existing_database(tmp_path):
 # --------------------------------------------------------------------------
 
 
-def _install_first_pass(monkeypatch, *, raw_id: int, status: str = "是策略"):
+#: Phase 3: the wording triggers are gone, so tests that need the gate to
+#: fire give the first pass a "management, target unknown" classification.
+_MANAGEMENT_UNKNOWN_CLASSES = [
+    {"class": "策略管理", "target": {"resolution": "unknown", "lifecycle_id": None}},
+    {"class": "新策略", "target": None},
+]
+
+
+def _install_first_pass(
+    monkeypatch,
+    *,
+    raw_id: int,
+    status: str = "是策略",
+    message_classes: list | None = None,
+):
     payload = (
         {}
         if status == "识别失败"
@@ -207,6 +221,11 @@ def _install_first_pass(monkeypatch, *, raw_id: int, status: str = "是策略"):
             },
             "lifecycle_event": {"event_type": "none", "confidence": 0.0},
             "confidence": 0.95,
+            **(
+                {"message_classes": message_classes}
+                if message_classes is not None
+                else {}
+            ),
         }
     )
     monkeypatch.setattr(
@@ -275,7 +294,11 @@ def test_gate_records_resolver_disabled_when_the_group_gate_is_shut(
         session.add(raw)
         session.commit()
         raw_id = int(raw.id)
-    _install_first_pass(monkeypatch, raw_id=raw_id)
+    _install_first_pass(
+        monkeypatch,
+        raw_id=raw_id,
+        message_classes=_MANAGEMENT_UNKNOWN_CLASSES,
+    )
 
     # context_resolver=None is exactly what the web and CLI entry points pass
     # when TradingSettings has the group's contextual pass switched off.
@@ -289,8 +312,7 @@ def test_gate_records_resolver_disabled_when_the_group_gate_is_shut(
 
     gate = _stored_gate(session_factory, raw_id)
     assert gate["outcome"] == "resolver_disabled"
-    assert "revision_language" in gate["triggers"]
-    assert "cancellation_language" in gate["triggers"]
+    assert gate["triggers"] == ["management_without_exact_target"]
 
 
 def test_gate_records_recognition_failed_before_any_gate_is_evaluated(
@@ -335,7 +357,11 @@ def test_gate_records_invoked_when_the_resolver_runs(tmp_path, monkeypatch):
         session.add(raw)
         session.commit()
         raw_id = int(raw.id)
-    _install_first_pass(monkeypatch, raw_id=raw_id)
+    _install_first_pass(
+        monkeypatch,
+        raw_id=raw_id,
+        message_classes=_MANAGEMENT_UNKNOWN_CLASSES,
+    )
     calls: list[tuple[str, ...]] = []
 
     def _resolver(**kwargs):
@@ -360,10 +386,10 @@ def test_gate_records_invoked_when_the_resolver_runs(tmp_path, monkeypatch):
         context_resolver=_resolver,
     )
 
-    assert calls and "revision_language" in calls[0]
+    assert calls and "management_without_exact_target" in calls[0]
     gate = _stored_gate(session_factory, raw_id)
     assert gate["outcome"] == "invoked"
-    assert "revision_language" in gate["triggers"]
+    assert "management_without_exact_target" in gate["triggers"]
 
 
 def test_gate_still_records_invoked_when_the_resolver_raises(tmp_path, monkeypatch):
@@ -384,7 +410,11 @@ def test_gate_still_records_invoked_when_the_resolver_raises(tmp_path, monkeypat
         session.add(raw)
         session.commit()
         raw_id = int(raw.id)
-    _install_first_pass(monkeypatch, raw_id=raw_id)
+    _install_first_pass(
+        monkeypatch,
+        raw_id=raw_id,
+        message_classes=_MANAGEMENT_UNKNOWN_CLASSES,
+    )
 
     def _resolver(**kwargs):
         raise RuntimeError("context provider exploded")

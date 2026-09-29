@@ -778,8 +778,6 @@ def test_context_resolution_triggers_are_closed_and_auditable():
 
     assert required is True
     assert reasons == (
-        "revision_language",
-        "entered_holder_language",
         "management_without_exact_target",
         "multiple_same_source_candidates",
         "text_image_conflict",
@@ -984,6 +982,15 @@ def test_commentary_target_contract_corrects_hold_without_business_writes(
         "strategy": {},
         "lifecycle_event": {"event_type": "none", "confidence": 0.8},
         "confidence": 0.8,
+        # Phase 3: the holder wording (``继续持有``) no longer triggers context
+        # resolution by itself; the first pass's own "management, target
+        # unknown" classification does.
+        "message_classes": [
+            {
+                "class": "仓位管理",
+                "target": {"resolution": "unknown", "lifecycle_id": None},
+            }
+        ],
     }
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
@@ -1198,6 +1205,14 @@ def test_context_cancel_targets_exact_thread_before_projection(tmp_path, monkeyp
                 "strategy": {},
                 "lifecycle_event": {"event_type": "none", "confidence": 0.0},
                 "confidence": 0.8,
+                # Phase 3: ``取消`` wording no longer triggers by itself; the
+                # first pass's "strategy management, target unknown" does.
+                "message_classes": [
+                    {
+                        "class": "策略管理",
+                        "target": {"resolution": "unknown", "lifecycle_id": None},
+                    }
+                ],
             },
             input_kind="text",
             model="mimo-v2.5",

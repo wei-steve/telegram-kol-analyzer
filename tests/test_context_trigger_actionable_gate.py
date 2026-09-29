@@ -74,19 +74,21 @@ def test_strategy_message_keeps_multiple_candidates():
     assert reasons == ("multiple_same_source_candidates",)
 
 
-def test_wording_signal_still_triggers_without_the_structural_one():
+def test_holder_wording_no_longer_triggers_on_its_own():
+    # Phase 3 plan §1.1: ``entered_holder_language`` was removed as a stand-alone
+    # trigger (observation §9.2: +3 corrections, 0 regressions). Wording alone
+    # neither triggers nor lets the structural signal back in.
     required, reasons = _evaluate(
         recognition_result="非策略",
         lifecycle_event={"event_type": "none"},
         text="这个持仓先放着",
     )
 
-    assert required is True
-    assert "entered_holder_language" in reasons
-    assert "multiple_same_source_candidates" not in reasons
+    assert required is False
+    assert reasons == ()
 
 
-def test_apparent_entry_revision_is_unchanged_for_non_strategy_messages():
+def test_apparent_entry_revision_stays_absent_for_non_strategy_messages():
     required, reasons = _evaluate(
         recognition_result="非策略",
         lifecycle_event={"event_type": "none"},
@@ -107,6 +109,7 @@ def test_apparent_entry_revision_is_unchanged_for_non_strategy_messages():
 
     # `apparent_entry_may_be_revision` has always required
     # `recognition_result == "是策略"`, so it must stay absent here; the gate
-    # only removes the structural signal and leaves `revision_language`.
-    assert required is True
-    assert reasons == ("revision_language",)
+    # removes the structural signal, and phase 3 removed the stand-alone
+    # `revision_language` wording trigger, so nothing is left.
+    assert required is False
+    assert reasons == ()

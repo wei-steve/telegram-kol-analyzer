@@ -26,6 +26,7 @@ verdict and the alerting layer decides what a human needs to see.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -191,12 +192,31 @@ class LifecycleApplicationVerdict:
         return f"{REASON_PREFIX}:{self.reason_code}"
 
 
+def execution_downgrade_note(payload: Mapping[str, Any] | None) -> str | None:
+    """Read-only summary of ``_context_resolution.execution_downgrade``.
+
+    Phase 3 plan §2. Context resolution can rewrite or suppress what the first
+    pass classified; the payload records it as ``{"from": [classes], "reason"}``.
+    This only formats that record ("首轮：仓位管理 → 上下文降级（hold）"); it
+    creates no alert type and changes no verdict code.
+    """
+
+    context = payload.get("_context_resolution") if isinstance(payload, Mapping) else None
+    downgrade = context.get("execution_downgrade") if isinstance(context, Mapping) else None
+    if not isinstance(downgrade, Mapping):
+        return None
+    origin = downgrade.get("from")
+    names = "、".join(str(name) for name in origin) if isinstance(origin, list) and origin else "未知"
+    return f"首轮：{names} → 上下文降级（{downgrade.get('reason') or 'unknown'}）"
+
+
 def classify_unapplied_lifecycle_event(
     *,
     intent: str | None,
     target_lifecycle_id: int | None,
     target_verified: bool | None,
     target_detail: str = "",
+    execution_downgrade: str | None = None,
 ) -> LifecycleApplicationVerdict:
     """Name the outcome, most-forgiving first.
 
@@ -209,15 +229,22 @@ def classify_unapplied_lifecycle_event(
     still failed".
     """
 
+    def _with_note(detail: str) -> str:
+        # ``execution_downgrade`` is ``execution_downgrade_note(payload)``; it
+        # only annotates the detail, never the reason code.
+        return f"{detail} [{execution_downgrade}]" if execution_downgrade else detail
+
     if not intent or intent == "none":
-        return LifecycleApplicationVerdict(NO_ACTIONABLE_INTENT, intent or "none")
+        return LifecycleApplicationVerdict(
+            NO_ACTIONABLE_INTENT, _with_note(intent or "none")
+        )
     if target_lifecycle_id is None:
-        return LifecycleApplicationVerdict(NO_TARGET_NAMED, intent)
+        return LifecycleApplicationVerdict(NO_TARGET_NAMED, _with_note(intent))
     if target_verified is not True:
         return LifecycleApplicationVerdict(
-            TARGET_NOT_VERIFIABLE, target_detail or "unverified"
+            TARGET_NOT_VERIFIABLE, _with_note(target_detail or "unverified")
         )
-    return LifecycleApplicationVerdict(APPLY_FAILED, intent)
+    return LifecycleApplicationVerdict(APPLY_FAILED, _with_note(intent))
 
 
 def reason_code_from_recognition_reason(reason: Any) -> str | None:

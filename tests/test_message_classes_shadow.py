@@ -512,7 +512,9 @@ def _trigger(payload):
             "current": {"text": "平掉，反手做多"},
             "reply_chain": [],
         },
-        candidates=[{"thread_id": 12, "lifecycle_id": 1319}],
+        # Phase 3: ``status`` matters now (``exact_target_not_manageable``), so
+        # the candidate is a live, entered lifecycle.
+        candidates=[{"thread_id": 12, "lifecycle_id": 1319, "status": "entered"}],
     )
 
 
@@ -521,19 +523,16 @@ def _trigger(payload):
     [
         EXIT_AND_REVERSE_CLASSES,
         [{"class": "闲话", "target": None}],
-        [
-            {
-                "class": "仓位管理",
-                "target": {"resolution": "unknown", "lifecycle_id": None},
-            }
-        ],
         [],
         None,
         "broken",
     ],
 )
 def test_the_new_field_changes_neither_triggers_nor_instructions(classes):
-    """The zero-behaviour-change regression for phase 1.
+    """The zero-behaviour-change regression for phase 1 (still true for these shapes).
+
+    Phase 3 changed this on purpose for a management element whose target is
+    ``unknown``: see ``test_an_unknown_management_element_now_triggers_context``.
 
     Whatever the classification says -- including a value that contradicts the
     old fields, and including a malformed one -- the context trigger reasons and
@@ -550,6 +549,20 @@ def test_the_new_field_changes_neither_triggers_nor_instructions(classes):
     assert normalize_authoritative_instructions(
         with_classes
     ) == normalize_authoritative_instructions(without)
+
+
+def test_an_unknown_management_element_now_triggers_context():
+    """Phase 3 plan §1.1: the one deliberate change to the phase 1 claim above."""
+
+    payload = _base_payload()
+    payload["message_classes"] = [
+        {"class": "仓位管理", "target": {"resolution": "unknown", "lifecycle_id": None}}
+    ]
+
+    assert _trigger(payload) == (True, ("management_without_exact_target",))
+    assert normalize_authoritative_instructions(
+        payload
+    ) == normalize_authoritative_instructions(_base_payload())
 
 
 def test_a_management_message_keeps_its_triggers_when_classified_explicitly():

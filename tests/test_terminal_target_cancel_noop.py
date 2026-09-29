@@ -449,7 +449,19 @@ def _install_repost_incident(session_factory):
     return current_id, lifecycle_id, thread.id
 
 
-def _cancel_first_pass(lifecycle_id: int) -> MimoAuthoritativeResult:
+def _cancel_first_pass(
+    lifecycle_id: int, *, extra_unknown_management: bool = False
+) -> MimoAuthoritativeResult:
+    # ``extra_unknown_management``: phase 3 removed the ``调整`` wording trigger,
+    # and a live exact target is manageable, so nothing triggers context
+    # resolution for the live-target negative test. An additional 仓位管理 element
+    # with an unknown target (``management_without_exact_target``) restores the
+    # trigger without touching the exact 1327 target the test is about.
+    extra = (
+        [{"class": "仓位管理", "target": {"resolution": "unknown", "lifecycle_id": None}}]
+        if extra_unknown_management
+        else []
+    )
     return MimoAuthoritativeResult(
         raw_message_id=19490,
         payload={
@@ -476,7 +488,8 @@ def _cancel_first_pass(lifecycle_id: int) -> MimoAuthoritativeResult:
                         "symbol": "BTC",
                         "side": "long",
                     },
-                }
+                },
+                *extra,
             ],
             "confidence": 0.9,
         },
@@ -699,7 +712,9 @@ def test_19490_replay_negative_live_target_keeps_failing_loudly(tmp_path, monkey
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
-        lambda *args, **kwargs: _cancel_first_pass(lifecycle_id),
+        lambda *args, **kwargs: _cancel_first_pass(
+            lifecycle_id, extra_unknown_management=True
+        ),
     )
 
     def model_caller(**kwargs):

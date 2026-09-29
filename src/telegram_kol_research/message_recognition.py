@@ -2329,6 +2329,7 @@ def _attribute_unapplied_lifecycle_event(
     raw_message: RawMessage,
     lifecycle_event: dict[str, Any],
     current_message_text: str | None,
+    payload: dict[str, Any] | None = None,
 ) -> recognition_attribution.LifecycleApplicationVerdict:
     """Name why a lifecycle event the model produced changed nothing (A-8).
 
@@ -2404,6 +2405,7 @@ def _attribute_unapplied_lifecycle_event(
         target_lifecycle_id=target_lifecycle_id,
         target_verified=target_verified,
         target_detail=target_detail,
+        execution_downgrade=recognition_attribution.execution_downgrade_note(payload),
     )
     if directive_error and verdict.reason_code == recognition_attribution.APPLY_FAILED:
         # The target was fine; what we could not do is read the instruction.
@@ -3275,6 +3277,7 @@ def apply_authoritative_mimo_payload(
                 raw_message=raw_message,
                 lifecycle_event=lifecycle_event,
                 current_message_text=current_message_text,
+                payload=payload,
             )
             result = MessageRecognitionResult(
                 raw_message_id=raw_message_id,

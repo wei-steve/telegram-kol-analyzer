@@ -47,7 +47,13 @@ from telegram_kol_research.message_instruction_items import (
 )
 from telegram_kol_research.message_classification import (
     CLASS_NEW_STRATEGY,
+    CLASS_POSITION_MANAGEMENT,
+    MANAGEMENT_MESSAGE_CLASSES,
+    RESOLUTION_EXACT,
+    RESOLUTION_UNKNOWN,
+    MessageClassElement,
     message_class_identities,
+    parse_message_classes,
 )
 from telegram_kol_research.message_evidence import (
     build_current_message_input_fingerprint,
@@ -130,26 +136,23 @@ from telegram_kol_research.strategy_threads import (
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
+#: Phase 3 plan §1.1. ``revision_language`` / ``cancellation_language`` /
+#: ``entered_holder_language`` were removed as stand-alone triggers: the first
+#: pass's own classification (does it name a target, is the target still
+#: manageable) replaces reading keywords. Historical decision rows still carry
+#: the old names, so readers keep their labels.
 CONTEXT_TRIGGER_ORDER = (
-    "revision_language",
-    "cancellation_language",
-    "entered_holder_language",
     "management_without_exact_target",
+    "exact_target_outside_candidates",
+    "exact_target_not_manageable",
     "multiple_same_source_candidates",
     "reply_target_disagreement",
     "text_image_conflict",
     "apparent_entry_may_be_revision",
 )
-REVISION_LANGUAGE = ("更新", "修改", "改为", "调整", "replace", "update")
-CANCELLATION_LANGUAGE = ("取消", "撤销", "撤单", "cancel")
-ENTERED_HOLDER_LANGUAGE = (
-    "有入场",
-    "已入场",
-    "持仓",
-    "保护成本",
-    "保本",
-    "继续持有",
-)
+#: Private local condition of ``apparent_entry_may_be_revision`` only; no longer
+#: a trigger of its own (design §5 implementation constraint).
+_APPARENT_REVISION_WORDS = ("更新", "修改", "改为", "调整", "replace", "update")
 EXACT_CONTEXT_RISK_REDUCTION_MARKER = (
     "_exact_context_risk_reduction_authorized"
 )
@@ -212,14 +215,54 @@ def requires_context_resolution(
         first_pass_payload.get("recognition_result") or ""
     )
     reasons: set[str] = set()
-    if any(term.lower() in text for term in REVISION_LANGUAGE):
-        reasons.add("revision_language")
-    if any(term.lower() in text for term in CANCELLATION_LANGUAGE):
-        reasons.add("cancellation_language")
-    if any(term.lower() in text for term in ENTERED_HOLDER_LANGUAGE):
-        reasons.add("entered_holder_language")
-    if event_type != "none" and target_lifecycle_id in (None, ""):
+    # Phase 3 plan §1.1. Read the first pass's own classification. When the
+    # prompt predates the contract (``message_classes`` absent) or the list has
+    # a fatal violation, the classification is not trusted and only the old
+    # fields decide.
+    parsed_classes = parse_message_classes(first_pass_payload)
+    classes_usable = parsed_classes.present and not parsed_classes.fatal
+    management_elements: tuple[MessageClassElement, ...] = (
+        tuple(
+            element
+            for element in parsed_classes.elements
+            if element.message_class in MANAGEMENT_MESSAGE_CLASSES
+            and element.target is not None
+        )
+        if classes_usable
+        else ()
+    )
+    if any(
+        element.target.resolution == RESOLUTION_UNKNOWN
+        for element in management_elements
+    ) or (event_type != "none" and target_lifecycle_id in (None, "")):
         reasons.add("management_without_exact_target")
+    if management_elements:
+        candidates_by_lifecycle = {
+            int(_context_value(candidate, "lifecycle_id")): candidate
+            for candidate in candidates
+        }
+        from telegram_kol_research.entry_assembly_admission import (
+            _LIVE_LIFECYCLE_STATUSES,
+        )
+
+        for element in management_elements:
+            if (
+                element.target.resolution != RESOLUTION_EXACT
+                or element.target.lifecycle_id is None
+            ):
+                continue
+            candidate = candidates_by_lifecycle.get(int(element.target.lifecycle_id))
+            if candidate is None:
+                reasons.add("exact_target_outside_candidates")
+                continue
+            status = str(_context_value(candidate, "status", "") or "")
+            if status not in _LIVE_LIFECYCLE_STATUSES or (
+                element.message_class == CLASS_POSITION_MANAGEMENT
+                and status == "pending_entry"
+            ):
+                reasons.add("exact_target_not_manageable")
+    if len(candidates) > 1:
+        reasons.add("multiple_same_source_candidates")
     if len(candidates) > 1:
         reasons.add("multiple_same_source_candidates")
 
@@ -257,7 +300,7 @@ def requires_context_resolution(
     if isinstance(conflicts, list) and conflicts:
         reasons.add("text_image_conflict")
     if recognition_result == "是策略" and candidates and (
-        "revision_language" in reasons
+        any(term.lower() in text for term in _APPARENT_REVISION_WORDS)
         or any(
             "overlapping_entry"
             in tuple(_context_value(candidate, "reasons", ()) or ())
@@ -398,7 +441,20 @@ def _management_target_gate(
     lifecycle_event = first_pass_payload.get("lifecycle_event")
     lifecycle_event = lifecycle_event if isinstance(lifecycle_event, Mapping) else {}
     if str(lifecycle_event.get("event_type") or "none") == "none":
-        return False, None
+        # Phase 3 plan §1.1: a first pass that classified the message as a
+        # management instruction opens the gate even when it left the old
+        # ``event_type`` at ``none`` (raw 19692), so the narrowed candidate set
+        # is what the context resolver sees.
+        parsed_classes = parse_message_classes(first_pass_payload)
+        if not (
+            parsed_classes.present
+            and not parsed_classes.fatal
+            and any(
+                element.message_class in MANAGEMENT_MESSAGE_CLASSES
+                for element in parsed_classes.elements
+            )
+        ):
+            return False, None
     raw_message = session.get(RawMessage, int(raw_message_id))
     if raw_message is None:
         return False, None
@@ -773,6 +829,25 @@ def _resolved_mimo_result(
         ),
         "confidence": mimo.payload.get("confidence"),
     }
+    # Phase 3 plan §2. The classification the first pass gave, kept as-is next
+    # to the four old fields, and the list of class names that any downgrade
+    # below records as ``execution_downgrade.from``.
+    first_pass_message_classes = mimo.payload.get("message_classes")
+    first_pass_class_names: list[str] | None = None
+    if isinstance(first_pass_message_classes, list):
+        context_payload["first_pass"]["message_classes"] = first_pass_message_classes
+        first_pass_class_names = [
+            str(element.get("class"))
+            for element in first_pass_message_classes
+            if isinstance(element, Mapping) and element.get("class") is not None
+        ]
+
+    def _record_downgrade(reason: str) -> None:
+        context_payload["execution_downgrade"] = {
+            "from": first_pass_class_names,
+            "reason": reason,
+        }
+
     payload["_context_resolution"] = context_payload
     if decision.decision == "new_thread":
         return replace(mimo, payload=payload)
@@ -786,6 +861,11 @@ def _resolved_mimo_result(
         decision.confidence < 0.7
         and not exact_risk_reduction_authorized
     ) or decision.decision in {"hold", "unresolved"}:
+        _record_downgrade(
+            decision.decision
+            if decision.decision in {"hold", "unresolved"}
+            else "low_confidence"
+        )
         payload.update(
             recognition_result="非策略",
             reason=decision.reason or "context resolution produced no executable action",
@@ -836,6 +916,7 @@ def _resolved_mimo_result(
         selected_candidates=selected_candidates,
     )
     if decision.decision == "revise_thread":
+        _record_downgrade("revise_planner")
         context_payload["replacement_strategy"] = dict(
             original_strategy if isinstance(original_strategy, dict) else {}
         )
@@ -871,6 +952,7 @@ def _resolved_mimo_result(
         lifecycle_event["management_action"] = decision.management_action
     if exact_risk_reduction_authorized:
         lifecycle_event[EXACT_CONTEXT_RISK_REDUCTION_MARKER] = True
+    _record_downgrade("retargeted")
     payload.update(
         recognition_result="非策略",
         reason=decision.reason,
