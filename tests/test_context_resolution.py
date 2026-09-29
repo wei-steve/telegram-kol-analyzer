@@ -163,7 +163,9 @@ def test_multi_target_management_fanout_refuses_non_partial_actions(management_a
     assert raised.value.code == "multi_target_action_not_allowed"
 
 
-def test_resolver_retries_malformed_json_once_and_persists_safe_attempt(tmp_path):
+def test_resolver_does_not_retry_malformed_json_and_persists_safe_attempt(tmp_path):
+    """Phase 3 plan section 3.2: only ``network_error`` earns a second request."""
+
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         raw = RawMessage(chat_id=88, message_id=1462, text="更新上面的 BTC 多单")
@@ -178,49 +180,50 @@ def test_resolver_retries_malformed_json_once_and_persists_safe_attempt(tmp_path
             return "not-json"
         return json.dumps(_valid_payload(), ensure_ascii=False)
 
-    decision = resolve_contextual_strategy(
-        session_factory,
-        raw_message_id=raw_id,
-        ai_recognition_config=AiRecognitionConfig(
-            text_provider=AiProviderConfig(
-                base_url="https://api.deepseek.com",
-                api_key="secret",
-                model="deepseek-v4-flash",
-            )
-        ),
-        evidence={
-            "text": {"observed_text": "更新上面的 BTC 多单"},
-            "images": [{"asset_id": 7, "fields": {"entry": "65100"}}],
-        },
-        context_window={
-            "current": {"message_id": 1462},
-            "messages": [{"message_id": 1460, "text": "BTC 多单"}],
-            "reply_chain": [],
-        },
-        candidates=[
-            {
-                "thread_id": 12,
-                "lifecycle_id": 22,
-                "root_message_id": 1460,
-                "symbol": "BTC",
-                "side": "long",
-            }
-        ],
-        first_pass_payload={"recognition_result": "是策略"},
-        exchange_state={"positions": [{"pos_id_hash": "abc", "symbol": "BTC"}]},
-        model_caller=model_caller,
-    )
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(
+                text_provider=AiProviderConfig(
+                    base_url="https://api.deepseek.com",
+                    api_key="secret",
+                    model="deepseek-v4-flash",
+                )
+            ),
+            evidence={
+                "text": {"observed_text": "更新上面的 BTC 多单"},
+                "images": [{"asset_id": 7, "fields": {"entry": "65100"}}],
+            },
+            context_window={
+                "current": {"message_id": 1462},
+                "messages": [{"message_id": 1460, "text": "BTC 多单"}],
+                "reply_chain": [],
+            },
+            candidates=[
+                {
+                    "thread_id": 12,
+                    "lifecycle_id": 22,
+                    "root_message_id": 1460,
+                    "symbol": "BTC",
+                    "side": "long",
+                }
+            ],
+            first_pass_payload={"recognition_result": "是策略"},
+            exchange_state={"positions": [{"pos_id_hash": "abc", "symbol": "BTC"}]},
+            model_caller=model_caller,
+        )
 
-    assert decision.target_thread_ids == (12,)
-    assert len(calls) == 2
+    assert raised.value.code == "malformed_json"
+    assert len(calls) == 1
     assert "secret" not in json.dumps(calls, ensure_ascii=False)
     assert "image_url" not in json.dumps(calls, ensure_ascii=False)
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
-    assert attempt.status == "completed"
-    assert attempt.attempts == 2
-    assert json.loads(attempt.decision_json)["decision"] == "revise_thread"
-    assert attempt.rejected_response_diagnostic_json is None
+    assert attempt.status == "exhausted"
+    assert attempt.attempts == 1
+    assert attempt.error_class == "malformed_json"
+    assert attempt.decision_json is None
     assert "secret" not in attempt.request_summary_json
 
 
@@ -889,7 +892,7 @@ def test_open_circuit_reschedules_durable_retry_without_counting_or_dropping_it(
         assert attempt.decision_json is None
 
 
-def test_resolver_retries_closed_contract_error_once_then_completes(tmp_path):
+def test_closed_contract_error_is_terminal_on_the_first_request(tmp_path):
     session_factory = create_session_factory(tmp_path / "contract-retry.db")
     with session_factory() as session:
         raw = RawMessage(chat_id=88, message_id=1465, text="BTC空单止盈一部分")
@@ -912,73 +915,63 @@ def test_resolver_retries_closed_contract_error_once_then_completes(tmp_path):
         ),
     ]
 
-    decision = resolve_contextual_strategy(
-        session_factory,
-        raw_message_id=raw_id,
-        ai_recognition_config=AiRecognitionConfig(),
-        evidence={},
-        context_window={"current": {"message_id": 1465}, "messages": []},
-        candidates=[{"thread_id": 12}, {"thread_id": 13}],
-        first_pass_payload={},
-        exchange_state={},
-        model_caller=lambda **kwargs: responses.pop(0),
-    )
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            evidence={},
+            context_window={"current": {"message_id": 1465}, "messages": []},
+            candidates=[{"thread_id": 12}, {"thread_id": 13}],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=lambda **kwargs: responses.pop(0),
+        )
 
-    assert decision.target_thread_ids == (12,)
-    assert responses == []
+    assert raised.value.code == "multi_target_action_not_allowed"
+    assert len(responses) == 1  # the second answer was never asked for
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
-    assert attempt.status == "completed"
-    assert attempt.attempts == 2
+    assert attempt.status == "exhausted"
+    assert attempt.attempts == 1
 
 
-def test_target_not_allowed_retry_adds_correction_and_keeps_bounded_diagnostic(
-    tmp_path,
-):
+def test_target_not_allowed_is_terminal_and_keeps_bounded_diagnostic(tmp_path):
+    """The in-attempt "corrected" second ask is retired (plan section 3.2)."""
+
     session_factory = create_session_factory(tmp_path / "target-correction.db")
     with session_factory() as session:
         raw = RawMessage(chat_id=88, message_id=1465, text="回顾已有策略")
         session.add(raw)
         session.commit()
         raw_id = raw.id
-    responses = [
-        _valid_payload(
-            decision="hold",
-            target_thread_ids=[12],
-            management_action=None,
-            supporting_message_ids=[1465],
-        ),
-        _valid_payload(
-            decision="hold",
-            target_thread_ids=[],
-            management_action=None,
-            supporting_message_ids=[1465],
-        ),
-    ]
     calls = []
 
     def model_caller(**kwargs):
         calls.append(kwargs["system_prompt"])
-        return responses.pop(0)
+        return _valid_payload(
+            decision="hold",
+            target_thread_ids=[12],
+            management_action=None,
+            supporting_message_ids=[1465],
+        )
 
-    decision = resolve_contextual_strategy(
-        session_factory,
-        raw_message_id=raw_id,
-        ai_recognition_config=AiRecognitionConfig(),
-        evidence={},
-        context_window={"current": {"message_id": 1465}, "messages": []},
-        candidates=[{"thread_id": 12}],
-        first_pass_payload={},
-        exchange_state={},
-        model_caller=model_caller,
-    )
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            evidence={},
+            context_window={"current": {"message_id": 1465}, "messages": []},
+            candidates=[{"thread_id": 12}],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=model_caller,
+        )
 
-    assert decision.decision == "hold"
-    assert decision.target_thread_ids == ()
-    assert len(calls) == 2
+    assert raised.value.code == "target_not_allowed"
+    assert len(calls) == 1
     assert "上一次响应违反 target_not_allowed" not in calls[0]
-    assert "上一次响应违反 target_not_allowed" in calls[1]
-    assert "不要修改 decision 来绕过校验" in calls[1]
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
     assert json.loads(attempt.rejected_response_diagnostic_json) == {
@@ -987,13 +980,11 @@ def test_target_not_allowed_retry_adds_correction_and_keeps_bounded_diagnostic(
         "target_thread_count": 1,
     }
     assert "12" not in attempt.rejected_response_diagnostic_json
-    assert attempt.status == "completed"
-    assert attempt.attempts == 2
+    assert attempt.status == "exhausted"
+    assert attempt.attempts == 1
 
 
-def test_target_not_allowed_retry_remains_exhausted_after_two_invalid_responses(
-    tmp_path,
-):
+def test_target_not_allowed_makes_one_request_per_fingerprint(tmp_path):
     session_factory = create_session_factory(tmp_path / "target-exhausted.db")
     with session_factory() as session:
         raw = RawMessage(chat_id=88, message_id=1465, text="回顾已有策略")
@@ -1012,26 +1003,26 @@ def test_target_not_allowed_retry_remains_exhausted_after_two_invalid_responses(
         calls.append(kwargs["system_prompt"])
         return invalid
 
-    with pytest.raises(ContextResolutionError) as raised:
-        resolve_contextual_strategy(
-            session_factory,
-            raw_message_id=raw_id,
-            ai_recognition_config=AiRecognitionConfig(),
-            evidence={},
-            context_window={"current": {"message_id": 1465}, "messages": []},
-            candidates=[{"thread_id": 12}],
-            first_pass_payload={},
-            exchange_state={},
-            model_caller=model_caller,
-        )
+    for _ in range(2):
+        with pytest.raises(ContextResolutionError) as raised:
+            resolve_contextual_strategy(
+                session_factory,
+                raw_message_id=raw_id,
+                ai_recognition_config=AiRecognitionConfig(),
+                evidence={},
+                context_window={"current": {"message_id": 1465}, "messages": []},
+                candidates=[{"thread_id": 12}],
+                first_pass_payload={},
+                exchange_state={},
+                model_caller=model_caller,
+            )
+        assert raised.value.code == "target_not_allowed"
 
-    assert raised.value.code == "target_not_allowed"
-    assert len(calls) == 2
-    assert "上一次响应违反 target_not_allowed" in calls[1]
+    assert len(calls) == 1
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
     assert attempt.status == "exhausted"
-    assert attempt.attempts == 2
+    assert attempt.attempts == 1
     assert attempt.error_class == "target_not_allowed"
 
 
@@ -1079,7 +1070,7 @@ def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch)
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
     assert attempt.status == "exhausted"
-    assert attempt.attempts == 2
+    assert attempt.attempts == 1
     assert attempt.error_class == "multi_target_action_not_allowed"
     assert len(captures) == 1
     assert captures[0]["status"] == "exhausted"
@@ -1097,7 +1088,7 @@ def test_resolver_exhausts_repeated_closed_contract_error(tmp_path, monkeypatch)
             model_caller=invalid_caller,
         )
     assert replayed.value.code == "multi_target_action_not_allowed"
-    assert calls == 2
+    assert calls == 1
     assert len(captures) == 1
 
 
@@ -1139,7 +1130,7 @@ def test_resolver_rejects_supporting_message_outside_context_and_persists_failur
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
     assert attempt.status == "exhausted"
-    assert attempt.attempts == 2
+    assert attempt.attempts == 1
     assert attempt.error_class == "message_evidence_outside_context"
 
 

@@ -139,12 +139,6 @@ CONTEXT_RESOLUTION_ERROR_CODES = frozenset(
         "resolved_lifecycle_missing",
     }
 )
-_TARGET_NOT_ALLOWED_CORRECTION = """
-纠错：上一次响应违反 target_not_allowed。
-如果 decision 是 new_thread、hold 或 unresolved，target_thread_ids 必须为 []。
-只有 revise_thread、manage_thread、cancel_thread、exit_thread 可以携带候选目标。
-不要修改 decision 来绕过校验；请保持原本语义并修正字段组合。
-""".strip()
 
 
 class ContextResolutionError(ValueError):
@@ -1050,19 +1044,12 @@ def resolve_contextual_strategy(
                     }
                 )
             existing_phase = retry_row.attempt_phase
-    prior_error_code: str | None = None
     provider_usage_entries = list(existing_usage_entries)
     effective_phase = existing_phase or attempt_phase
     for attempt_number in range(existing_request_count + 1, 3):
         failure: ContextResolutionError | None = None
         decoded: Mapping[str, Any] | None = None
-        active_system_prompt = (
-            CONTEXT_RESOLUTION_SYSTEM_PROMPT
-            if prior_error_code != "target_not_allowed"
-            else CONTEXT_RESOLUTION_SYSTEM_PROMPT
-            + "\n\n"
-            + _TARGET_NOT_ALLOWED_CORRECTION
-        )
+        active_system_prompt = CONTEXT_RESOLUTION_SYSTEM_PROMPT
         if attempt_number > 1:
             allowed, retry_at = circuits.reserve_retry(
                 provider_key,
@@ -1184,7 +1171,12 @@ def resolve_contextual_strategy(
             )
             failure.__cause__ = last.cause if last is not None else None
         if failure is not None:
-            terminal = attempt_number == 2
+            # Phase 3 plan section 3.2: only a network failure is worth a
+            # second request. Any other failure (a target outside the
+            # candidate set, malformed JSON, a broken contract) is the model's
+            # answer and asking again in the same attempt bought nothing (raw
+            # 19490: five of seven calls raised the same error).
+            terminal = attempt_number == 2 or failure.code != "network_error"
             next_attempt_at = None
             if failure.code == "network_error":
                 next_attempt_at = circuits.record_network_failure(
@@ -1219,9 +1211,6 @@ def resolve_contextual_strategy(
                 ),
                 system_prompt=active_system_prompt,
             )
-            if not terminal and failure.code != "network_error":
-                prior_error_code = failure.code
-                continue
             if not terminal:
                 raise failure
             capture_runtime_incident_best_effort(

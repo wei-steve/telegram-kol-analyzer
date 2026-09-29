@@ -562,8 +562,8 @@ def test_19490_replay_with_material_strategy_keeps_the_old_failure_path(
     tmp_path, monkeypatch
 ):
     """19490's shape, but the same message also gives a fresh BTC entry
-    (83000-83300, SL 81400) -- the no-op must not eat it, so the old, retried
-    ``mimo_authoritative_failed`` path stays unchanged."""
+    (83000-83300, SL 81400) -- the no-op must not eat it, so the
+    failure path stays (now terminal ``context_contract_failed``)."""
 
     session_factory = create_session_factory(tmp_path / "raw-19490-with-repost.db")
     current_id, lifecycle_id, thread_id = _install_repost_incident(session_factory)
@@ -611,8 +611,11 @@ def test_19490_replay_with_material_strategy_keeps_the_old_failure_path(
         ),
     )
 
+    # Phase 3 plan section 3.2: the context failure is no longer retried; it
+    # ends terminal, fail-closed and alerted. The message is still not swallowed
+    # by the no-op (3d) -- it never reaches ``target_terminal_noop``.
     assert result.assessment.agreement_status == "authoritative_failed"
-    assert result.automation == {"status": "skipped", "reason": "mimo_authoritative_failed"}
+    assert result.automation == {"status": "skipped", "reason": "context_contract_failed"}
 
 
 def test_19490_replay_job_succeeds_without_retry(tmp_path, monkeypatch):
@@ -665,7 +668,8 @@ def test_19490_replay_job_succeeds_without_retry(tmp_path, monkeypatch):
 
 def test_19490_replay_negative_live_target_keeps_failing_loudly(tmp_path, monkeypatch):
     """If lifecycle 1327 were still ``entered`` (a live position), the same
-    failure must stay retried, not become a silent no-op."""
+    failure must not become a silent no-op: it ends ``context_contract_failed``
+    (terminal, alerted)."""
 
     session_factory = create_session_factory(tmp_path / "raw-19490-live-target.db")
     with session_factory() as session:
@@ -741,8 +745,11 @@ def test_19490_replay_negative_live_target_keeps_failing_loudly(tmp_path, monkey
         ),
     )
 
+    # Phase 3 plan section 3.2: the context failure is no longer retried; it
+    # ends terminal, fail-closed and alerted. The message is still not swallowed
+    # by the no-op (3d) -- it never reaches ``target_terminal_noop``.
     assert result.assessment.agreement_status == "authoritative_failed"
-    assert result.automation == {"status": "skipped", "reason": "mimo_authoritative_failed"}
+    assert result.automation == {"status": "skipped", "reason": "context_contract_failed"}
 
 
 # ---------------------------------------------------------------------------

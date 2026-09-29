@@ -122,6 +122,8 @@ from telegram_kol_research.recognition_experiments import (
     _provider_usage_audit,
     _request_component_bytes_audit,
     build_authoritative_context_for_message,
+    first_pass_contract_violation_codes,
+    is_first_pass_contract_violation,
     run_mimo_authoritative_for_message,
 )
 from telegram_kol_research.strategy_thread_candidates import (
@@ -179,6 +181,16 @@ class AuthoritativeAssessment:
     #: ``mimo_authoritative_failed`` or the unrelated ``no_actionable_intent``
     #: bucket.
     context_resolution_terminal_noop_target_lifecycle_id: int | None = None
+    #: First-pass phase 3 (plan section 3). Set when this assessment is a
+    #: terminal, fail-closed outcome that a retry cannot repair:
+    #: ``first_pass_contract_violation`` (every model of the chain returned a
+    #: fatal ``message_classes`` violation) or ``context_contract_failed`` (the
+    #: second pass failed with anything but ``network_error``). The agreement
+    #: status stays ``authoritative_failed`` (nothing executes), the automation
+    #: reason becomes this value instead of ``mimo_authoritative_failed`` (which
+    #: the entry admission barrier reads as "a decision may still arrive"), and
+    #: the message processing job settles instead of retrying.
+    terminal_failure_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1523,11 +1535,23 @@ def assess_message_authoritatively(
     context_decision = None
     context_triggers: tuple[str, ...] = ()
     terminal_noop_target_lifecycle_id: int | None = None
+    terminal_failure_reason: str | None = None
     # The two gates that decide the contextual second pass are otherwise
     # memory-only, which left the Web card unable to tell "never ran" from
     # "ran and changed nothing". The default stands for the case where the
     # first pass failed and neither gate was ever evaluated.
     context_gate_outcome = "recognition_failed"
+    if mimo.error_message and is_first_pass_contract_violation(mimo):
+        # Plan section 3.1: every model of the chain answered with a fatal
+        # message_classes violation. Fail closed and do not queue a retry.
+        terminal_failure_reason = (
+            recognition_attribution.FIRST_PASS_CONTRACT_VIOLATION
+        )
+        logger.warning(
+            "first pass contract violation raw_message_id=%s codes=%s",
+            raw_message_id,
+            ",".join(first_pass_contract_violation_codes(mimo)),
+        )
     if not mimo.error_message and mimo.status != "识别失败":
         (
             evidence,
@@ -1632,7 +1656,7 @@ def assess_message_authoritatively(
                     decision=context_decision,
                     candidates=candidates,
                 )
-            except ContextResolutionError:
+            except ContextResolutionError as context_error:
                 # 3d: before falling back to the retried "context resolution
                 # failed" outcome, ask whether there is anything left to
                 # resolve at all. 陈哥's raw 19490 named lifecycle 1327 exactly
@@ -1679,6 +1703,14 @@ def assess_message_authoritatively(
                         status="识别失败",
                         error_message="context resolution failed",
                     )
+                    if context_error.code != "network_error":
+                        # Plan section 3.2: a contract failure of the second
+                        # pass will fail identically on every retry (the
+                        # exhausted attempt row is replayed for the same
+                        # fingerprint). End it here, fail closed, alerted.
+                        terminal_failure_reason = (
+                            recognition_attribution.CONTEXT_CONTRACT_FAILED
+                        )
             except Exception:
                 mimo = replace(
                     mimo,
@@ -1748,6 +1780,7 @@ def assess_message_authoritatively(
         context_resolution_terminal_noop_target_lifecycle_id=(
             terminal_noop_target_lifecycle_id
         ),
+        terminal_failure_reason=terminal_failure_reason,
     )
 
 
@@ -2333,6 +2366,15 @@ def _failure_point_for(reason: str) -> str:
             "the authoritative model produced no decision and every retry was "
             "spent, so nothing in this message was read or executed"
         ),
+        recognition_attribution.FIRST_PASS_CONTRACT_VIOLATION: (
+            "every model of the chain returned a first-pass classification "
+            "that violates the message_classes contract; the message was not "
+            "executed and is not retried"
+        ),
+        recognition_attribution.CONTEXT_CONTRACT_FAILED: (
+            "the contextual second pass returned a contract failure; the "
+            "message was not executed and is not retried"
+        ),
         recognition_attribution.GAP_RECOVERY_EXPIRED: (
             "no authoritative decision before the recovery window closed; the "
             "message is permanently unrecognised and was not executed"
@@ -2811,7 +2853,9 @@ def _run_legacy_authoritative_execution(
     elif assessment.agreement_status == "authoritative_failed":
         automation = {
             "status": "skipped",
-            "reason": "mimo_authoritative_failed",
+            "reason": (
+                assessment.terminal_failure_reason or "mimo_authoritative_failed"
+            ),
         }
     elif assessment.context_resolution_terminal_noop_target_lifecycle_id is not None:
         # 3d: context resolution failed, but the exact target it named is

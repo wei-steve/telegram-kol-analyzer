@@ -109,6 +109,32 @@ MIMO_AUTHORITATIVE_FAILED_EXHAUSTED = "mimo_authoritative_failed_exhausted"
 #: and keeps failing loudly through ``MIMO_AUTHORITATIVE_FAILED``.
 TARGET_TERMINAL_NOOP = "target_terminal_noop"
 
+#: First-pass phase 3 (plan section 3): two terminal, fail-closed outcomes of a
+#: model answer that retrying cannot repair. Both leave the message unread by
+#: the execution chain, so both are alerted; neither is retried by the message
+#: processing job (``TerminalAuthoritativeProcessingFailed``).
+#:
+#: ``first_pass_contract_violation``: every model of the chain answered with a
+#: fatal ``message_classes`` violation. ``context_contract_failed``: the second
+#: pass returned a contract failure other than ``network_error`` (raw 17972
+#: "止损改为2600", 18501 "全部仓位止盈出局", 18897 "止损统一修改83300" were real
+#: instructions of this shape). Kept out of ``AUTHORITY_NOT_PRODUCED_REASONS``
+#: on purpose: the provider outage replay re-queues every reason in that set,
+#: and replaying a structurally wrong answer against a healthy provider would
+#: only reproduce it.
+FIRST_PASS_CONTRACT_VIOLATION = "first_pass_contract_violation"
+CONTEXT_CONTRACT_FAILED = "context_contract_failed"
+TERMINAL_CONTRACT_FAILURE_REASONS = frozenset(
+    {FIRST_PASS_CONTRACT_VIOLATION, CONTEXT_CONTRACT_FAILED}
+)
+
+#: Refusal by the execution-layer actionability gate
+#: (``management_actionability``): the text is an intention, a hypothetical, or
+#: a price-trigger comment rather than an order. Recorded as
+#: ``management_not_actionable:<rule>`` and deliberately NOT alerted -- for a
+#: commentary message it is the expected outcome.
+MANAGEMENT_NOT_ACTIONABLE = "management_not_actionable"
+
 #: Every reason meaning "no authoritative decision was produced".
 #:
 #: A narrowing that reads as reasonable can silently exclude the one case that
@@ -158,6 +184,7 @@ ALERTED_REASONS = frozenset(
         SYMBOL_PRICE_SCALE_CONFLICT,
         MEDIA_UNREADABLE,
         *AUTHORITY_NOT_PRODUCED_REASONS,
+        *TERMINAL_CONTRACT_FAILURE_REASONS,
     }
 )
 

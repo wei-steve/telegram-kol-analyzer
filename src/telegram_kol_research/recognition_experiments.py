@@ -37,7 +37,10 @@ from telegram_kol_research.contextual_message_window import (
     render_authoritative_context,
 )
 from telegram_kol_research.media_retention import resolve_media_path
-from telegram_kol_research.message_classification import parse_message_classes
+from telegram_kol_research.message_classification import (
+    fatal_violations,
+    parse_message_classes,
+)
 from telegram_kol_research.message_evidence import (
     build_current_message_input_fingerprint,
     build_message_input_fingerprint,
@@ -130,6 +133,62 @@ class MimoModelAttempt:
     started_at: Any
     completed_at: Any
     duration_ms: int
+
+
+#: Prefix of the error text a fatal ``message_classes`` violation leaves in the
+#: run / attempt audit (``error_message``); the violation codes follow it.
+#: ``is_first_pass_contract_violation`` reads it back.
+FIRST_PASS_CONTRACT_VIOLATION_PREFIX = "message_classes contract violation: "
+
+
+class MessageClassesContractViolation(ValueError):
+    """The first pass returned a ``message_classes`` field with a fatal violation.
+
+    Phase 3 plan section 3.1. Asking the same model the same question again does
+    not change a structurally wrong answer, so the same-model retry is skipped;
+    the chain fallback rule is unchanged. ``codes`` are the fatal violation codes
+    (``message_classification.fatal_violations``).
+    """
+
+    def __init__(self, codes: tuple[str, ...]):
+        self.codes = tuple(codes)
+        super().__init__(
+            FIRST_PASS_CONTRACT_VIOLATION_PREFIX + ",".join(self.codes)
+        )
+
+
+def is_first_pass_contract_violation(result: Any) -> bool:
+    """Every model that was tried answered with a fatal contract violation.
+
+    A violation on one model followed by a network failure on the next is an
+    ordinary (retried) failure, not a contract failure: the message could still
+    be read by a healthy provider.
+    """
+
+    if not getattr(result, "error_message", None):
+        return False
+    records = tuple(getattr(result, "model_attempts", ()) or ())
+    if not records:
+        return FIRST_PASS_CONTRACT_VIOLATION_PREFIX in str(result.error_message)
+    return all(
+        (not record.succeeded)
+        and FIRST_PASS_CONTRACT_VIOLATION_PREFIX in str(record.error_message or "")
+        for record in records
+    )
+
+
+def first_pass_contract_violation_codes(result: Any) -> tuple[str, ...]:
+    """Fatal violation codes recorded by the last tried model, in order."""
+
+    records = tuple(getattr(result, "model_attempts", ()) or ())
+    text = str(
+        (records[-1].error_message if records else getattr(result, "error_message", ""))
+        or ""
+    )
+    if FIRST_PASS_CONTRACT_VIOLATION_PREFIX not in text:
+        return ()
+    tail = text.split(FIRST_PASS_CONTRACT_VIOLATION_PREFIX, 1)[1].split(" | ", 1)[0]
+    return tuple(code for code in tail.strip().split(",") if code)
 
 
 class _MimoModelFailed(RuntimeError):
@@ -725,6 +784,11 @@ def _call_mimo_authoritative_with_retry(
                     failure_class=RESPONSE_INVALID,
                 )
             errors.append(str(exc))
+            if isinstance(exc, MessageClassesContractViolation):
+                # Same model, same question, same structurally wrong answer:
+                # not retried (phase 3 plan section 3.1). The chain fallback
+                # (``_should_try_next_model``) is unchanged.
+                break
             if isinstance(exc, MimoRequestDeadlineExceeded):
                 # A second full deadline would not fit inside the job claim
                 # lease; the queue's own retry is the next attempt.
@@ -804,14 +868,18 @@ def _validate_authoritative_payload(payload: dict[str, Any]) -> None:
             raise ValueError("MiMo response missing strategy")
     elif strategy is not None and not isinstance(strategy, dict):
         raise ValueError("MiMo response missing strategy")
-    # Phase 1 (shadow) of the first-pass classification contract: read
-    # ``message_classes`` but never fail on it. Neither a missing field nor a
-    # violated rule may raise here -- the production prompt (v8) does not emit
-    # the field at all, and rolling a newer version back to v8 must leave
-    # recognition working. A raise would turn a prompt rollback into a
-    # recognition outage. Promoting violations to a hard failure, and skipping
-    # the same-model retry for them, is phase 3 (design §6, §8).
-    parse_message_classes(payload)
+    # Phase 3 of the first-pass classification contract (plan section 3.1): a
+    # fatal violation of ``message_classes`` is a failed answer. A *missing*
+    # field is not: the production prompt (v8) does not emit it, and rolling a
+    # newer version back to v8 must leave recognition working. Non-fatal codes
+    # (duplicate target, element order, an all-null target on a non-management
+    # element, ``strategy_not_allowed``) are normalised by the parser and never
+    # raise here.
+    parsed_classes = parse_message_classes(payload)
+    if parsed_classes.present:
+        fatal_codes = fatal_violations(parsed_classes)
+        if fatal_codes:
+            raise MessageClassesContractViolation(fatal_codes)
 
 
 def _load_experiment_messages(

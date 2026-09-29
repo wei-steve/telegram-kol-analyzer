@@ -43,6 +43,7 @@ from telegram_kol_research.recognition_decisions import (
     save_pending_authoritative_decision,
 )
 from telegram_kol_research.recognition_experiments import (
+    MessageClassesContractViolation,
     _validate_authoritative_payload,
 )
 
@@ -283,13 +284,19 @@ def test_recognition_accepts_a_payload_without_the_new_field():
         [{"class": "闲话", "target": None}, {"class": "新策略", "target": None}],
     ],
 )
-def test_recognition_accepts_a_payload_whose_new_field_violates_the_contract(classes):
-    """Phase 1 records violations; promoting them to a failure is phase 3."""
+def test_recognition_rejects_a_payload_whose_new_field_has_a_fatal_violation(classes):
+    """Phase 3 (plan section 3.1) promotes fatal violations to a failed answer.
+
+    Every case here is fatal: not a list, empty, wrong element type, class out
+    of range, missing required target, an exclusive class that is not alone.
+    """
 
     payload = _base_payload()
     payload["message_classes"] = classes
 
-    _validate_authoritative_payload(payload)
+    with pytest.raises(MessageClassesContractViolation) as raised:
+        _validate_authoritative_payload(payload)
+    assert raised.value.codes
 
 
 def test_recognition_still_rejects_the_pre_existing_broken_payloads():

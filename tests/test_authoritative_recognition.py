@@ -935,7 +935,7 @@ def test_authoritative_apply_projects_future_shadow_contract_idempotently(
         assert contract.state == "pending"
 
 
-def test_commentary_target_contract_corrects_hold_without_business_writes(
+def test_commentary_target_contract_failure_is_terminal_without_business_writes(
     tmp_path,
     monkeypatch,
 ):
@@ -1006,10 +1006,12 @@ def test_commentary_target_contract_corrects_hold_without_business_writes(
 
     def model_caller(**kwargs):
         context_prompts.append(kwargs["system_prompt"])
-        corrected = "上一次响应违反 target_not_allowed" in kwargs["system_prompt"]
+        # ``hold`` with a target violates ``target_not_allowed``. The in-attempt
+        # "corrected" second ask is retired (phase 3 plan section 3.2): this is
+        # one request, then a terminal fail-closed outcome.
         return {
             "decision": "hold",
-            "target_thread_ids": [] if corrected else [thread.id],
+            "target_thread_ids": [thread.id],
             "management_action": None,
             "confidence": 0.9,
             "supporting_message_ids": [1600, 1601],
@@ -1036,14 +1038,12 @@ def test_commentary_target_contract_corrects_hold_without_business_writes(
         context_resolver=context_resolver,
     )
 
-    assert result.assessment.agreement_status != "authoritative_failed"
-    assert result.assessment.context_resolution.decision == "hold"
-    assert result.recognition.status == "非策略"
-    assert result.automation == {"status": "skipped", "reason": "mimo_no_action"}
+    assert result.assessment.agreement_status == "authoritative_failed"
+    assert result.assessment.terminal_failure_reason == "context_contract_failed"
+    assert result.automation == {"status": "skipped", "reason": "context_contract_failed"}
     assert executor_calls == []
-    assert len(context_prompts) == 2
+    assert len(context_prompts) == 1
     assert "上一次响应违反 target_not_allowed" not in context_prompts[0]
-    assert "上一次响应违反 target_not_allowed" in context_prompts[1]
     with session_factory() as session:
         assert session.query(StrategyManagementBatch).count() == 0
         assert session.query(PositionMutationIntent).count() == 0

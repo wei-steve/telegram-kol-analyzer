@@ -155,6 +155,28 @@ class TerminalAuthoritativeProcessingFailed(RuntimeError):
 
     queue_reason = _TERMINAL_EMPTY_INPUT_QUEUE_REASON
 
+    def __init__(self, message: str = "", *, queue_reason: str | None = None):
+        super().__init__(message)
+        if queue_reason is not None:
+            self.queue_reason = queue_reason
+
+
+def _terminal_contract_failure_reason(processing_result: Any) -> str | None:
+    """First-pass phase 3: a fail-closed outcome a retry cannot repair.
+
+    ``first_pass_contract_violation`` / ``context_contract_failed`` are set on
+    the assessment by ``assess_message_authoritatively``; the decision already
+    carries the same value as its automation reason, so the entry admission
+    barrier reads it as terminal, and the wakeups ran inside the authoritative
+    processor. All that is left for the job is not to be queued again.
+    """
+
+    assessment = getattr(processing_result, "assessment", None)
+    if getattr(assessment, "agreement_status", None) != "authoritative_failed":
+        return None
+    reason = getattr(assessment, "terminal_failure_reason", None)
+    return str(reason) if reason else None
+
 
 def _is_terminal_empty_input_authoritative_failure(
     processing_result: Any,
@@ -253,6 +275,8 @@ async def process_message_job(
                     retry_processor=(
                         authoritative_processor
                         if retry_authoritative_failure
+                        and _terminal_contract_failure_reason(processing_result)
+                        is None
                         else None
                     ),
                     retry_delay_seconds=(
@@ -278,6 +302,14 @@ async def process_message_job(
                 == "authoritative_failed"
                 and not retry_authoritative_failure
             ):
+                terminal_reason = _terminal_contract_failure_reason(
+                    processing_result
+                )
+                if terminal_reason is not None:
+                    raise TerminalAuthoritativeProcessingFailed(
+                        terminal_reason,
+                        queue_reason=f"terminal_authoritative_failure:{terminal_reason}",
+                    )
                 if _is_terminal_empty_input_authoritative_failure(
                     processing_result
                 ):

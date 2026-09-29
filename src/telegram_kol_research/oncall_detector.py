@@ -106,6 +106,10 @@ LOSSY_RECOGNITION_REASONS = frozenset(
         # here, the worker's rewrite would read to D3 as "re-recognised" and
         # clear the case of a message that was never read.
         "mimo_authoritative_failed_exhausted",
+        # Phase 3: terminal fail-closed contract failures. The message was
+        # not read by the execution chain and no retry is coming.
+        "first_pass_contract_violation",
+        "context_contract_failed",
         "authoritative_gap_recovery_expired",
         "lifecycle_apply_failed",
         "management_recognition_unresolved",
