@@ -36,8 +36,12 @@
   （关掉任一道，对应测试失败）。
 - 全量（最终候选）：10626 passed / 15 failed / 4 skipped（基于 origin/main 5ba66e8a）；`test_minimal_server_updater.py` 8 个与
   `test_server_update_scripts.py` 7 个失败在 origin/main 基线上同样失败，与本次无关。
+  这是 worktree 内缺 `.venv` 的已知现象（调度会话确认），不是回归。
 
 ## 部署与之后（风险级别 L1）
+
+- 排期：等调止盈 L2 观察窗结束、调度会话通知后第一个部署。部署前 rebase 到最新
+  origin/main，跑受影响测试 + 全量，再经用户确认后 `tg-deploy`。
 
 - 纯日志/异常文本改动，无 schema、无交易写语义、无依赖变化、无 systemd 单元变化。
 - 部署后可在服务器用计数方式核对（不打印内容）：
