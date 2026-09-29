@@ -107,7 +107,9 @@
     </div>
   </div>
 
-  {# One entry per signal in authoritative_recognition.CONTEXT_TRIGGER_ORDER.
+  {# One entry per signal in authoritative_recognition.CONTEXT_TRIGGER_ORDER,
+     plus the three retired ones (revision/cancellation/entered_holder_language)
+     because historical decision rows still carry those names.
      The reader needs to see which signal spent the token, so these are chips
      in the card body, never buried in the technical details. #}
   {% set context_trigger_labels = {
@@ -115,6 +117,8 @@
     'cancellation_language': '取消措辞',
     'entered_holder_language': '已入场/持有措辞',
     'management_without_exact_target': '管理指令无明确目标',
+    'exact_target_outside_candidates': '精确目标不在候选集合内',
+    'exact_target_not_manageable': '精确目标已不可管理',
     'multiple_same_source_candidates': '同来源多个候选策略',
     'reply_target_disagreement': '回复目标与识别目标不一致',
     'text_image_conflict': '图文冲突',
@@ -193,6 +197,11 @@
         {% set display_classification = 'unknown' %}
         {% set display_classification_label = '结论未记录' %}
       {% endif %}
+      {# 阶段 3 E2：首轮分类存在且无致命违规时，主标签直接读 message_classes（可多个）；
+         识别异常 / 需要上下文 仍优先；否则沿用上面的旧推导。data 属性仍由旧推导给出。 #}
+      {% set message_classes_fatal = message.message_classes_fatal_violations if message.message_classes_fatal_violations is defined else [] %}
+      {% set primary_from_classes = message_classes and not message_classes_fatal and display_classification not in ['error', 'context'] %}
+      {% set class_chip_styles = {'新策略': 'entry', '策略管理': 'management', '仓位管理': 'management', '闲话': 'irrelevant', '图片不可读': 'unknown'} %}
       {% set strategy_classification = display_classification in ['entry', 'management'] %}
       {% set accepted_candidate_count = system_acceptance.accepted_candidate_count if system_acceptance else 0 %}
       {% set missing_candidate = strategy_classification and message.signal_candidate_count == 0 %}
@@ -357,7 +366,19 @@
             </div>
           {% endif %}
           <div class="message-ai-chip-row" data-message-ai-chip-row aria-label="AI识别结论">
-            <span class="message-ai-chip is-{{ display_classification }}">{{ display_classification_label }}</span>
+            {% if primary_from_classes %}
+              {% for item in message_classes %}
+                <span class="message-ai-chip is-{{ class_chip_styles.get(item['class'], 'unknown') }}" data-message-primary-class>{{ item['class'] }}</span>
+              {% endfor %}
+              {% if message.message_classes_context_rewrote %}
+                <span class="message-ai-chip is-neutral" data-message-context-rewrote title="上下文分析改写了首轮的旧字段结论">上下文改写</span>
+              {% endif %}
+              {% if message.message_classes_execution_downgrade %}
+                <span class="message-ai-chip is-warning" data-message-execution-downgrade title="首轮分类被上下文降级，未按首轮执行">上下文降级：{{ message.message_classes_execution_downgrade.reason }}</span>
+              {% endif %}
+            {% else %}
+              <span class="message-ai-chip is-{{ display_classification }}">{{ display_classification_label }}</span>
+            {% endif %}
             {% if confidence is none %}
               <span class="message-ai-chip is-neutral">置信度未记录</span>
             {% elif confidence >= 0.8 %}

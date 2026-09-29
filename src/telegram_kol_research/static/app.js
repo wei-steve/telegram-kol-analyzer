@@ -277,6 +277,8 @@ const CONTEXT_TRIGGER_LABELS = {
   cancellation_language: '取消措辞',
   entered_holder_language: '已入场/持有措辞',
   management_without_exact_target: '管理指令无明确目标',
+  exact_target_outside_candidates: '精确目标不在候选集合内',
+  exact_target_not_manageable: '精确目标已不可管理',
   multiple_same_source_candidates: '同来源多个候选策略',
   reply_target_disagreement: '回复目标与识别目标不一致',
   text_image_conflict: '图文冲突',

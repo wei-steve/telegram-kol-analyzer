@@ -15,6 +15,7 @@ from telegram_kol_research.entry_confirmation_candidates import (
     is_entry_confirmation_candidate,
 )
 from telegram_kol_research.message_classification import (
+    NON_FATAL_VIOLATIONS,
     compare_message_classes,
     derive_message_classes,
 )
@@ -1059,7 +1060,41 @@ def _serialize_raw_messages(
         message_classes = (
             raw_message_classes if isinstance(raw_message_classes, list) else None
         )
-        message_classes_derived = derive_message_classes(authoritative_payload)
+        # Phase 3 plan §4 F4 / §1.3. ``authoritative_payload`` is the payload
+        # *after* context resolution rewrote the old fields, while the explicit
+        # ``message_classes`` is still the first pass's own. Comparing the two
+        # inflated "分类不一致" by ~80 rows, so derive from the first-pass old
+        # fields the context step stored in ``_context_resolution.first_pass``.
+        context_payload = authoritative_payload.get("_context_resolution")
+        first_pass_snapshot = (
+            context_payload.get("first_pass")
+            if isinstance(context_payload, dict)
+            else None
+        )
+        derive_source = authoritative_payload
+        message_classes_context_rewrote = False
+        if isinstance(first_pass_snapshot, dict):
+            derive_source = dict(authoritative_payload)
+            for key in ("recognition_result", "lifecycle_event", "strategy"):
+                if key in first_pass_snapshot:
+                    derive_source[key] = first_pass_snapshot[key]
+            message_classes_context_rewrote = (
+                first_pass_snapshot.get("recognition_result")
+                != authoritative_payload.get("recognition_result")
+                or first_pass_snapshot.get("lifecycle_event")
+                != authoritative_payload.get("lifecycle_event")
+            )
+        message_classes_derived = derive_message_classes(derive_source)
+        raw_execution_downgrade = (
+            context_payload.get("execution_downgrade")
+            if isinstance(context_payload, dict)
+            else None
+        )
+        message_classes_execution_downgrade = (
+            dict(raw_execution_downgrade)
+            if isinstance(raw_execution_downgrade, dict)
+            else None
+        )
         message_classes_agrees = (
             compare_message_classes(message_classes, message_classes_derived)["agrees"]
             if message_classes is not None
@@ -1073,6 +1108,14 @@ def _serialize_raw_messages(
             if isinstance(raw_message_classes_violations, list)
             else []
         )
+        # F2: violations are the ones stored with the first-pass evidence, never
+        # a re-parse of the (context-rewritten) final payload -- that produced
+        # false ``strategy_required`` on raw 19351 / 19481.
+        message_classes_fatal_violations = [
+            code
+            for code in message_classes_violations
+            if code not in NON_FATAL_VIOLATIONS
+        ]
         execution_uncertainty = _serialize_execution_uncertainty(decision)
         message_evidence = evidence_by_msg_id.get(raw_message.id)
         mimo_analysis = _serialize_mimo_analysis(
@@ -1193,6 +1236,9 @@ def _serialize_raw_messages(
                 "message_classes_derived": message_classes_derived,
                 "message_classes_agrees": message_classes_agrees,
                 "message_classes_violations": message_classes_violations,
+                "message_classes_fatal_violations": message_classes_fatal_violations,
+                "message_classes_context_rewrote": message_classes_context_rewrote,
+                "message_classes_execution_downgrade": message_classes_execution_downgrade,
                 "signal_candidate_count": len(
                     candidates_by_msg_id.get(raw_message.id, [])
                 ),
