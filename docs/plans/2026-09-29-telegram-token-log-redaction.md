@@ -50,3 +50,14 @@
 - **需用户决定**：部署后经 @BotFather 轮换受影响的 bot token（旧 token 已进入
   journald 与 `telegram-kol.log*` 轮转文件）；旧日志行可 `journalctl --vacuum-time`
   清理或等待自然过期，轮转日志文件同理。
+
+## 部署记录（2026-09-29）
+
+- 12:05:46Z `tg-deploy 4d342bbe138718b28a8a93e0f81587f32db4e08c`（代码同 7cdeb0ab）；回滚
+  `tg-deploy 5ba66e8aea77c4e70867d4a07b759032e20bef0e`。之后推 origin/main（非强推），
+  OFFENDERS 判决式 PASS（自测对 5ba66e8a 输出 FAIL）。`telegram-kol-oncall` 加载了
+  改动的 cli/app_logging，已单独重启；oncall-codex 不加载改动模块，未重启。
+- L1 观察 12:05:40–12:21Z：worker/web/ingest/oncall 带 token 的 journald 行 0、err 行 0、
+  NRestarts 0；`data/logs/telegram-kol.log` 部署后带 token 的行 0。
+- 该文件仍留有 3 行部署前（09:13Z 那条回溯）的 token，轮转文件 `.1`–`.10` 可能也有；
+  和 journald 旧行一起，由用户决定清理还是等待过期。
