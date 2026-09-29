@@ -422,3 +422,21 @@ B 会换算成 83800。
 - **与「调止盈」设计稿的交接。** 那份稿子（分支 `claude/take-profit-adjustment`）实施前要先 rebase 到本候选；
   本稿的回放用例（`test_m1_*`、`test_m2_guardrail_*`、`test_r2g_17936_*`）必须保持通过。
   另外，它要改的 R3（止损抽取误吃止盈价）本稿没有碰。
+
+## 9. 部署与观察（2026-09-29）
+
+- 部署前核对：生产 `0bcb894e`；`origin/main` 仍是 `6450ac67`，候选是它的后代，不需要 rebase；没有非终态管理批次；
+  未终结的合约都是 09-19～09-25 的挂单入场，不属于时效操作。用户在本会话确认后部署。
+- 部署顺序：
+  1. 推 `claude/sweet-jones-aaf0da`；
+  2. `tg-deploy 42d8a73bce4ec36a130804cebca8eba283b488c0`（04:07Z），代码与 `8ae8b8cc` 相同；worker、web、ingest 均为 active；
+  3. 推 `origin/main`，不带 `-f`；
+  4. OFFENDERS 检查：先自测，一次应得 FAIL、一次应得 PASS，都符合预期；正式判决为 **PASS**。
+- 回滚：`tg-deploy 0bcb894e9280d273e145eb44e99d24d14c6870a7`。值守代码没有改动，回滚后不需要重启值守服务。
+- L2 窗口：只读监视脚本 `/root/observe-mia-fixes.sh`，证据在 `/var/lib/telegram-kol-evidence/20260929-mia-fixes/`。
+  - 04:08:21Z → 05:27:30Z，连续 79 分钟，80 个样本全部健康，0 次重置；
+  - 5 条真实消息，来自 4 个群；
+  - 服务状态、HEAD、`submit_unknown`、critical 均正常；`management_stop_provenance_invalid` 为 0，未送达告警为 0。
+- **局限：** 窗口内没有产生管理批次，也没有触发任何一类新告警。M1、M2、护栏、Q1、M6 的正向执行路径**还没有真实样本**。
+  上线后出现的第一条米娅「止盈X%＋剩余止损」、第一条「第一止盈位到了」、第一条「半仓入场」，
+  要用交易所 GET 核对：减了几张、剩余止损挂在哪个价、有没有错写。
