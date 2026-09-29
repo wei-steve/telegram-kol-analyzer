@@ -133,3 +133,21 @@ def test_mia_and_other_regressions_are_exactly_what_they_were(tmp_path, monkeypa
 
     assert with_hook == without_hook
     assert all(row[0] != "adjust_take_profit" for row in with_hook)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("🔥设置好止盈止损持仓过夜！🔥\n止盈位：73070！！！\n止损位：78700！！！", 78700.0),
+        ("🔥剩余仓位继续持有，设置好止盈止损！\n止盈位：2710！！！\n止损位：2624！(成本价)", 2624.0),
+        ("止盈30%，剩下的止损移动到78000", 78000.0),
+        ("分批止盈30％！！！\n推保护价：77500！！！", 77500.0),
+        ("设置止损：  止盈：73070", None),
+    ],
+)
+def test_r3_the_take_profit_price_is_never_read_as_the_stop(text, expected):
+    from telegram_kol_research.message_recognition import (
+        _extract_explicit_stop_loss_from_management_text,
+    )
+
+    assert _extract_explicit_stop_loss_from_management_text(text) == expected
