@@ -20,7 +20,7 @@
 |---|---|---|
 | 阶段 1 · 影子 | L1（additive dormant） | `completed`（代码 `5ca19513`，提示词 v9 = `ai_prompt_versions.id=10` 已发布，观察窗通过） |
 | 阶段 2 · 观察与人工核准 | L0 | `completed`（2026-09-29：四张表已出；A、B 两组共 44 条人工核准已写入标注表） |
-| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 已部署 `24263e2f`，L2 观察窗进行中；批次 B 提示词待 v11 满一周） |
+| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 已部署 `24263e2f`，**L2 观察窗 PASS**；批次 B 提示词待 v11 满一周） |
 | 阶段 4 · 收口 | 以后 | `planned` |
 
 **仓库层面的一件事（2026-09-24，与本设计无关但影响所有会话）**：
@@ -733,6 +733,20 @@ v11 下 19016 被判「是策略、止损 null」，这是提示词【两套判�
 | 观察 | 服务器只读监视 `phase3-observe.service`（`/root/phase3-deploy/phase3_observe.py`），每分钟采样，日志 `/root/phase3-deploy/observe.log`，判决 `/root/phase3-deploy/verdict.txt`。PASS = 部署后 ≥30 分钟且 ≥5 条新决策、全程无硬异常；硬异常（服务不在、出现被删的触发名、非网络错误的上下文请求 >1、任务卡 >5 分钟、Traceback）立即停下判 ANOMALY；上限 24 小时 |
 
 部署在北京凌晨，流量低（部署时最后一条消息在 50 分钟前），观察窗预计白天凑满。
+
+### L2 观察窗结果：PASS（2026-09-29 23:03:40 UTC）
+
+- 部署后 3 小时 51 分钟攒够 5 条新决策，来自 3 个群（凌晨流量低）。全程每分钟采样，三服务 active；被删的三个触发名 0 次；非网络错误的上下文重复请求 0；卡住的任务 0；Traceback 0；识别失败 0；管理批次 0。
+- 这 5 条（19843–19847）都是 `[闲话]`，门判 `not_needed`，提示词 shared = 11（v11）。
+- 证据：服务器 `/root/phase3-deploy/observe.log`、`verdict.txt`、`baseline.txt`。
+
+**判决之后 4 分钟来的第一条新路径实盘样本：raw 19849（米娅群，2026-09-29 23:07:50 UTC）。**
+- 原文：「BTC多单目前浮盈出局1000点，止盈60%，剩余仓位止损位上移至82800，做无风险持仓！」
+- 首轮：`仓位管理 / exact / 1369`，`position_update`，`partial_take_profit,move_stop_to_protect`，止损 82800。
+- 1369（BTC 多）在 19:11:01 已 `expired`，从未入场：它的入场挂单（执行绑定 391）`entry_legs_terminal`、无 pos_id；米娅群近 3 天没有别的持仓。**我们在交易所上没有这笔仓位，没有裸露风险。**
+- 走的路：新判据 `exact_target_outside_candidates` 触发上下文（旧代码下同样会被 `entered_holder_language`「持仓」触发）→ 上下文只问 1 次，`target_outside_candidate_set`（被拒目标 thread 738）→ 3d 不适用（`position_update` 不是撤单类）→ 终态 `skipped / context_contract_failed`，已告警，任务 `succeeded` 不再排队。旧代码下这里会在同一次尝试里再问一次，并由处理任务再退避重试 5 次、堵同群约 4 分钟。
+- 结果对：没仓位可管，不写交易所；比旧路径少了重试和堵队。
+- **留给后续的一个疑点**：被拒的 thread 738 出现在这次调用的 `candidate_thread_ids_json` 里（`[223,283,375,657,712,738]`），却被判「不在候选集合内」。可能是给解析器的允许集合与记录的候选列表来源不同（例如 A-7 收窄）。这是上下文解析器既有的不一致，不是本阶段引入的；按陈哥稿 3a 的诊断字段，可以再攒几例后查。
 
 ### 批次 B · 提示词（未开始）
 
