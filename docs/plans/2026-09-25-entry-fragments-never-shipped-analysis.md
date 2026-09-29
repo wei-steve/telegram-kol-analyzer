@@ -297,3 +297,117 @@ if existing is not None:
 不动 `entry_preambles` 任何行。本文第 3 节「退役具体包含什么」那三条本地代码/文档改动
 （删种子那一节、删两条测试断言、改 `prompt_composition.py:119` 的注释）
 也一并等到同批，避免在观测窗内产生任何与识别链相关的提交。
+
+## 6. 执行记录（2026-09-29）
+
+§5 的 ①② 于 2026-09-29 执行完毕，用户在会话里逐项确认。三件事：发布提示词、清理一行数据、
+退役代码种子里的 `entry_fragments`。
+
+### 6.1 ① 提示词：`ai_prompt_versions.id = 11`，2026-09-29 16:14:30.291724 UTC
+
+底稿是**生产 v9（`id = 10`）原文**，7397 字符（v9 是 6704），校验器 `success=True errors=[]`。
+回滚是把 `ai_prompt_definitions.id = 1` 的 `active_version_id` 退回 `10`，不必回滚代码。
+发布经 `prompt_registry.save_prompt_draft` / `publish_prompt_draft`，比对交换参数
+（`expected_active_version_id` / `expected_draft_version_id`）全程带着，没有写裸 SQL。
+
+原计划只改一处，最后改了三处，多出来的两处都是被现场证据逼出来的：
+
+**(a) 计划内 · leg_allocation 规则。** 【新开仓前置仓位指令】末尾加两行：
+「两个点位各半仓」= 整单正常仓位拆成两腿，`risk_multiplier` 输出 1，**不得输出 0.5**；
+并说明「各」字作用在谁身上——「半仓入场」是整单减半（0.5），「两个点位各半仓」是每腿各半、整单不变（1）。
+没有引入 `entry_fragments`，规则落在生产真正在填的 `entry_context` 上。
+
+**(b) 计划外 · 补全被截断的一节。** 调查过程中发现生产 v9 的【两套判据刻意不一致，不要自行调和】
+只剩一条半，第二条断在「- 下面」，后面四条全缺。两条独立路径核实过不是取数时截断的
+（`length(content)` 与本地读到的字符数都是 6704；又在服务器上直接打印了那段的 `repr`）。
+按代码种子原稿照抄补回。四分类线同意并入本次发布，细节记在
+`docs/first-pass-classification-status.md`「第二条测量界线」一节。
+
+**(c) 计划外 · `strategy` 为 null 的条件改成带优先级的写法。** 这一条是回放逼出来的。
+只做 (b) 的稿子在 19016 上输出 `recognition_result = 是策略` + `strategy = null`，
+被 `recognition_experiments._validate_authoritative_payload:802` 拒收，报
+`MiMo response missing strategy`——就是 2026-09-27 部署 `e1d29708` 修掉的那个 20% 故障。
+根因是两条规则在这类消息上互相矛盾：v9 的「数组里没有 新策略 元素时 strategy 必须为 null」
+与补全后的「只有止盈没有止损 → recognition_result = 是策略，而 message_classes 不含 新策略」。
+`e1d29708` 的代码注释写着「strategy 为 null 的情况就是 recognition_result 不是 是策略 的每一种」,
+这个前提正是**被截断的提示词**让它成立的。改成：
+
+> 数组里没有 新策略 元素、**且 recognition_result 不是 是策略** 时，strategy 必须为 null；
+> 若 recognition_result = 是策略（见下面【两套判据刻意不一致】举的那个例子），
+> strategy 必须是完整对象，即使 message_classes 不含 新策略。
+
+与 `_validate_authoritative_payload` 逐字对齐，纯提示词，不改代码。
+**这个矛盾在代码种子里本来就有**（种子同时带着两条），只是种子从未上过生产，所以没人撞到。
+
+### 6.2 发布前的历史对照回放
+
+走提示词中心既有的 `prompt_testing.run_prompt_draft_test`，每条消息跑现行版与新稿各一次，
+模型是权威识别环节链首 `gpt-5.6-luna`。两轮共 13 次 run。
+
+**第二轮（最终稿，`ai_prompt_test_runs` 20–24）—— 验收依据：**
+
+| raw_id | 用途 | 现行 v9 | 新版本 |
+|---|---|---|---|
+| 19016 | (c) 的验证 | 非策略，strategy 非 dict | **是策略**，strategy 完整对象，`error = null` |
+| **12769** | 主目标 | `entry_context.risk_multiplier = 0.5` | **1** |
+| 6925 | 目标 | 0.5 | **1** |
+| 9821 | 对照 | 0.5 | 0.5（未动） |
+| 18938 | 对照 | 是策略 / `[新策略]` | 完全相同 |
+
+**一个方法上的坑值得记下来**：`compare_assessments` **不比较 `entry_context`**，
+所以页面上的 `differences` 对本次改动是空的。验收是直接读 `active_result_json` /
+`draft_result_json` 里的 `entry_context.risk_multiplier` 做的。
+反过来 `differences` 为空正好证明 `recognition_result` / `strategy.*` /
+`lifecycle_event.*` / `message_classes` 没被带偏。
+
+**第一轮（只做 (b) 的稿子，run 20–27，已被 `save_prompt_draft` 改稿时自动删除）留下两条记录：**
+- 19016 报 `MiMo response missing strategy`——就是它导致了 (c)。
+- 7929 与 12042 的 `message_classes` 从 `[策略管理/unknown]`（12042 还多一个 `仓位管理`）
+  变成 `[闲话]`。两条都没有标的；新规则说「各半仓 = 1 = 正常仓位」，
+  按 v9 自己那句「只有当消息携带对后续策略有用的信息（仓位倍率）时才算 策略管理」，
+  没有定量就该落 闲话。**是规则的后果，不是 bug，但确实动了 message_classes**，
+  与「message_classes 不受影响」的预估不符，已交四分类线。
+
+### 6.3 ② `entry_preambles.id = 9` 的 L3 修复
+
+| | |
+|---|---|
+| 备份 | `/opt/telegram-kol-analyzer/data/backups/research-preamble9-repair-20260929T161502Z.db` |
+| 大小 / 校验 | 488 726 528 字节；`sha256 = 7ad982286ba1a47760c714d2c43bf347f4764843ea2330fbfda1fca4bd4b9ea1`；`PRAGMA quick_check = ok` |
+| 改动 | 一行：`UPDATE entry_preambles SET status='invalidated', invalidated_at=…, updated_at=… WHERE id=9 AND status='pending'`，`rowcount = 1` |
+| 回滚 | 把该行 `status` 改回 `pending`、两个时间戳清回 `NULL` / `2026-08-24 03:39:52.077112` |
+
+前后计数：
+
+| | 前 | 后 |
+|---|---|---|
+| `entry_preambles` 按状态 | consumed 4 / expired 1 / invalidated 4 / **pending 11**，共 20 | consumed 4 / expired 1 / **invalidated 5** / **pending 10**，共 20 |
+| `entry_strategy_assemblies` | 133 | 133 |
+| `entry_strategy_fragments` | 0 | 0 |
+
+行的内容保留（`risk_multiplier` 仍是 0.5，作为审计痕迹），只改状态。
+风险按 §5 说过的口径：`entry_message_assembly_v2_mode = live` 时走 v2 路径，
+v1 的 `select_entry_preamble` 不被调用，所以这行本来就消费不到——这是记录修正
+加上消除一个条件性隐患，不是止血。
+
+### 6.4 ③ 代码种子的 `entry_fragments` 退役
+
+`prompt_defaults.py` 删掉【相邻入场消息片段】整节与 `entry_fragments` 的 JSON 示例，
+`forthcoming` 那行不再写「entry_context 或 entry_fragments」，
+「对后续策略有用的信息（仓位倍率、分腿比例、补仓价）」收回成「（仓位倍率）」，
+并把 6.1 的 (a)(c) 两处同步进种子。种子里 `entry_fragments` 现在一处不剩。
+
+三条测试断言跟着改：
+- `tests/test_prompt_composition.py` —— 删掉钉 `"entry_fragments"` / `全仓操作` /
+  `正常仓位操作` / `补仓价格` / `推断半仓` 的断言，换成钉新规则的两条；
+- `tests/test_ai_recognition_config.py` —— `'"entry_fragments"' in …` 换成 `"两个点位各半仓" in …`；
+- `tests/test_message_classes_shadow.py` —— §8 阶段 1「不删既有字段」那个元组里去掉
+  `"entry_fragments"`。它从来不是这条规则要保护的那种「既有字段」：没有任何已发布版本要求过它。
+
+**留下来没动的**：`entry_strategy_fragments` 表、`normalize_entry_strategy_fragments`、
+`adjacent_entry_assembly` 的 `leg_allocation` / `supplemental_entry` 分支——按 §3 的结论保留。
+
+**种子仍比生产多一块 `instructions`**（【价格与字段归一化】两行、【新开仓识别】两行、
+「元素顺序…与 instructions 的排序约定一致」、以及 JSON 里的 `instructions` 数组）。
+那是**另一个从未上过生产的契约**，与本议题同构但不在本次批准范围，一个字没动。
+下一个碰这块的人应当先问它和 `entry_fragments` 是不是同一个故事。
