@@ -356,6 +356,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # message's number, so a person must see every occurrence rather than
         # discover it from the fill.
         "management_add_position_rejected_stop_superseded",
+        # 2026-09-29, M6/Q3: a bare "半仓入场/半仓进场" confirmation the model
+        # missed (#19064 was judged 闲聊 and opened full size), caught instead
+        # by a deterministic rule. A person must see it because the rule
+        # silently changes an order's size, and because a miss here is the
+        # same failure the rule exists to catch.
+        "half_position_entry_confirmed_by_rule",
     }
 )
 

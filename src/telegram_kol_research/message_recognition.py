@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import mimetypes
@@ -101,6 +102,7 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_management_target_failure,
     capture_runtime_incident_best_effort,
 )
+from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.strategy_management_contracts import (
     management_contract_fingerprint,
     serialize_management_contract,
@@ -1379,34 +1381,16 @@ def _apply_lifecycle_event_decision(
             _remember_applied_candidate(session, candidate, applied_candidate_ids)
             return True
 
-        target.lifecycle_status = "entered"
-        target.entered_at = event_at
-        target.entry_signal_message_id = raw_message.message_id
-        if entry_price is not None:
-            target.entry_price_actual = entry_price
-        target.exit_reason = None
-        target.exited_at = None
-        target.updated_at = utc_now()
-        candidate = _upsert_entry_confirmation_candidate(
+        _apply_entry_confirmation_lifecycle_update(
             session,
             raw_message=raw_message,
-            lifecycle=target,
+            target=target,
             entry_price=entry_price,
-            parse_source=parse_source,
-        )
-        _remember_applied_candidate(session, candidate, applied_candidate_ids)
-        # 2026-09-23, design section 4.2.2. The sizing word this message carries
-        # has nowhere else to go: MiMo only emits ``entry_context`` for messages
-        # it cannot map onto an existing strategy, and this one it could. Writing
-        # the preamble inside the same transaction as the lifecycle update is
-        # what lets the next adjacent strategy size itself from it.
-        _persist_entry_confirmation_preamble(
-            session,
-            raw_message=raw_message,
-            lifecycle=target,
+            event_at=event_at,
             confidence=confidence,
-            recognition_generation=authoritative_generation,
-            now=event_at,
+            authoritative_generation=authoritative_generation,
+            applied_candidate_ids=applied_candidate_ids,
+            parse_source=parse_source,
         )
         return True
 
@@ -3189,6 +3173,26 @@ def apply_authoritative_mimo_payload(
                     authoritative_payload=payload,
                 )
 
+        half_position_entry_confirmation_match = None
+        if not lifecycle_applied:
+            # 2026-09-29, design section M6/Q3 (#19064). Runs regardless of
+            # ``event_type`` -- the failure mode this covers is the model
+            # answering ``none`` -- and only after every model-driven branch
+            # above has had its chance, so a message the model resolved
+            # correctly (#18890) never reaches it. The incident is captured
+            # below, only after this transaction commits (own session, own
+            # write -- see ``_HalfPositionEntryConfirmationMatch``).
+            half_position_entry_confirmation_match = (
+                _apply_deterministic_half_position_entry_confirmation_if_matched(
+                    session,
+                    raw_message,
+                    authoritative_generation=authoritative_generation,
+                    applied_candidate_ids=accepted_candidate_ids,
+                    now=raw_message.posted_at or utc_now(),
+                )
+            )
+            lifecycle_applied = half_position_entry_confirmation_match is not None
+
         lifecycle_event.pop("_exact_context_risk_reduction_authorized", None)
 
         result = _result_from_ai_payload(
@@ -3303,6 +3307,11 @@ def apply_authoritative_mimo_payload(
                 lifecycle_event=lifecycle_event,
                 authoritative_generation=authoritative_generation,
                 reason_code=projection_failure_reason,
+            )
+        if half_position_entry_confirmation_match is not None:
+            _capture_half_position_entry_confirmation_incident(
+                session_factory,
+                match=half_position_entry_confirmation_match,
             )
         return result
 
@@ -4655,6 +4664,242 @@ def _evidence_text_field(
     if not isinstance(entry, Mapping):
         return None
     return entry.get("value")
+
+
+def _apply_entry_confirmation_lifecycle_update(
+    session,
+    *,
+    raw_message: RawMessage,
+    target: StrategyLifecycle,
+    entry_price: float | None,
+    event_at: datetime,
+    confidence: float,
+    authoritative_generation: str | None,
+    applied_candidate_ids: set[int] | None,
+    parse_source: str,
+) -> None:
+    """Shared tail of an ``entry_confirm`` decision, model-driven or not.
+
+    2026-09-29, design section M6/Q3. Factored out so the deterministic
+    "半仓入场" fallback below produces exactly the same effect a correct model
+    ``entry_confirm`` / ``half_position_entry`` decision would have (#18890):
+    the lifecycle flips to entered, an ``entry_confirm``-marked candidate is
+    written so the four execution/alert gates that read that marker still see
+    it, and the sizing word this message carries is persisted as a preamble
+    for the adjacent-entry assembly to pick up.
+    """
+
+    target.lifecycle_status = "entered"
+    target.entered_at = event_at
+    target.entry_signal_message_id = raw_message.message_id
+    if entry_price is not None:
+        target.entry_price_actual = entry_price
+    target.exit_reason = None
+    target.exited_at = None
+    target.updated_at = utc_now()
+    candidate = _upsert_entry_confirmation_candidate(
+        session,
+        raw_message=raw_message,
+        lifecycle=target,
+        entry_price=entry_price,
+        parse_source=parse_source,
+    )
+    _remember_applied_candidate(session, candidate, applied_candidate_ids)
+    # 2026-09-23, design section 4.2.2. The sizing word this message carries
+    # has nowhere else to go: MiMo only emits ``entry_context`` for messages
+    # it cannot map onto an existing strategy, and this one it could. Writing
+    # the preamble inside the same transaction as the lifecycle update is
+    # what lets the next adjacent strategy size itself from it.
+    _persist_entry_confirmation_preamble(
+        session,
+        raw_message=raw_message,
+        lifecycle=target,
+        confidence=confidence,
+        recognition_generation=authoritative_generation,
+        now=event_at,
+    )
+
+
+#: 2026-09-29, design section M6/Q3 (#19064). A message that, signature
+#: stripped, is *only* this phrase -- optionally followed by exclamation
+#: marks -- and nothing else. Longer text such as "半仓入场，另一半等回调"
+#: carries its own qualification and must still go to the model; matching a
+#: bare substring would catch that case too and is deliberately not done here.
+_BARE_HALF_POSITION_ENTRY_RE = re.compile(r"^(?:半仓入场|半仓进场)[!！]*$")
+
+#: How long after the preceding strategy message a bare "半仓入场" is still
+#: read as its confirmation. Chosen in the 2026-09-29 design (Q3, recommended
+#: value); an older message is left to the model, same as before this rule.
+HALF_POSITION_ENTRY_CONFIRMATION_MAX_AGE = timedelta(seconds=60)
+
+#: Delivered unconditionally (added to ``config.ALWAYS_NOTIFIED_INCIDENT_TYPES``).
+HALF_POSITION_ENTRY_DETERMINISTIC_INCIDENT_TYPE = (
+    "half_position_entry_confirmed_by_rule"
+)
+
+
+def _bare_half_position_entry_text(text: str | None) -> bool:
+    """Whether ``text``, signature stripped, is only a half-position phrase."""
+
+    scrubbed = scrub_contact_identifiers(text or "")
+    return bool(_BARE_HALF_POSITION_ENTRY_RE.match(scrubbed.strip()))
+
+
+def _find_immediately_preceding_pending_entry_lifecycle(
+    session,
+    raw_message: RawMessage,
+) -> StrategyLifecycle | None:
+    """The one strategy this bare confirmation could be confirming, or none.
+
+    Only the *immediately preceding* strategy message in the same chat
+    (``StrategyLifecycle.signal_at`` is the underlying raw message's own
+    ``posted_at``, set in ``_ensure_lifecycle_record``), and only when it is
+    still awaiting its entry. An older or already-resolved strategy is left to
+    the model, matching the design's "同一群上一条策略消息" wording.
+    """
+
+    posted_at = raw_message.posted_at
+    if posted_at is None:
+        return None
+    preceding = (
+        session.query(StrategyLifecycle)
+        .filter(
+            StrategyLifecycle.chat_id == int(raw_message.chat_id),
+            StrategyLifecycle.signal_at < posted_at,
+        )
+        .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+        .first()
+    )
+    if preceding is None or preceding.lifecycle_status != "pending_entry":
+        return None
+    age = posted_at - preceding.signal_at
+    if age < timedelta(0) or age > HALF_POSITION_ENTRY_CONFIRMATION_MAX_AGE:
+        return None
+    return preceding
+
+
+@dataclass(frozen=True)
+class _HalfPositionEntryConfirmationMatch:
+    """What the incident capture needs, read while the ORM row is still live.
+
+    Recorded so the incident can be captured *after* the caller's own session
+    commits -- see the module docstring on ``_capture_committed_multi_target_failures``
+    for why: ``record_runtime_incident`` opens its own session, and doing that
+    while this module's own session still holds an uncommitted write produces
+    ``database is locked`` on SQLite, not a nested-write warning.
+    """
+
+    raw_message_id: int
+    target_lifecycle_id: int
+    chat_id: int
+    symbol: str
+    side: str
+    occurred_at: datetime
+
+
+def _capture_half_position_entry_confirmation_incident(
+    session_factory: sessionmaker,
+    *,
+    match: _HalfPositionEntryConfirmationMatch,
+) -> None:
+    """Mandatory deterministic capture; never silenced by an env whitelist.
+
+    Mirrors ``management_stop_price_gate.record_stop_gate_rejection``'s
+    "mandatory deterministic ledger capture" shape, but this call site is not
+    itself the execution path -- a failed capture must not stop the
+    confirmation it is reporting on, so it fails open and logs instead of
+    propagating. Called only after the confirmation's own transaction has
+    committed (see ``_HalfPositionEntryConfirmationMatch``).
+    """
+
+    try:
+        record_runtime_incident(
+            session_factory,
+            source_kind="strategy_lifecycle",
+            source_record_id=str(match.target_lifecycle_id),
+            incident_type=HALF_POSITION_ENTRY_DETERMINISTIC_INCIDENT_TYPE,
+            severity="high",
+            fingerprint=hashlib.sha256(
+                f"half_position_entry_confirmed_by_rule:{match.raw_message_id}:"
+                f"{match.target_lifecycle_id}".encode()
+            ).hexdigest(),
+            redacted_summary=json.dumps(
+                {
+                    "component": "entry_confirmation",
+                    "reason_code": "half_position_entry_confirmed_by_rule",
+                    "chat_id": match.chat_id,
+                    "raw_message_id": match.raw_message_id,
+                    "impact": f"{match.symbol} {match.side}",
+                }
+            ),
+            occurred_at=match.occurred_at,
+            feature_policy_version="half-position-entry-deterministic-v1",
+            prompt_version="none",
+            tool_policy_version="no-exchange-write",
+            evidence_refs_json=json.dumps(
+                [
+                    f"raw_message:{match.raw_message_id}",
+                    f"strategy_lifecycle:{match.target_lifecycle_id}",
+                ]
+            ),
+            affected_raw_message_id=None,
+            message_operation_contract_id=None,
+        )
+    except Exception:
+        logger.warning(
+            "half_position_entry_confirmed_by_rule incident capture failed "
+            "open: raw_message_id=%s target_lifecycle_id=%s",
+            match.raw_message_id,
+            match.target_lifecycle_id,
+        )
+
+
+def _apply_deterministic_half_position_entry_confirmation_if_matched(
+    session,
+    raw_message: RawMessage,
+    *,
+    authoritative_generation: str | None,
+    applied_candidate_ids: set[int] | None,
+    now: datetime,
+) -> _HalfPositionEntryConfirmationMatch | None:
+    """Fallback for a bare "半仓入场" the model missed (#19064).
+
+    2026-09-29, design section M6/Q3. Fires only when nothing else already
+    applied this message (so a model that correctly recognised the
+    confirmation, as it did for #18890, is untouched and never double-sized)
+    and only for the exact bare phrase within 60 seconds of the one strategy
+    it could be confirming. Produces exactly the effect the model's own
+    ``entry_confirm`` / ``half_position_entry`` decision would have: it does
+    not touch a lifecycle that has already left ``pending_entry`` -- entered
+    (filled) or otherwise -- so an already-filled market leg is never resized
+    down after the fact. Returns the match (for the caller to capture an
+    incident about, once its transaction has committed) or ``None``.
+    """
+
+    if not _bare_half_position_entry_text(raw_message.text):
+        return None
+    target = _find_immediately_preceding_pending_entry_lifecycle(session, raw_message)
+    if target is None:
+        return None
+    _apply_entry_confirmation_lifecycle_update(
+        session,
+        raw_message=raw_message,
+        target=target,
+        entry_price=None,
+        event_at=now,
+        confidence=1.0,
+        authoritative_generation=authoritative_generation,
+        applied_candidate_ids=applied_candidate_ids,
+        parse_source="half_position_entry_deterministic",
+    )
+    return _HalfPositionEntryConfirmationMatch(
+        raw_message_id=int(raw_message.id),
+        target_lifecycle_id=int(target.id),
+        chat_id=int(raw_message.chat_id),
+        symbol=str(target.symbol),
+        side=str(target.side),
+        occurred_at=now,
+    )
 
 
 def _persist_entry_confirmation_preamble(
