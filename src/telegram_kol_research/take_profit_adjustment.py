@@ -926,3 +926,178 @@ def _decimal_text(value: Decimal) -> str:
     normalized = value.normalize()
     text = format(normalized, "f")
     return text
+
+
+# --------------------------------------------------------------------------
+# Entry legs of the same strategy that have not filled yet
+
+
+@dataclass(frozen=True, slots=True)
+class UnfilledTakeProfitPlan:
+    """The share plan an entry leg that has not filled should carry.
+
+    An unfilled leg has no position and no size yet; its take-profit plan is
+    a list of ``(price, share-of-position %)`` that the convergence worker
+    turns into order sizes once the leg fills. Shares sum to exactly 100.
+    """
+
+    status: str
+    reason_code: str | None = None
+    targets: tuple[tuple[str, str], ...] = ()
+    dropped_crossed: tuple[str, ...] = ()
+
+    def as_evidence(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "reason_code": self.reason_code,
+            "targets": [list(item) for item in self.targets],
+            "dropped_crossed": list(self.dropped_crossed),
+        }
+
+
+def plan_unfilled_take_profit_allocations(
+    *,
+    instruction: TakeProfitInstruction,
+    side: str,
+    last_price: Any,
+    current_plan: Sequence[tuple[Any, Any]],
+    strategy_take_profit_prices: Sequence[Any] = (),
+) -> UnfilledTakeProfitPlan:
+    """New ``(price, %)`` plan for an unfilled entry leg of the same strategy.
+
+    Same reading of the instruction as :func:`plan_take_profit_adjustment`,
+    in shares instead of contracts:
+
+    * full reset / ratios only / prices only: the prices and shares the
+      instruction gives (prices only keeps this leg's own split when the tier
+      count is unchanged, else the entry-time default table);
+    * single tier: that tier is replaced (same price, else the named ``第N``
+      tier) or added in this leg's current plan at the named share, and the
+      other tiers are scaled so the plan still totals 100;
+    * tiers the market has already crossed are dropped and their share goes
+      to the rest, exactly as for a filled position.
+    """
+
+    normalized_side = str(side or "").strip().lower()
+    last = _decimal(last_price)
+    if normalized_side not in {"long", "short"} or last is None or last <= 0:
+        return UnfilledTakeProfitPlan(PLAN_REFUSED, REASON_INPUT_INVALID)
+    current: list[tuple[Decimal, Decimal]] = []
+    for price, share in current_plan:
+        parsed_price, parsed_share = _decimal(price), _decimal(share)
+        if (
+            parsed_price is None
+            or parsed_price <= 0
+            or parsed_share is None
+            or parsed_share <= 0
+        ):
+            return UnfilledTakeProfitPlan(PLAN_REFUSED, REASON_INPUT_INVALID)
+        current.append((parsed_price, parsed_share))
+
+    if instruction.mode == MODE_SINGLE_TIER:
+        if len(instruction.prices) != 1 or len(instruction.allocations) != 1:
+            return UnfilledTakeProfitPlan(PLAN_REFUSED, REASON_ALLOCATION_INVALID)
+        price = _decimal(instruction.prices[0])
+        share = _decimal(instruction.allocations[0])
+        if price is None or price <= 0:
+            return UnfilledTakeProfitPlan(PLAN_REFUSED, REASON_PRICE_MISSING)
+        if share is None or not 0 < share < 100:
+            return UnfilledTakeProfitPlan(PLAN_REFUSED, REASON_ALLOCATION_INVALID)
+        if _crossed(price, side=normalized_side, last=last):
+            return UnfilledTakeProfitPlan(
+                PLAN_REFUSED,
+                REASON_ALL_TIERS_CROSSED,
+                dropped_crossed=(_decimal_text(price),),
+            )
+        nearest_first = sorted(
+            current, key=lambda row: row[0], reverse=normalized_side == "short"
+        )
+        replaced = next(
+            (index for index, row in enumerate(nearest_first) if row[0] == price),
+            None,
+        )
+        if (
+            replaced is None
+            and instruction.tier_index is not None
+            and 1 <= instruction.tier_index <= len(nearest_first)
+        ):
+            replaced = instruction.tier_index - 1
+        others = [
+            row for index, row in enumerate(nearest_first) if index != replaced
+        ]
+        if not others:
+            tiers = [(price, Decimal("100"))]
+        else:
+            rest = Decimal("100") - share
+            scaled = _scaled_to(
+                [row[1] for row in others], total=rest
+            )
+            if scaled is None:
+                return UnfilledTakeProfitPlan(PLAN_REFUSED, REASON_ALLOCATION_INVALID)
+            tiers = [(row[0], value) for row, value in zip(others, scaled)]
+            tiers.append((price, share))
+        tiers.sort(key=lambda item: item[0], reverse=normalized_side == "short")
+        return UnfilledTakeProfitPlan(
+            PLAN_READY,
+            targets=tuple(
+                (_decimal_text(price), _decimal_text(value)) for price, value in tiers
+            ),
+        )
+
+    pseudo_existing = [
+        (price, share, f"plan-{index}") for index, (price, share) in enumerate(current)
+    ]
+    try:
+        prices, shares = _prices_and_shares(
+            instruction=instruction,
+            existing=pseudo_existing,
+            filled=set(),
+            strategy_prices=strategy_take_profit_prices,
+        )
+    except _Refusal as refusal:
+        return UnfilledTakeProfitPlan(PLAN_REFUSED, refusal.reason_code)
+    tiers = sorted(
+        zip(prices, shares), key=lambda item: item[0], reverse=normalized_side == "short"
+    )
+    dropped_crossed = tuple(
+        _decimal_text(price)
+        for price, _ in tiers
+        if _crossed(price, side=normalized_side, last=last)
+    )
+    tiers = [
+        (price, share)
+        for price, share in tiers
+        if not _crossed(price, side=normalized_side, last=last)
+    ]
+    if not tiers:
+        return UnfilledTakeProfitPlan(
+            PLAN_REFUSED, REASON_ALL_TIERS_CROSSED, dropped_crossed=dropped_crossed
+        )
+    scaled = _scaled_to([share for _, share in tiers], total=Decimal("100"))
+    if scaled is None:
+        return UnfilledTakeProfitPlan(PLAN_REFUSED, REASON_ALLOCATION_INVALID)
+    return UnfilledTakeProfitPlan(
+        PLAN_READY,
+        targets=tuple(
+            (_decimal_text(price), _decimal_text(value))
+            for (price, _), value in zip(tiers, scaled)
+        ),
+        dropped_crossed=dropped_crossed,
+    )
+
+
+def _scaled_to(values: Sequence[Decimal], *, total: Decimal) -> list[Decimal] | None:
+    """Scale positive shares to sum to exactly ``total`` (six places, remainder last)."""
+
+    current = sum(values, Decimal("0"))
+    if not values or current <= 0 or total <= 0:
+        return None
+    quantum = Decimal("0.000001")
+    scaled = [
+        (value * total / current).quantize(quantum) for value in values[:-1]
+    ]
+    last = total - sum(scaled, Decimal("0"))
+    if last <= 0 or any(value <= 0 for value in scaled):
+        return None
+    scaled.append(last)
+    return scaled

@@ -15,6 +15,39 @@
 | 5 | 执行器（shadow / live）、R4 收敛计划改写、超时收口、通知 | 完成 | `8fd1ad2f` |
 | 7 | 回放与合成用例补齐、状态文档、最终全量（10438 passed, 4 skipped） | 完成 | 最后一个提交（见 git log） |
 
+### 返工（2026-09-29 指挥会话审阅）
+
+| # | 内容 | 状态 |
+|---|---|---|
+| R-1 | shadow 终态改为 `resolved`（原因码仍为 `take_profit_adjust_shadow_planned`），leg 置 `skipped`；仍发管理通知，目标计划写进批次快照 `target_snapshot.take_profit_adjustment.execution`（指纹同步重算）。真正的拒绝仍为 `blocked`。依据：`oncall_detector.py` 规则 D2 把 `blocked` 当失败，`succeeded/resolved` 当成功 | 完成 |
+| R-2 | 同一 binding、同一策略下**未成交**入场腿（收敛行 `pos_id` 为空且状态为 `waiting_position/waiting_backup_stop`，入场腿非终态）：live 时把它的 `desired_take_profits_json` 和 `planned` 状态的止盈保护腿改成新计划（价位 + 百分比）；shadow 只记进快照。与已成交仓位一起在第一次写入前规划，任一未成交腿算不出计划就整条拒绝、零写入 | 完成 |
+| R-3 | binding 388 同形状的收敛器集成测试（`tests/test_take_profit_adjustment_unfilled_leg.py`）；修了对账把 `submitted` 收敛冻结成 `conflicted` 的问题 | 完成 |
+
+R-2 的细节：
+- **两种 `planned_size` 口径**：入场提交时为未成交单写的保护腿存的是**仓位百分比**（`recovery_live_submit` 存草稿的 `allocation_pct`，如 `'50.0'`）；为已有仓位写的腿（`materialize_verified_position_protection`、收敛器、本功能的已成交路径）存的是**张数**。
+  未成交腿的新保护腿沿用百分比，且沿用原值的写法（原值带小数点就写成 `100.0`）。新代码里没有任何地方把已有保护腿的 `planned_size` 当张数读（已逐处核对：执行器只在写入新腿时写 `planned_size`，只在判断写法时看原值字符串）。
+- **各模式的百分比计划**（纯函数 `take_profit_adjustment.plan_unfilled_take_profit_allocations`）：整套重设 / 只给比例 / 只给价位与已成交仓位同样算法（只给价位时档数不变沿用该腿自己的比例，档数变了用默认表）；
+  只说一档则在该腿原计划里替换同价档（否则按「第 N 档」，都没有就加入），其余档按比例缩放使合计恰为 100（6 位小数，余数给最后一档）；已被现价越过的档去掉、份额并入其余档。
+- **何时写**：所有已成交仓位的新结构都已就位（已一致、已替换、或撤旧成功挂新失败而交给收敛器按新计划重试）时，才在一个事务里改写未成交腿；
+  止损替换失败、认领失败、撤单阶段失败时不改（未成交腿继续跟策略其余部分的旧计划一致），即「失败回滚一并覆盖」。
+  事务内逐行复查：如果该腿在此期间已成交（收敛行有了 `pos_id` 或离开等待状态），不改它。
+- 原计划解析失败 → 新原因码 `take_profit_adjust_unfilled_leg_plan_invalid`。
+
+R-3 发现并修复的问题：`position_take_profit_orders.reconcile_trigger_take_profit_order_history` 对 `submitted` 收敛
+把该收敛名下**所有** `PositionTakeProfitOrder` 的张数相加作为计划张数。调止盈后，旧单（已撤）和新单记在同一收敛下，
+10+5+15=30 > 实际仓位 15，于是把收敛冻结为 `conflicted / convergence_partial_position_unexplained`。
+修法：只排除**本功能自己撤掉并证明已不在挂单列表里**的行（`status='cancelled'` 且 `cancel_response_json.source ==
+'take_profit_adjustment_absence_confirmed'`），其它已撤行的计数方式不变。已用去掉修复的对照运行确认该用例会失败。
+身份比对（`_take_profit_orders_match_convergence`）不受新 order_id 影响，不会因此冲突。
+
+### 生产只读核实（指挥会话，2026-09-29）
+
+- `management_execution_mode = live`，`position_management_liveness_v2_mode = live`。
+- 设置表里**没有** `take_profit_adjust_mode` 键，部署后即按代码默认 `shadow` 生效。
+- lifecycle 1264 `take_profit = '84000-82000'`（已核实），18199 回放的前提（两档策略价）成立。
+- binding 388：leg 662 已成交（pos 1001125407523145，收敛 302 `submitted`，止盈腿 verified）；leg 663 未成交
+  （收敛 303 `waiting_backup_stop`、`pos_id` 空，保护腿 1189/1190 `planned`，`planned_size='50.0'` 为百分比）。
+
 上线（不在本分支范围）：`take_profit_adjust_mode` 默认 `shadow`，部署后先看 3～5 笔真实样本的影子通知，
 再由用户决定切 `live`；切 `live` 后第一笔实盘样本直接核对交易所历史（撤了哪几张、挂了哪几张、合计是否不超过持仓）。
 回滚：设置改回 `disabled`，或 `tg-deploy` 回滚到部署前的生产 sha。无 schema 变更，无生产数据改动。
@@ -82,11 +115,13 @@
 `take_profit_adjust_exchange_read_incomplete`、`take_profit_adjust_quote_unavailable`、`take_profit_adjust_position_not_found`、
 `take_profit_adjust_protection_unresolved`、`take_profit_adjust_stop_missing`、`take_profit_adjust_price_tick_invalid`、
 `take_profit_adjust_stop_replace_failed`、`take_profit_adjust_snapshot_invalid`、`take_profit_adjust_interrupted`、
-`take_profit_adjust_execution_error`（另复用 `take_profit_replace_incomplete`、`explicit_stop_adjustment_not_risk_tightening`）。
+`take_profit_adjust_execution_error`、`take_profit_adjust_unfilled_leg_plan_invalid`（另复用 `take_profit_replace_incomplete`、`explicit_stop_adjustment_not_risk_tightening`）。
 
 ## 已知限制
 
 - 「第一止盈位 X，触发后上移止损做成本保护」这类同时带不带价保本的消息，保本部分不执行（它是触发后的计划，
   与止损阶梯的规则一致）；带价的止损照第 5 条处理。
+- 本功能新建的止盈逻辑腿 `leg_index` 接在原最大值之后，永远不是 1；`take_profit_fill_evidence` 的「第一止盈成交证明」
+  只认 `leg_index == 1`，所以调止盈之后该仓位不会再产生 TP1 成交证明（止损阶梯读的是账本，不受影响）。复合管理路径已有同样情况。
 - 执行结果不写 `ExecutionEvent`（`adjust_position_tpsl` 会写）；证据在批次 leg 的 `request_json` 和通知里。
 - `docs/ARCHITECTURE.md` 第 4.8 节尚未提到这个新生产者；按「只描述生产现状」的约定，应在部署时补。

@@ -193,11 +193,24 @@ def test_shadow_mode_records_the_plan_and_writes_nothing(session_factory):
     assert exchange.writes == []
     assert result["status"] == "shadow_planned" and result["submitted"] is False
     batch = _batch(session_factory, batch_id)
-    assert (batch.status, batch.reason_code) == ("blocked", "take_profit_adjust_shadow_planned")
+    # ``resolved``, never ``blocked``: the on-call watcher treats blocked as a
+    # failure and would open a case for every shadow run.
+    assert (batch.status, batch.reason_code) == ("resolved", "take_profit_adjust_shadow_planned")
+    assert batch.completed_at is not None
     with session_factory() as session:
         leg = session.query(StrategyManagementLeg).one()
         recorded = json.loads(leg.request_json)["take_profit_adjustment"]
     assert recorded["plan"]["targets"] == [["84000", "7"], ["82000", "8"]]
+    snapshot = json.loads(batch.target_snapshot_json)
+    execution = snapshot["take_profit_adjustment"]["execution"]
+    assert execution["mode"] == "shadow"
+    assert execution["positions"][0]["plan"]["targets"] == [["84000", "7"], ["82000", "8"]]
+    assert execution["unfilled_entry_legs_rewritten"] is False
+    from telegram_kol_research.strategy_management_planner import (
+        management_target_fingerprint,
+    )
+
+    assert batch.target_fingerprint == management_target_fingerprint(snapshot)
     rendered = format_strategy_management_notification(
         _notifications(session_factory, batch_id)[0]
     )

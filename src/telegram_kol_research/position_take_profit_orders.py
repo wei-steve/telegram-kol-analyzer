@@ -436,6 +436,15 @@ def reconcile_trigger_take_profit_order_history(
         )
         if live_size is None:
             continue
+        # A take-profit adjustment (2026-09-29) cancels this convergence's
+        # orders and records their replacements under the same convergence.
+        # The replaced orders no longer protect anything; counting them would
+        # double the planned size and freeze the convergence as an
+        # unexplained partial reduction. Only rows that adjustment itself
+        # retired, after proving them gone, are left out.
+        orders = [
+            row for row in orders if not _replaced_by_take_profit_adjustment(row)
+        ]
         planned_size = sum((_decimal_or_zero(row.size_text) for row in orders), Decimal("0"))
         terminal_fills = any(row.status == "filled" for row in orders)
         if live_size < planned_size and not terminal_fills:
@@ -514,6 +523,17 @@ def reconcile_trigger_take_profit_order_history(
             convergence.completed_at = now
             convergence.updated_at = now
     session.flush()
+
+
+TAKE_PROFIT_ADJUSTMENT_CANCEL_SOURCE = "take_profit_adjustment_absence_confirmed"
+
+
+def _replaced_by_take_profit_adjustment(row: PositionTakeProfitOrder) -> bool:
+    return (
+        str(row.status or "") == "cancelled"
+        and _load_evidence(row.cancel_response_json).get("source")
+        == TAKE_PROFIT_ADJUSTMENT_CANCEL_SOURCE
+    )
 
 
 def _exact_convergence_leg_is_terminal(

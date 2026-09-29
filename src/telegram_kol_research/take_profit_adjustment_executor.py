@@ -85,7 +85,9 @@ from telegram_kol_research.take_profit_adjustment import (
     ExistingTakeProfit,
     TakeProfitAdjustmentPlan,
     TakeProfitInstruction,
+    UnfilledTakeProfitPlan,
     plan_take_profit_adjustment,
+    plan_unfilled_take_profit_allocations,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
 
@@ -109,6 +111,11 @@ REASON_SNAPSHOT_INVALID = "take_profit_adjust_snapshot_invalid"
 REASON_INTERRUPTED = "take_profit_adjust_interrupted"
 REASON_EXECUTION_ERROR = "take_profit_adjust_execution_error"
 REASON_ADOPTION_FAILED = "protection_order_adoption_failed"
+REASON_UNFILLED_PLAN_INVALID = "take_profit_adjust_unfilled_leg_plan_invalid"
+
+#: Convergence states of an entry leg that has not filled: no position, no
+#: take-profit order, only a share plan waiting for the fill.
+_UNFILLED_CONVERGENCE_STATUSES = frozenset({"waiting_position", "waiting_backup_stop"})
 
 _TERMINAL_BATCH_STATUSES = frozenset({"succeeded", "blocked", "resolved"})
 _ACTIVE_PROTECTION_LEG_STATUSES_EXCLUDED = frozenset(
@@ -118,6 +125,45 @@ _ACTIVE_PROTECTION_LEG_STATUSES_EXCLUDED = frozenset(
 
 class TakeProfitAdjustmentExecutionError(RuntimeError):
     """The batch handed to this executor is not a take-profit adjustment."""
+
+
+@dataclass(slots=True)
+class _UnfilledLeg:
+    """An entry leg of the same strategy that has not filled yet.
+
+    **Two units live in ``position_protection_legs.planned_size``.** Legs
+    written at entry submit for an order that has not filled carry the
+    *share of the position in percent* (``recovery_live_submit`` stores the
+    draft's ``allocation_pct``, e.g. ``'50.0'``); legs written for a live
+    position (``materialize_verified_position_protection``, the convergence,
+    and this module's filled-position path) carry *contracts*. Nothing here
+    ever reads an existing ``planned_size`` as contracts: for an unfilled leg
+    it is only looked at to write the replacement in the same unit and the
+    same spelling.
+    """
+
+    execution_order_leg_id: int
+    convergence_id: int
+    current_plan: list[tuple[str, str]]
+    plan: UnfilledTakeProfitPlan
+    planned_leg_ids: list[int]
+    planned_size_style: str
+
+    @property
+    def changes(self) -> bool:
+        return [tuple(item) for item in self.plan.targets] != [
+            (_canonical(price), _canonical(share)) for price, share in self.current_plan
+        ]
+
+    def as_evidence(self) -> dict[str, Any]:
+        return {
+            "execution_order_leg_id": self.execution_order_leg_id,
+            "convergence_id": self.convergence_id,
+            "current_plan": [list(item) for item in self.current_plan],
+            "plan": self.plan.as_evidence(),
+            "planned_take_profit_leg_ids": list(self.planned_leg_ids),
+            "changes": self.changes,
+        }
 
 
 @dataclass(slots=True)
@@ -376,10 +422,37 @@ def _execute_locked(
 
     for position in positions:
         _record_leg_evidence(session_factory, position.leg.id, position.evidence, now)
+
+    # Entry legs of the same strategy that have not filled (binding 388,
+    # leg 663, 2026-09-29): their plan is rewritten too, or the leg would
+    # fill later and stage the take profits this message replaced.
+    unfilled = _load_unfilled_entry_legs(
+        session_factory,
+        batch=batch,
+        instruction=instruction,
+        side=side,
+        last_price=last_price,
+        strategy_prices=strategy_prices,
+    )
+    if isinstance(unfilled, str):
+        _record_snapshot_execution(
+            session_factory, batch.id, positions=positions, unfilled=[], mode=mode, now=now
+        )
+        return _refuse(session_factory, batch, unfilled, now)
+    refused_unfilled = next(
+        (item for item in unfilled if item.plan.status != PLAN_READY), None
+    )
+    _record_snapshot_execution(
+        session_factory, batch.id, positions=positions, unfilled=unfilled, mode=mode, now=now
+    )
+    if refused_unfilled is not None:
+        return _refuse(
+            session_factory, batch, str(refused_unfilled.plan.reason_code), now
+        )
     nothing_to_do = all(
         position.plan.status == PLAN_ALREADY_SATISFIED and not position.stop_change
         for position in positions
-    )
+    ) and not any(item.changes for item in unfilled)
     if nothing_to_do:
         _set_leg_status(session_factory, batch, "succeeded", now)
         _finalize(
@@ -396,14 +469,17 @@ def _execute_locked(
             writes=False,
         )
     if mode != "live":
-        # Design 3.7 ``shadow``: the whole plan is on the legs and in the
-        # notification; nothing reaches the exchange.
-        _set_leg_status(session_factory, batch, "blocked", now)
+        # Design 3.7 ``shadow``: the whole plan is in the batch snapshot, on
+        # the legs and in the notification; nothing reaches the exchange and
+        # no local plan changes. ``resolved``, not ``blocked``: a shadow run
+        # is the expected outcome, and the on-call watcher reads ``blocked``
+        # as a failure (oncall_detector rule D2).
+        _set_leg_status(session_factory, batch, "skipped", now)
         _finalize(
             session_factory,
             batch_id=batch.id,
             expected={"executing"},
-            status="blocked",
+            status="resolved",
             reason=REASON_SHADOW_PLANNED,
             now=now,
         )
@@ -421,6 +497,7 @@ def _execute_locked(
         instrument_id=instrument_id,
         instruction=instruction,
         positions=positions,
+        unfilled=unfilled,
         deepcoin_client=deepcoin_client,
         now=now,
     )
@@ -434,6 +511,7 @@ def _execute_live(
     instrument_id: str,
     instruction: TakeProfitInstruction,
     positions: list[_Position],
+    unfilled: list[_UnfilledLeg],
     deepcoin_client: Any,
     now: datetime,
 ) -> dict[str, Any]:
@@ -444,6 +522,13 @@ def _execute_live(
 
     wrote = False
     failure: str | None = None
+    #: Positions whose take profits now follow the new plan: satisfied
+    #: already, replaced, or cancelled with the placement handed to the
+    #: convergence (which then chases the new plan). The unfilled legs are
+    #: rewritten only when every position is in this set -- otherwise the
+    #: batch failed before the new structure took hold anywhere complete, and
+    #: the unfilled legs keep the plan the rest of the strategy still has.
+    new_plan_in_place: set[str] = set()
     for position in positions:
         leg = position.leg
         pos_id = str(leg.pos_id)
@@ -452,6 +537,7 @@ def _execute_live(
             continue
         if position.plan.status == PLAN_ALREADY_SATISFIED and not position.stop_change:
             _transition_leg(session_factory, leg.id, "succeeded", now, None)
+            new_plan_in_place.add(pos_id)
             continue
         if position.authority.adoptions:
             try:
@@ -605,6 +691,8 @@ def _execute_live(
             cancel_phase_done = tp_result.succeeded or str(
                 tp_result.reason_code or ""
             ).startswith("take_profit_replacement_")
+            if cancel_phase_done:
+                new_plan_in_place.add(pos_id)
             if not cancel_phase_done:
                 # Nothing new placed and the old take profits are armed except
                 # any whose cancel the exchange already accepted: the plan goes
@@ -638,7 +726,23 @@ def _execute_live(
                     session_factory, leg.id, "failed", now, position.evidence
                 )
                 continue
+        else:
+            new_plan_in_place.add(pos_id)
         _transition_leg(session_factory, leg.id, "succeeded", now, position.evidence)
+
+    unfilled_applied = False
+    if new_plan_in_place == {str(position.leg.pos_id) for position in positions}:
+        _rewrite_unfilled_entry_legs(session_factory, unfilled=unfilled, now=now)
+        unfilled_applied = True
+    _record_snapshot_execution(
+        session_factory,
+        batch.id,
+        positions=positions,
+        unfilled=unfilled,
+        mode="live",
+        now=now,
+        unfilled_applied=unfilled_applied,
+    )
 
     final_reason = failure or REASON_APPLIED
     _finalize(
@@ -654,6 +758,225 @@ def _execute_live(
         reason=final_reason,
         writes=wrote,
     )
+
+
+def _load_unfilled_entry_legs(
+    session_factory: sessionmaker,
+    *,
+    batch: ManagementBatchRecord,
+    instruction: TakeProfitInstruction,
+    side: str,
+    last_price: Decimal,
+    strategy_prices: list[str],
+) -> list[_UnfilledLeg] | str:
+    """Every not-yet-filled entry leg of this strategy that has a share plan."""
+
+    from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
+
+    managed = {int(leg.execution_order_leg_id) for leg in batch.legs}
+    result: list[_UnfilledLeg] = []
+    with session_factory() as session:
+        entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.execution_binding_id == int(batch.execution_binding_id))
+            .filter(ExecutionOrderLeg.strategy_instance_id == batch.strategy_instance_id)
+            .filter(ExecutionOrderLeg.purpose == "entry")
+            .order_by(ExecutionOrderLeg.id.asc())
+            .all()
+        )
+        for entry_leg in entry_legs:
+            if int(entry_leg.id) in managed:
+                continue
+            if str(entry_leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
+                continue
+            convergence = (
+                session.query(TriggerTakeProfitConvergence)
+                .filter(TriggerTakeProfitConvergence.venue == "deepcoin")
+                .filter(
+                    TriggerTakeProfitConvergence.execution_order_leg_id
+                    == int(entry_leg.id)
+                )
+                .one_or_none()
+            )
+            if (
+                convergence is None
+                or str(convergence.pos_id or "").strip()
+                or str(convergence.status or "") not in _UNFILLED_CONVERGENCE_STATUSES
+            ):
+                continue
+            try:
+                rows = json.loads(convergence.desired_take_profits_json)
+                current_plan = [
+                    (str(row["price"]), str(row["allocation_pct"])) for row in rows
+                ]
+            except (TypeError, ValueError, KeyError):
+                return REASON_UNFILLED_PLAN_INVALID
+            if not current_plan:
+                return REASON_UNFILLED_PLAN_INVALID
+            planned_legs = (
+                session.query(PositionProtectionLeg)
+                .filter(PositionProtectionLeg.venue == "deepcoin")
+                .filter(PositionProtectionLeg.execution_order_leg_id == int(entry_leg.id))
+                .filter(PositionProtectionLeg.role == "take_profit")
+                .filter(PositionProtectionLeg.status == "planned")
+                .filter(PositionProtectionLeg.exchange_order_id.is_(None))
+                .order_by(PositionProtectionLeg.id.asc())
+                .all()
+            )
+            result.append(
+                _UnfilledLeg(
+                    execution_order_leg_id=int(entry_leg.id),
+                    convergence_id=int(convergence.id),
+                    current_plan=current_plan,
+                    plan=plan_unfilled_take_profit_allocations(
+                        instruction=instruction,
+                        side=side,
+                        last_price=last_price,
+                        current_plan=current_plan,
+                        strategy_take_profit_prices=strategy_prices,
+                    ),
+                    planned_leg_ids=[int(row.id) for row in planned_legs],
+                    # Unit is a percent here; only the spelling is copied.
+                    planned_size_style=(
+                        "float"
+                        if any("." in str(row.planned_size or "") for row in planned_legs)
+                        else "plain"
+                    ),
+                )
+            )
+    return result
+
+
+def _rewrite_unfilled_entry_legs(
+    session_factory: sessionmaker, *, unfilled: list[_UnfilledLeg], now: datetime
+) -> None:
+    """Point every unfilled leg's share plan and planned legs at the new plan.
+
+    One transaction for all of them. Each row is re-checked inside it: a leg
+    that filled meanwhile (convergence now carries a ``pos_id`` or left the
+    waiting states) is not touched here -- it is a position, and positions are
+    this batch's business only when the planner froze them into it.
+    """
+
+    with session_factory() as session:
+        for item in unfilled:
+            if not item.changes:
+                continue
+            convergence = session.get(TriggerTakeProfitConvergence, item.convergence_id)
+            if (
+                convergence is None
+                or str(convergence.pos_id or "").strip()
+                or str(convergence.status or "") not in _UNFILLED_CONVERGENCE_STATUSES
+            ):
+                continue
+            convergence.desired_take_profits_json = json.dumps(
+                [
+                    {"allocation_pct": share, "price": price}
+                    for price, share in item.plan.targets
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            convergence.updated_at = now
+            legs = (
+                session.query(PositionProtectionLeg)
+                .filter(PositionProtectionLeg.venue == "deepcoin")
+                .filter(
+                    PositionProtectionLeg.execution_order_leg_id
+                    == item.execution_order_leg_id
+                )
+                .filter(PositionProtectionLeg.role == "take_profit")
+                .all()
+            )
+            if not legs:
+                # No planned legs: the convergence materialises them from the
+                # plan when the leg fills.
+                continue
+            for row in legs:
+                if int(row.id) in item.planned_leg_ids and row.status == "planned":
+                    row.status = "superseded"
+                    row.updated_at = now
+            next_index = max(int(row.leg_index) for row in legs)
+            entry_leg = session.get(ExecutionOrderLeg, item.execution_order_leg_id)
+            for price, share in item.plan.targets:
+                next_index += 1
+                session.add(
+                    PositionProtectionLeg(
+                        venue="deepcoin",
+                        execution_binding_id=int(entry_leg.execution_binding_id),
+                        execution_order_leg_id=item.execution_order_leg_id,
+                        role="take_profit",
+                        leg_index=next_index,
+                        planned_trigger_price=price,
+                        # Percent of the future position, like the rows it
+                        # replaces -- never contracts (see ``_UnfilledLeg``).
+                        planned_size=_percent_text(share, item.planned_size_style),
+                        status="planned",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        session.commit()
+
+
+def _percent_text(share: str, style: str) -> str:
+    value = Decimal(str(share))
+    text = format(value.normalize(), "f")
+    if style == "float" and "." not in text:
+        text = f"{text}.0"
+    return text
+
+
+def _canonical(value: Any) -> str:
+    try:
+        return format(Decimal(str(value)).normalize(), "f")
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+
+
+def _record_snapshot_execution(
+    session_factory: sessionmaker,
+    batch_id: int,
+    *,
+    positions: list[_Position],
+    unfilled: list[_UnfilledLeg],
+    mode: str,
+    now: datetime,
+    unfilled_applied: bool = False,
+) -> None:
+    """Write what this run computed into the batch snapshot (fingerprint kept in step)."""
+
+    from telegram_kol_research.strategy_management_planner import (
+        management_target_fingerprint,
+    )
+
+    with session_factory() as session:
+        row = session.get(StrategyManagementBatch, int(batch_id))
+        if row is None:
+            return
+        try:
+            snapshot = json.loads(row.target_snapshot_json or "{}")
+        except (TypeError, ValueError):
+            snapshot = {}
+        adjustment = snapshot.get("take_profit_adjustment")
+        if not isinstance(adjustment, dict):
+            adjustment = {}
+        adjustment["execution"] = {
+            "mode": mode,
+            "computed_at": now.isoformat(),
+            "positions": [position.evidence for position in positions],
+            "unfilled_entry_legs": [item.as_evidence() for item in unfilled],
+            "unfilled_entry_legs_rewritten": bool(unfilled_applied),
+        }
+        snapshot["take_profit_adjustment"] = adjustment
+        row.target_snapshot_json = json.dumps(
+            snapshot, ensure_ascii=False, sort_keys=True, default=str
+        )
+        row.target_fingerprint = management_target_fingerprint(
+            json.loads(row.target_snapshot_json)
+        )
+        row.updated_at = now
+        session.commit()
 
 
 def _record_stop_replacement(
@@ -828,6 +1151,11 @@ def _rewrite_take_profit_plan(
                 role="take_profit",
                 leg_index=next_index,
                 planned_trigger_price=price,
+                # Contracts: this leg belongs to a live position and is about
+                # to carry an order of exactly this size (the convergence
+                # writes its own position legs the same way). Existing rows of
+                # the same entry leg may still carry the submit-time percent;
+                # nothing here reads theirs.
                 planned_size=size,
                 pos_id=pos_id,
                 status="protection_recovery_pending",
@@ -910,6 +1238,7 @@ def _record_replacement(
         bind_verified_exchange_order,
     )
     from telegram_kol_research.position_take_profit_orders import (
+        TAKE_PROFIT_ADJUSTMENT_CANCEL_SOURCE,
         record_take_profit_cancel_requested,
         record_take_profit_cancelled,
         record_take_profit_order,
@@ -988,7 +1317,7 @@ def _record_replacement(
             record_take_profit_cancelled(
                 session,
                 row,
-                response={"source": "take_profit_adjustment_absence_confirmed"},
+                response={"source": TAKE_PROFIT_ADJUSTMENT_CANCEL_SOURCE},
                 cancelled_at=now,
             )
         session.commit()
