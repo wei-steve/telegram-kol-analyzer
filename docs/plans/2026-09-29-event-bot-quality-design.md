@@ -8,7 +8,7 @@
   `execution_events.action` / `source_message_id`、`strategy_lifecycles` 主键与 `(chat_id, message_id)` 唯一键）；
   值守状态库只读；worker 日志 `journalctl` 按时间窗；`/etc/telegram-kol-*.env` 只读了**键名**和两个
   incident 类型清单的值。没有全表扫描、没有交易所调用、没有发任何 Telegram 消息。
-- 状态：**已批准（2026-09-29，用户：第 8 节全部按推荐）**；代码候选 `d835c941`，全量通过，**未部署、未推 origin/main**
+- 状态：**已批准（2026-09-29，用户：第 8 节全部按推荐）**；**已部署 `83fcfba6`（2026-09-29 10:32Z），L1 窗口通过**，见第 10 节
 
 ## 0. 结论速览
 
@@ -392,3 +392,27 @@ Q5 本次不改、另立一稿；Q6 批准按 5.3 执行（调度会话在部署
 6. 回滚：`tg-deploy 0bcb894e9280d273e145eb44e99d24d14c6870a7`；删掉 oncall env 里新增的两行；重启值守。
    注意：回滚后按类型键开的 D6c 案件（`unheard_type:`）旧代码不认识其前缀的格式化，会走通用格式；无害，但会一直 open 到 stale。
 7. 执行尝试 4631 的数据收口按第 5.3 节单独做（L3，已批准，不在本候选里）。
+
+## 10. 部署与观察（2026-09-29）
+
+- rebase 到 `origin/main` = `d3578d5b`（米娅修复，生产 `42d8a73b`），无冲突；米娅改动不触及本候选文件。
+  rebase 后补一个提交 `83fcfba6`：米娅新增的 3 个必发类型各给一句「需要你：…」
+  （其中「止损改挂保本价」「按规则半仓入场」是系统做了别的动作，不是「自动处理已停止」，通用句会误导）。
+- 最终候选 `83fcfba6f27906d2cab3c5cdf5e8ee8f2dca6b3d` 全量 **10492 passed / 4 skipped / 0 failed**。
+- 部署前：生产 `42d8a73b`，无进行中的管理批次 / 执行尝试。候选是生产的后代。
+- 推 `claude/eager-dubinsky-44265c` → `tg-deploy`（10:32Z，worker/web/ingest active）→ 值守 env 追加两行
+  `TELEGRAM_KOL_ONCALL_NOTIFY_{CHAT_ID,BOT_TOKEN}`（从 worker env 复制，未打印值；原文件备份
+  `/etc/telegram-kol-oncall.env.bak-20260929-event-bot`，权限 600 root）→ 单独重启 `telegram-kol-oncall`
+  （10:33Z，active）→ 推 `origin/main`（无 `-f`）→ OFFENDERS 自测 FAIL/PASS 各一，判决 **PASS**，生产 sha 在 `origin/main` 上。
+- 回滚：`tg-deploy 42d8a73bce4ec36a130804cebca8eba283b488c0`；把 oncall env 换回备份；重启值守。
+- L1 窗口 10:33Z → 10:49Z（15 分钟）：四个服务 active、0 次重启；值守心跳每分钟更新；
+  窗口内 0 条新消息、0 个新案件、0 条新告警、0 条新 incident；部署后日志无 Traceback、无摘要被拒、无上下文加载失败。
+  一次 3.6 秒事件循环停顿来自网页持仓面板的同步 Deepcoin 请求（30 天内 59 次，与本次无关）。
+- 旁证：今天部署前的 D6c 案 38 / 39 / 41（共 9 条消息）针对的都是静音类型（2428 / 2429 / 2431），新规则下都不会开案。
+- **局限**：窗口内没有值守告警、没有事件处理类 incident，所以「例行消息走运行通知」「事件通知带群名 / 原文 / 需要你」
+  还没有生产样本（有单测）。第一条可验证的是北京 09-30 09:00 的每日报平安（应出现在「Kol运行通知」）。
+- **新发现**：执行尝试 **4705**（米娅 #19670，09-29 01:17Z，部署前）同样冻成 `partial_failed no_exchange_write_tracked`，
+  与 4631 同一根因（Q5）。第 5.3 节的收口因此改为两条：dry-run 期望 `scanned 2 | closeable 2`，apply 用 `--expected-count 2`
+  （执行前先按 5.1 的方法确认 4705 名下无执行事件、无活绑定）。两天内第二个样本，说明 Q5 的根因修复值得尽快立稿。
+- 未修：httpx 的 `HTTPStatusError` 把含 bot token 的完整 Telegram URL 写进 worker 的 journald（24 小时 3 行、30 天 13 行），
+  不在本次范围，已另开任务；修复部署后建议在 @BotFather 轮换该 token。
