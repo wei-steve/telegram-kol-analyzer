@@ -20,7 +20,7 @@
 |---|---|---|
 | 阶段 1 · 影子 | L1（additive dormant） | `completed`（代码 `5ca19513`，提示词 v9 = `ai_prompt_versions.id=10` 已发布，观察窗通过） |
 | 阶段 2 · 观察与人工核准 | L0 | `completed`（2026-09-29：四张表已出；A、B 两组共 44 条人工核准已写入标注表） |
-| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 代码候选已变基到 `c40fb421` 之上，末个代码提交 `2cdb8de4` 全量通过，未部署；批次 B 提示词待 v11 满一周） |
+| 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `in_progress`（批次 A 已部署 `24263e2f`，L2 观察窗进行中；批次 B 提示词待 v11 满一周） |
 | 阶段 4 · 收口 | 以后 | `planned` |
 
 **仓库层面的一件事（2026-09-24，与本设计无关但影响所有会话）**：
@@ -718,6 +718,21 @@ v11 下 19016 被判「是策略、止损 null」，这是提示词【两套判�
 2. **2026-09-29 16:14:30 UTC**：entry_fragments 会话发布 `ai_prompt_versions.id = 11`（详见上文「第二条测量界线」一节）；
 3. **阶段 3 代码部署时刻**（待部署）；
 4. **阶段 3 提示词（批次 B）发布时刻**（待发布）。
+
+### 批次 A 部署（2026-09-29 19:12:43 UTC = 北京 09-30 03:12:43，用户在本会话确认「开始部署阶段 3」）
+
+| | |
+|---|---|
+| 部署 sha | `24263e2f553ae86112b4cb65c71a66847cfcb5ea`（末个代码提交 `2cdb8de4`） |
+| 回滚 | `tg-deploy c40fb4218ef4c70807fb38ceb900a6b581260864` |
+| 部署前 | 生产 HEAD `c40fb421`，候选是其后代；`origin/main` `5973e31d` 是候选祖先；无 `pyproject`/`deploy/` 变更，不需要 pip install、不需要同步 systemd 单元 |
+| 在途检查 | 无进行中的处理任务、上下文重试、执行中的决策；近 2 小时 0 个管理批次；唯一近期 `pending_entry`（XMR 1372）无交易所绑定 |
+| 部署后 | 三服务 active（worker PID 3293338）；同一 sha 快进推 `origin/main`（未用 -f）；双向核对 PASS；`OFFENDERS` 判决式 `PASS: 0 code files beyond production`（自测：对 `c40fb421` 正确报出 26 个代码文件） |
+| 部署前基线（24 h） | 决策 192、上下文调用 60 次 / 51 条消息、识别失败 3、worker 近 1 h 错误行 0；基线 id：raw 19842、context attempt 6899 |
+| **测量界线 3** | **2026-09-29 19:12:43 UTC**（worker `ActiveEnterTimestamp`） |
+| 观察 | 服务器只读监视 `phase3-observe.service`（`/root/phase3-deploy/phase3_observe.py`），每分钟采样，日志 `/root/phase3-deploy/observe.log`，判决 `/root/phase3-deploy/verdict.txt`。PASS = 部署后 ≥30 分钟且 ≥5 条新决策、全程无硬异常；硬异常（服务不在、出现被删的触发名、非网络错误的上下文请求 >1、任务卡 >5 分钟、Traceback）立即停下判 ANOMALY；上限 24 小时 |
+
+部署在北京凌晨，流量低（部署时最后一条消息在 50 分钟前），观察窗预计白天凑满。
 
 ### 批次 B · 提示词（未开始）
 
