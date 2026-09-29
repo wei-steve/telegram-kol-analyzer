@@ -416,3 +416,18 @@ Q5 本次不改、另立一稿；Q6 批准按 5.3 执行（调度会话在部署
   （执行前先按 5.1 的方法确认 4705 名下无执行事件、无活绑定）。两天内第二个样本，说明 Q5 的根因修复值得尽快立稿。
 - 未修：httpx 的 `HTTPStatusError` 把含 bot token 的完整 Telegram URL 写进 worker 的 journald（24 小时 3 行、30 天 13 行），
   不在本次范围，已另开任务；修复部署后建议在 @BotFather 轮换该 token。
+
+## 11. 执行尝试 4631 + 4705 的 L3 收口（2026-09-29 10:58Z，用户确认，备份方式选 A）
+
+- 前置核对：两条名下执行事件 0、绑定 0；4705（#19670）的条目在预检被拒（`management_stop_provenance_invalid`），批次 187 blocked。
+- **备份偏离 5.3 节（用户选 A）**：服务器已有 3 个全库恢复点，都未到退役期，再做全库备份会违反「最多 3 个」。
+  改为单表备份（与 09-26 同法）：`/var/backups/telegram-kol/20260929-attempt-closeout/authoritative_execution_attempts.sql.zst`，
+  **451442 字节，sha256 `56be629befa2053272ea455fb1a146446a72e8451c338994b6223402e6372f9b`**；
+  还原到临时库 `PRAGMA quick_check = ok`、4806 行。按规则保留到本次改动结束后 14 天（10-13），退役时把大小与 sha256 记入 manifest。
+- dry-run：`scanned 2 | closeable 2 | refused 0 | exchange_write_count 0`，两条都是 `no_execution_event`，manifest `1e88f437…`。
+- apply（`--expected-count 2`，以 `telegram-kol-worker` 身份、`PYTHONDONTWRITEBYTECODE=1`）：`changed_count 2`，同一 manifest，持锁 0.13 s。
+- 前后计数（`authoritative_execution_attempts`，共 4806 行不变）：`uncertain 2 → 0`、`closed_no_write 35 → 37`，其余不变。
+  两行 `status=closed_no_write`，`error_summary` 追加 `closed_out=closed_no_write@2026-09-29`，`exchange_effect` 仍为 `outcome_unknown`。
+- `recognition_decisions`（raw 19598 / 19670）逐列指纹前后一致（`8c679715…` / `9d50c1cb…`），两条消息仍冻结、不可重新识别。
+- 证据：同目录 `before.txt` / `dry-run.json` / `apply.json` / `after.txt`。
+- 回滚：从备份还原这两行的 `status` / `error_summary` / `updated_at`（停 worker 后按主键写回）。
