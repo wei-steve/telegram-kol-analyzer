@@ -8,7 +8,7 @@
   `strategy_management_market_decisions.management_batch_id`、`execution_events` 经 `raw_messages (chat_id, message_id)`）；
   代码读 `execution_boundary.py`、`authoritative_recognition.py`、`authoritative_execution_attempts.py`、
   `strategy_management_executor.py`。没有交易所调用。
-- 状态：**设计稿，只有文档，等用户拍板第 7 节**
+- 状态：**已批准（2026-09-29，用户：第 7 节全部按推荐）**；实施中
 - 风险级别：**L3**（改的是「跨过副作用边界之后的结果如何定性」，属 AGENTS.md 所说的交易所写入语义；
   **不改表结构、不修生产数据、不改任何真实下单 / 撤单代码**）
 
@@ -184,3 +184,7 @@ A-6 已经让「每个条目载荷都写着 `status: blocked` 等」的管理拒
 - **Q3 部署级别**：推荐按 L3 评审、L2 观察（30 分钟 ≥5 条消息），不另做数据演练（无结构改动、无数据修复）。
 - **Q4 写前日志审计若发现例外**：推荐「把那一类写路径排除在证明之外、照旧冻结」，而不是在本稿里顺手改执行器；
   改执行器另立一稿。
+
+### 7.1 裁定（2026-09-29）
+
+Q1＝B（`closed_no_write`，不可自动重试）；Q2 新增 `management_refused_before_write`；Q3 L3 评审 + L2 观察；Q4 审计发现例外就排除在证明之外、照旧冻结。
