@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
+import re
 from datetime import UTC, datetime
 from types import SimpleNamespace
 import logging
@@ -57,6 +59,13 @@ def caplog(caplog, monkeypatch):
 
 
 NOW = datetime(2026, 9, 28, 3, 23, 38, tzinfo=UTC)
+#: A fake group id in production's shape, and the strategy instance id that
+#: embeds it: ``deepcoin:<group id>:<source message id>:<symbol>:<side>``.
+FAKE_GROUP_ID = -1009999999999
+STRATEGY_INSTANCE_ID = f"deepcoin:{FAKE_GROUP_ID}:10792:BTC:long"
+#: The minus sign is what tells a group id from a Deepcoin position or order
+#: id, which are also long digit runs beginning with 100.
+_GROUP_ID_SHAPE = re.compile(r"-100\d{10,}")
 _OUTAGE = SimpleNamespace(
     kind="payment_required",
     scan_exhausted=False,
@@ -183,7 +192,10 @@ _CASES: dict[str, tuple[str, dict]] = {
         "management_recovery_timeout",
         dict(
             management_batch_id=158,
-            strategy_instance_id="chen-btc-696",
+            # Production's shape, group id and all (a fake one). The old value
+            # ``chen-btc-696`` could never trip the opaque-secret scan, which
+            # is how incident 2419 lost its detail unnoticed (2026-09-28).
+            strategy_instance_id=STRATEGY_INSTANCE_ID,
             target_lifecycle_id=1327,
             effective_action="move_stop",
             recovery_reason_code="protection_recovery_required",
@@ -406,6 +418,93 @@ def test_the_detailed_summary_is_the_one_recorded(tmp_path, monkeypatch, adapter
         row = session.query(RuntimeIncident).one()
         assert row.incident_type == incident_type
         assert row.redacted_summary == detailed
+    # No group id rides inside a string field. The integer ``chat_id`` field is
+    # the one deliberate carrier (admitted by A-3d, never printed by the
+    # generic formatter); a group id welded into a string -- as
+    # ``strategy_instance_id`` was -- is what the opaque-secret scan refuses.
+    stored = json.loads(detailed)
+    # The fake group id's digits, whatever ``_safe_label`` did to its sign.
+    assert str(FAKE_GROUP_ID).lstrip("-") not in detailed
+    for key, value in stored.items():
+        if key == "chat_id":
+            assert isinstance(value, int), (adapter_name, key)
+            continue
+        assert not _GROUP_ID_SHAPE.search(str(value)), (adapter_name, key, value)
+
+
+def test_r3b_recovery_timeout_keeps_its_detail_without_the_group_id(tmp_path):
+    """Incident 2419: batch 184's timeout recorded only its reason code.
+
+    ``strategy_instance_id`` embeds the group id, the opaque-secret scan
+    refused the whole detailed summary, and the minimal fallback was stored.
+    The detail now travels as the three parts of that id a person can use.
+    """
+
+    session_factory = create_session_factory(tmp_path / "r3b.db")
+
+    recorded = adapters.capture_management_recovery_timeout(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"management_recovery_timeout"})
+        ),
+        management_batch_id=184,
+        strategy_instance_id=STRATEGY_INSTANCE_ID,
+        target_lifecycle_id=1348,
+        effective_action="break_even",
+        recovery_reason_code="break_even_market_decision_missing_or_invalid",
+        timeout_minutes=60,
+        occurred_at=NOW,
+    )
+
+    assert recorded is not None
+    summary = json.loads(recorded.redacted_summary)
+    assert summary["lifecycle_id"] == 1348
+    assert summary["symbol"] == "BTC"
+    assert summary["side"] == "long"
+    assert summary["origin_message_id"] == 10792
+    assert summary["effective_action"] == "break_even"
+    assert summary["timeout_minutes"] == 60
+    assert "strategy_instance_id" not in summary
+    assert "9999999999" not in recorded.redacted_summary
+
+
+@pytest.mark.parametrize(
+    "strategy_instance_id",
+    [
+        "",
+        "chen-btc-696",
+        "deepcoin:-1009999999999:BTC:long",
+        "deepcoin:-1009999999999:not-a-number:BTC:long",
+        "deepcoin:-1009999999999:10792:BTC:long:extra",
+        "deepcoin:-1009999999999:10792::",
+        None,
+    ],
+)
+def test_an_unparseable_strategy_instance_id_is_left_out_not_raised(
+    tmp_path, strategy_instance_id
+):
+    session_factory = create_session_factory(tmp_path / "unparseable.db")
+
+    recorded = adapters.capture_management_recovery_timeout(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"management_recovery_timeout"})
+        ),
+        management_batch_id=184,
+        strategy_instance_id=strategy_instance_id,
+        target_lifecycle_id=1348,
+        effective_action="break_even",
+        recovery_reason_code="break_even_market_decision_missing_or_invalid",
+        timeout_minutes=60,
+        occurred_at=NOW,
+    )
+
+    summary = json.loads(recorded.redacted_summary)
+    # Still the detailed summary, only without the parts it could not read.
+    assert summary["lifecycle_id"] == 1348
+    assert "strategy_instance_id" not in summary
+    assert "9999999999" not in recorded.redacted_summary
+    assert not {"symbol", "side", "origin_message_id"} & set(summary)
 
 
 def test_a_refused_detail_logs_refused_and_not_failed_open(tmp_path, caplog):

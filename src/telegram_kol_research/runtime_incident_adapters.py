@@ -1260,6 +1260,33 @@ def _blocker_labels(blockers: list[dict] | None) -> tuple[str, str]:
     return ",".join(ids), ", ".join(labels)
 
 
+_STRATEGY_INSTANCE_ID = re.compile(
+    r"(?P<venue>[a-z][a-z0-9_]{0,31}):(?P<group>-?\d+):(?P<message>\d{1,18}):"
+    r"(?P<symbol>[A-Za-z0-9]{1,32}):(?P<side>long|short)\Z"
+)
+
+
+def _strategy_instance_parts(strategy_instance_id: Any) -> dict[str, Any]:
+    """Split a strategy instance id into the parts that are safe to show.
+
+    Production ids read ``deepcoin:<group id>:<source message id>:<symbol>:
+    <side>``. The group id is deliberately *not* returned: it is the part that
+    made the opaque-secret scan refuse incident 2419's summary, and it has no
+    place in an alert anyway -- the event bot names groups by label. Anything
+    that does not have exactly that shape yields nothing rather than a guess
+    or an exception; the caller then records the summary without these fields.
+    """
+
+    match = _STRATEGY_INSTANCE_ID.match(str(strategy_instance_id or "").strip())
+    if match is None:
+        return {}
+    return {
+        "symbol": match.group("symbol").upper(),
+        "side": match.group("side"),
+        "origin_message_id": int(match.group("message")),
+    }
+
+
 def capture_management_recovery_timeout(
     session_factory: sessionmaker,
     *,
@@ -1290,6 +1317,7 @@ def capture_management_recovery_timeout(
         "reason_code": _safe_label(recovery_reason_code or "recovery_required"),
         "operation": f"management_batch_{int(management_batch_id)}",
     }
+    strategy_parts = _strategy_instance_parts(strategy_instance_id)
     return _capture_with_minimal_fallback(
         session_factory,
         config=config,
@@ -1299,7 +1327,14 @@ def capture_management_recovery_timeout(
         severity="high",
         detailed_summary=_summary(
             **fixed,
-            strategy_instance_id=_safe_label(strategy_instance_id),
+            # Not ``strategy_instance_id`` itself: it embeds the group id, the
+            # opaque-secret scan refused the whole detailed summary on it, and
+            # incident 2419 (2026-09-28) was stored with nothing but its reason
+            # code. The three parts a person can act on travel instead; the
+            # group id never does, under any name.
+            symbol=strategy_parts.get("symbol"),
+            side=strategy_parts.get("side"),
+            origin_message_id=strategy_parts.get("origin_message_id"),
             lifecycle_id=int(target_lifecycle_id),
             effective_action=_safe_label(effective_action),
             # Minutes in their own integer field, for the reason given in

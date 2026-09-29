@@ -216,6 +216,22 @@ _SUMMARY_FIELDS = frozenset(
         "effective_action",
         "candidate_count",
         "candidates",
+        # 2026-09-29, the refusal a fifth time, and this time the field *was*
+        # admitted: ``strategy_instance_id`` (above) reads
+        # ``deepcoin:<group id>:<source message id>:<symbol>:<side>``, and the
+        # group id's long digit run welded into that label is exactly what the
+        # opaque-secret scan below exists to refuse. So incident 2419 -- batch
+        # 184's recovery timeout -- was stored with only its reason code. The
+        # recovery-timeout adapter now sends the three parts of that id a
+        # person can use, each in its own field: ``symbol`` (letters and
+        # digits, e.g. ``BTC``), ``side`` (``long`` / ``short``) and
+        # ``origin_message_id`` (an integer). None of them can carry the group
+        # id: the adapter parses the id against its exact five-part shape and
+        # returns only these three, never the second part, and an id of any
+        # other shape contributes nothing. The scan still runs over them.
+        "symbol",
+        "side",
+        "origin_message_id",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(
