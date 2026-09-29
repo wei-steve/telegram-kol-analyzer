@@ -718,16 +718,19 @@ def test_r2g_17936_join_is_a_hard_boundary_even_when_only_a_qq_number_sits_betwe
 
     validate_management_fraction_payload({"lifecycle_event": event}, combined)
     directive = resolve_management_directive(text=combined, lifecycle_event=event)
-    # Same answer as the raw text alone gave before any of this: "保留底仓" is a
-    # tail-retention term, and that branch precedes the percent branch and
-    # closes DEFAULT_TAIL_CLOSE_FRACTION (0.8) rather than the stated 止盈70%.
-    # Pre-existing semantics, not changed here.
+    # Same answer as the raw text alone gives: "保留底仓" is a tail-retention
+    # term, and that branch precedes the percent branch, but M3 (2026-09-29
+    # Mia design) makes it prefer the message's own explicit "止盈70%" over
+    # the 0.8 default, and "做成本保护" upgrades the intent to
+    # partial_then_break_even (the strategy price, since no move price is
+    # named here). Changed from the pre-M3 answer of
+    # ("partial_take_profit", DEFAULT_TAIL_CLOSE_FRACTION, "tail_retention").
     raw_only = resolve_management_directive(text=raw, lifecycle_event=event)
     assert (directive.intent, directive.fraction, directive.reason_code) == (
         raw_only.intent,
         raw_only.fraction,
         raw_only.reason_code,
-    ) == ("partial_take_profit", DEFAULT_TAIL_CLOSE_FRACTION, "tail_retention")
+    ) == ("partial_then_break_even", 0.7, "tail_retention_explicit_percentage")
 
 
 def test_r2g_a_verb_never_claims_a_percent_across_the_join() -> None:
@@ -966,5 +969,64 @@ def test_m1_r3_take_profit_heading_defect_is_not_widened() -> None:
         )
         is None
     )
+
+
+
+# --- 2026-09-29 Mia design, M3: tail retention prefers an explicit % -------
+
+
+def test_m3_17936_tail_retention_prefers_the_stated_percentage() -> None:
+    # #17936 陈哥, ZEC 多单: "止盈70%保留底仓做成本保护". Before M3, the tail
+    # branch (_TAIL_TERMS matches "保留底仓") ran ahead of the percentage
+    # branch and always closed DEFAULT_TAIL_CLOSE_FRACTION (0.8), discarding
+    # the stated 70% and the "做成本保护" protection upgrade. Captured on the
+    # pre-fix module: intent="partial_take_profit", fraction=0.8,
+    # reason_code="tail_retention" (see also test_r2g_17936_* above, which
+    # this fix also updates).
+    raw = "一对一指导ZEC多单止盈70%保留底仓做成本保护。\n@Tarderfengge QQ:158241758"
+    event = {
+        "event_type": "position_update",
+        "management_action": "partial_take_profit, move_stop_to_protect",
+    }
+    directive = resolve_management_directive(text=raw, lifecycle_event=event)
+    assert directive.intent == "partial_then_break_even"
+    assert directive.fraction == pytest.approx(0.7)
+    assert directive.reason_code == "tail_retention_explicit_percentage"
+    # No move price was named, so protection falls back to the strategy
+    # price downstream (stop_loss/stop_price_source stay None here).
+    assert directive.stop_loss is None
+    assert directive.stop_price_source is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_fraction", "expected_reason"),
+    [
+        ("止盈50%，剩余仓位留底仓", 0.5, "tail_retention_explicit_percentage"),
+        ("只保留底仓", DEFAULT_TAIL_CLOSE_FRACTION, "tail_retention"),
+        (
+            "建议只留一点尾仓，求稳也可以出局",
+            DEFAULT_TAIL_CLOSE_FRACTION,
+            "tail_retention_preferred_over_optional_exit",
+        ),
+    ],
+)
+def test_m3_tail_retention_variants(text, expected_fraction, expected_reason) -> None:
+    directive = resolve_management_directive(
+        text=text,
+        lifecycle_event={"management_action": "partial_take_profit"},
+    )
+    assert directive.fraction == pytest.approx(expected_fraction)
+    assert directive.reason_code == expected_reason
+
+
+def test_m3_negative_conflicting_percentage_and_tail_wording_still_rejects() -> None:
+    # "平掉X%" and "保留Y%" (X + Y != 100) inside a tail-retention message
+    # must still raise management_fraction_ambiguous via _management_fraction
+    # -- M3 does not weaken that existing guard.
+    with pytest.raises(ValueError, match="management_fraction_ambiguous"):
+        resolve_management_directive(
+            text="止盈70%保留底仓，保留40%",
+            lifecycle_event={"management_action": "partial_take_profit"},
+        )
 
 

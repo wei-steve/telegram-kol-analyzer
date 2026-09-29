@@ -354,18 +354,38 @@ def resolve_management_directive(
         )
 
     if any(term in combined for term in _TAIL_TERMS):
+        # M3 (2026-09-29 Mia design): an explicit percentage in this message
+        # ("止盈70%保留底仓做成本保护") names the close fraction the KOL
+        # actually meant; only fall back to the 0.8 default when the message
+        # gives no number at all ("只保留底仓"). `_management_fraction`
+        # already tells "平掉 X%" (close) apart from "保留 X%" (retained,
+        # inverted) and raises `management_fraction_ambiguous` on conflict.
+        explicit_fraction = _management_fraction(lifecycle_event, combined)
+        tail_intent = (
+            "partial_then_break_even" if has_protection else "partial_take_profit"
+        )
         return _directive(
-            "partial_take_profit",
-            fraction=DEFAULT_TAIL_CLOSE_FRACTION,
+            tail_intent,
+            fraction=(
+                DEFAULT_TAIL_CLOSE_FRACTION
+                if explicit_fraction is None
+                else explicit_fraction
+            ),
             symbol=symbol,
             side=side,
             reason_code=(
-                "tail_retention_preferred_over_optional_exit"
+                "tail_retention_explicit_percentage"
+                if explicit_fraction is not None
+                else "tail_retention_preferred_over_optional_exit"
                 if any(term in combined for term in _FULL_EXIT_TERMS)
                 or "出局" in combined
                 else "tail_retention"
             ),
             strategy_thread_id=strategy_thread_id,
+            stop_loss=current_message_stop if has_protection else None,
+            stop_price_source=(
+                current_message_stop_source if has_protection else None
+            ),
         )
 
     if has_partial:
