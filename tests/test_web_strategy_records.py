@@ -1690,6 +1690,7 @@ def test_strategy_list_css_prevents_card_overlap():
         "}"
     ) in css
     assert ".strategy-record-entry {" in css
+    assert ".strategy-record-sticky-controls .strategy-record-needs-you" in css
 
 
 def test_loader_and_sql_count_apply_same_actionable_rule_before_limit(tmp_path):
@@ -1774,3 +1775,13 @@ def test_lists_order_by_recency_not_historical_attention(tmp_path):
     page2 = _api(client, "finished", limit=2, page=2)["records"]
     assert [row["lifecycle_id"] for row in page1] == [newest, mid]
     assert [row["lifecycle_id"] for row in page2] == [old_failed]
+
+
+def test_state_labels_cover_recognition_and_execution_vocabulary():
+    from telegram_kol_research.web_app import _strategy_state_label
+
+    assert _strategy_state_label("accepted", "recognition") == "已识别"
+    assert _strategy_state_label("succeeded", "execution") == "成功"
+    assert _strategy_state_label("filled", "execution") == "已成交"
+    assert _strategy_state_label("cancelled", "execution") == "已撤单"
+    assert _strategy_state_label("brand_new_code", "execution") == "brand_new_code"

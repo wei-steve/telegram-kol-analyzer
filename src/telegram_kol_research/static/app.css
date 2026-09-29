@@ -741,7 +741,8 @@ body {
   }
 
   .strategy-record-sticky-controls .home-service-health,
-  .strategy-record-sticky-controls .home-priority-risk {
+  .strategy-record-sticky-controls .home-priority-risk,
+  .strategy-record-sticky-controls .strategy-record-needs-you {
     grid-column: 1 / -1;
   }
 
