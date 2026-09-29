@@ -161,6 +161,13 @@ _FULL_EXIT_TERMS = (
     "止损出局",
     "止盈出局",
     "出局吧",
+    # M8 (2026-09-29 Mia design): "保本出局" / "先保本出局" (#19383, #17821).
+    # Only fires when the model already gave a non-full-exit label -- this
+    # branch only runs when the earlier explicit exit_type checks did not
+    # already match -- and is still excluded by the existing "剩余仓位" etc.
+    # guard just below, so "剩余仓位保本出局" is unaffected.
+    "保本出局",
+    "先保本出局",
 )
 _CANCEL_ENTRY_TERMS = (
     "策略先取消",

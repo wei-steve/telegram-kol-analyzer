@@ -1030,3 +1030,28 @@ def test_m3_negative_conflicting_percentage_and_tail_wording_still_rejects() -> 
         )
 
 
+
+# --- 2026-09-29 Mia design, M8: "保本出局" joins the full-exit term list ---
+
+
+@pytest.mark.parametrize("text", ["保本出局", "先保本出局", "触发保本出局了"])
+def test_m8_break_even_exit_terms_are_full_exit(text) -> None:
+    # #19383 / #17821: both had no position at the time, so this was never a
+    # money question, but the model's "全平/exit" label should not be needed
+    # for these phrases to read as a full exit.
+    directive = resolve_management_directive(
+        text=text,
+        lifecycle_event={"event_type": "position_update"},
+    )
+    assert directive.intent == "full_exit"
+    assert directive.reason_code == "explicit_full_exit"
+
+
+def test_m8_negative_remaining_position_break_even_exit_is_not_full() -> None:
+    # The pre-existing "剩余仓位" exclusion must still apply to the new terms:
+    # "剩余仓位保本出局" is a partial instruction, not a full exit.
+    directive = resolve_management_directive(
+        text="止盈50%，剩余仓位保本出局",
+        lifecycle_event={"management_action": "partial_take_profit"},
+    )
+    assert directive.intent != "full_exit"
