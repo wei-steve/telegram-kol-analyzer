@@ -89,6 +89,13 @@ class TradingSettings:
     #: deploy: only bindings newer than this id will be in scope for the
     #: automatic column. Nothing reads it for a decision in phase 1.
     stop_ladder_activation_after_binding_id: int | None = None
+    #: Take-profit adjustment (``docs/plans/2026-09-29-take-profit-adjustment-
+    #: design.md`` 3.7). ``shadow`` -- the default, user ruling Q5 -- plans and
+    #: reports what would change with zero exchange writes; ``live`` executes
+    #: it; ``disabled`` creates no adjustment batch at all. In every mode an
+    #: allocation message ("两个止盈位各50%") is never turned into a market
+    #: reduction: that judgement is made in recognition and is not gated here.
+    take_profit_adjust_mode: Literal["disabled", "shadow", "live"] = "shadow"
     entry_preamble_mode: Literal["disabled", "shadow", "live"] = "disabled"
     entry_message_assembly_v2_mode: Literal[
         "disabled", "shadow", "live"
@@ -547,6 +554,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         field_name="stop_ladder_activation_after_binding_id",
     )
+    take_profit_adjust_mode = _rollout_mode(
+        raw.get("take_profit_adjust_mode", defaults.take_profit_adjust_mode),
+        field_name="take_profit_adjust_mode",
+    )
     entry_preamble_mode = _entry_preamble_mode(
         raw.get("entry_preamble_mode", defaults.entry_preamble_mode)
     )
@@ -686,6 +697,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         stop_ladder_activation_after_binding_id=(
             stop_ladder_activation_after_binding_id
         ),
+        take_profit_adjust_mode=take_profit_adjust_mode,
         entry_preamble_mode=entry_preamble_mode,
         entry_message_assembly_v2_mode=entry_message_assembly_v2_mode,
         entry_revision_v2_mode=entry_revision_v2_mode,
