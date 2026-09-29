@@ -18,6 +18,7 @@ from telegram_kol_research.message_recognition import (
     _parse_explicit_exit_signal,
     _result_from_ai_payload,
     _upsert_ai_signal_candidate,
+    _upsert_management_signal_candidate,
     _validate_explicit_management_targets_in_session,
     apply_authoritative_mimo_payload,
     recognize_message_now,
@@ -352,6 +353,56 @@ def test_position_update_persists_intent_without_mutating_confirmed_lifecycle(tm
         assert candidate.management_action == "move_stop_to_break_even"
         assert candidate.stop_loss_text == "65550"
         assert candidate.take_profit_text == "63300/62100"
+
+
+@pytest.mark.parametrize("management_action", ["move_stop_to_break_even", "partial_then_break_even"])
+def test_break_even_intent_never_copies_the_original_stop_even_when_copy_defaults_true(
+    tmp_path, management_action
+):
+    """2026-09-29 coordinator review: pin the pre-M2 break-even default.
+
+    A break-even-carrying intent with no ``requested_stop_loss`` has always
+    meant "no explicit price, protection resolves downstream", never "copy
+    the strategy's original stop" -- regardless of
+    ``copy_lifecycle_stop_loss_when_silent``. M2's first draft dropped this
+    check entirely, so a caller using the (default) ``copy=True`` --
+    ``bitcoin_junzhang_profile`` in production -- would have started copying
+    the original stop back in for a break-even intent. This test calls
+    ``_upsert_management_signal_candidate`` directly with the default
+    ``copy_lifecycle_stop_loss_when_silent=True`` and a real
+    ``lifecycle.stop_loss`` to prove it is *not* copied.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        lifecycle = StrategyLifecycle(
+            chat_id=1,
+            message_id=1,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 9, 29, tzinfo=UTC),
+            entered_at=datetime(2026, 9, 29, tzinfo=UTC),
+            entry_price_actual=80000,
+            stop_loss=79000,
+        )
+        raw_message = RawMessage(chat_id=1, message_id=2, text="做好成本保护")
+        session.add_all([lifecycle, raw_message])
+        session.flush()
+
+        candidate = _upsert_management_signal_candidate(
+            session,
+            raw_message=raw_message,
+            lifecycle=lifecycle,
+            parse_source="test",
+            management_action=management_action,
+            requested_stop_loss=None,
+            copy_lifecycle_stop_loss_when_silent=True,
+        )
+        session.flush()
+
+        assert candidate.stop_loss_text is None
+        assert candidate.stop_price_source is None
 
 
 @pytest.mark.parametrize(

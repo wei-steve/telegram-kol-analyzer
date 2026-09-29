@@ -5030,6 +5030,18 @@ def _upsert_management_signal_candidate(
     management_contract_fingerprint: str | None = None,
     copy_lifecycle_stop_loss_when_silent: bool = True,
 ) -> SignalCandidate:
+    # A break-even-carrying intent (move_stop_to_break_even /
+    # partial_then_break_even) with no requested_stop_loss has always meant
+    # "no explicit price, protection resolves downstream" -- never "copy the
+    # original stop", regardless of ``copy_lifecycle_stop_loss_when_silent``.
+    # This predates M2 and must stay first: the coordinator's review (2026-
+    # 09-29) caught a regression where a break-even-intent caller with the
+    # ``copy=True`` default (bitcoin_junzhang_profile) would otherwise have
+    # started copying the original stop in again.
+    break_even_intent = str(management_action or "").lower() in {
+        "move_stop_to_break_even",
+        "partial_then_break_even",
+    }
     desired = {
         "symbol": lifecycle.symbol,
         "side": lifecycle.side,
@@ -5057,6 +5069,8 @@ def _upsert_management_signal_candidate(
         "stop_loss_text": (
             _format_number(requested_stop_loss)
             if requested_stop_loss is not None
+            else None
+            if break_even_intent
             else _format_number(lifecycle.stop_loss)
             if copy_lifecycle_stop_loss_when_silent
             else None
