@@ -26,6 +26,7 @@ import typer
 from sqlalchemy import create_engine, inspect, tuple_
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.app_logging import install_secret_log_redaction
 from telegram_kol_research.backfill import build_backfill_windows
 from telegram_kol_research.ai_recognition_config import (
     build_ai_config_view,
@@ -6846,6 +6847,7 @@ def oncall_watch(
 
 
 def main() -> None:
+    install_secret_log_redaction()
     app()
 
 

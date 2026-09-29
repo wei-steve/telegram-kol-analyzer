@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.telegram_bot_api import raise_for_telegram_status
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.oncall_remediation import handle_callback, handle_text_command
 from telegram_kol_research.oncall_remediation_runtime import (
@@ -1432,7 +1433,7 @@ def _format_datetime(value: Any) -> str | None:
 
 async def _delete_webhook(client: httpx.AsyncClient, base_url: str) -> None:
     response = await client.post(f"{base_url}/deleteWebhook")
-    response.raise_for_status()
+    raise_for_telegram_status(response)
 
 
 async def _set_bot_commands(client: httpx.AsyncClient, base_url: str) -> None:
@@ -1451,12 +1452,12 @@ async def _set_bot_commands(client: httpx.AsyncClient, base_url: str) -> None:
             ]
         },
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
 
 
 async def _latest_update_offset(client: httpx.AsyncClient, base_url: str) -> int:
     response = await client.get(f"{base_url}/getUpdates", params={"timeout": 0, "limit": 100})
-    response.raise_for_status()
+    raise_for_telegram_status(response)
     updates = response.json().get("result") or []
     update_ids = [int(update.get("update_id") or 0) for update in updates]
     return max(update_ids, default=0) + 1 if update_ids else 0
@@ -1482,7 +1483,7 @@ async def _get_updates(client: httpx.AsyncClient, base_url: str, *, offset: int)
             "allowed_updates": '["message","callback_query"]',
         },
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
     return list(response.json().get("result") or [])
 
 
@@ -1501,7 +1502,7 @@ async def _send_message(
             "disable_web_page_preview": True,
         },
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
 
 
 def _message_is_from_alert_chat(message: dict[str, Any], chat_id: str) -> bool:
@@ -1534,7 +1535,7 @@ async def _answer_callback_query(
             "show_alert": False,
         },
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
 
 
 async def _finish_system_operator_callback_response(
@@ -1639,7 +1640,7 @@ async def _edit_message_text(
         f"{base_url}/editMessageText",
         json=payload,
     )
-    response.raise_for_status()
+    raise_for_telegram_status(response)
 
 
 def _replace_expiry_refresh_status(original_text: str, status_text: str) -> str:

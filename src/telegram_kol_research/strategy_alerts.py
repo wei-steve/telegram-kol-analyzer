@@ -13,6 +13,7 @@ import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.telegram_bot_api import raise_for_telegram_status
 from telegram_kol_research.ai_endpoints import (
     chat_completions_url,
     provider_append_v1,
@@ -606,7 +607,7 @@ async def send_strategy_alert_bot_message(
                 "disable_web_page_preview": True,
             },
         )
-        response.raise_for_status()
+        raise_for_telegram_status(response)
 
 
 async def process_strategy_alert_for_record(

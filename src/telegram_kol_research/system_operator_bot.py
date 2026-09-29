@@ -18,6 +18,7 @@ from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
+from telegram_kol_research.telegram_bot_api import raise_for_telegram_status
 from telegram_kol_research.config import (
     CONTEXT_WORKER_EXHAUSTED_DELIVERED_OPERATION_PREFIX,
     RuntimeIncidentConfig,
@@ -4049,7 +4050,7 @@ async def send_system_operator_bot_message(
             f"https://api.telegram.org/bot{config.bot_token}/sendMessage",
             json=payload,
         )
-        response.raise_for_status()
+        raise_for_telegram_status(response)
         try:
             body = response.json()
         except (TypeError, ValueError):
@@ -4077,7 +4078,7 @@ async def send_system_operator_bot_document(
             data={"chat_id": config.chat_id, "caption": caption[:1024]},
             files={"document": (filename[:128], content.encode("utf-8"), "application/json")},
         )
-        response.raise_for_status()
+        raise_for_telegram_status(response)
         body = response.json()
         result = body.get("result") if isinstance(body, dict) else None
         return result.get("message_id") if isinstance(result, dict) else None

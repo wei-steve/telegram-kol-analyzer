@@ -31,6 +31,7 @@ from typing import Any, Callable
 
 import httpx
 
+from telegram_kol_research.telegram_bot_api import raise_for_telegram_status
 from telegram_kol_research.config import OncallRemediationConfig
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import OncallRemediationProposal
@@ -118,7 +119,7 @@ async def clear_system_operator_bot_reply_markup(
             },
         )
         if response.status_code >= 500:
-            response.raise_for_status()
+            raise_for_telegram_status(response)
 
 
 async def execute_proposal_locked(
