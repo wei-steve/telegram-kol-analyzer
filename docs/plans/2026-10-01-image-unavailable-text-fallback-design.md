@@ -157,3 +157,19 @@
 - **Q4 实时下载 30 秒超时顺带阻塞整条消息入库 30 秒**：20102 就晚了 31 秒才入库。推荐**本方案不动**，另开一条时延议题（改成先入库后下载涉及和 worker 的时序）。
 - **Q5 20102 要不要在部署后手工重新入队**：notify_only 群，推荐重跑一次作为首个真实样本。
 - **Q6 补下载时间窗 N**：推荐 2 小时。更长会让 reconcile 每轮多下一些旧图；更短可能漏掉夜间积压。
+
+## 9. 实施结果（2026-10-01）
+
+- **候选 sha：`7388588a`**（基于 origin/main `9941109b`；WIP `168dfe32` 已并入其历史）。未推送、未部署。
+- 全量 `uv run python -m pytest -q`：**10942 passed, 4 skipped**（25 分 33 秒）。
+- 聚焦（16 个文件，含新文件）：411 passed。
+- 新测试 `tests/test_image_unavailable_text_fallback.py`，24 条，回放 20102 / 18368 / 20025 / 17301 四种形态，外加闸门乙、证据回放、告警、补下载重新入队、定向重试。
+- **修复前失败的证据**：新测试文件在修复前代码（`9941109b`）上连收集都会失败（新符号不存在）；另用只依赖旧接口的探针在修复前代码上确认：20102 形态与纯图形态都抛可重试的 `AuthoritativeProcessingFailed`，模型调用 0 次（文字从未送出）；17301 形态（checkpoint 已过 >5 条、1 小时前发出）不在补下载集合里。探针与临时目录已删除。
+- 改动文件：`recognition_experiments.py`、`message_evidence.py`、`authoritative_recognition.py`、`image_missing_price_gate.py`（新）、`recognition_failure_attribution.py`、`message_processing_worker.py`（仅注释）、`telegram_live_listener.py`、`oncall_alerts.py`、`templates/_messages.html`。**未改提示词、未改交易所对账器**、无 schema 变更、无依赖变更。
+- 改写的旧测试：`test_recognition_experiments.py` 里原来锁定「整条放弃」的那条，改为锁定降级行为。
+
+部署要点（交调度会话排期）：
+- L2。部署涉及 ingest 与 worker，`tg-deploy` 会按 worker → web → ingest 重启。
+- 观察：30 分钟 ≥5 条真实消息；缺图正向样本 30 天仅 9 条，窗口内大概率碰不到，首例出现时核对 `input_kind=text+image_missing` 的决策、执行与告警。
+- 部署后手工重新入队 raw 20102 一次（Q5，notify_only 群，无资金影响）。它当前的决策原因是 `mimo_authoritative_failed_exhausted`，不会被补下载自动重新入队。
+- 回滚：`tg-deploy <部署前生产 sha>`。
