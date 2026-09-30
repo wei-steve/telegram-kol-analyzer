@@ -314,3 +314,44 @@ def test_live_state_queries_never_scan_tables_with_bound_parameters(tmp_path):
             and "status" in step
             for step in active_plan
         ), active_plan
+
+
+def test_strategy_list_partial_is_rendered_once_per_version_and_query(tmp_path):
+    app, clock = _make_app(tmp_path)
+    client = TestClient(app)
+    cache = app.state.strategy_list_render_cache
+    _add_lifecycle(app.state.session_factory)
+
+    first = client.get("/strategy-records?filter=all")
+    second = client.get("/strategy-records?filter=all")
+    assert first.status_code == 200
+    assert "data-strategy-record-list" in first.text
+    assert second.text == first.text
+    assert cache.render_count == 1
+
+    # A different query is a different entry.
+    client.get("/strategy-records?filter=needs_attention")
+    assert cache.render_count == 2
+    client.get("/strategy-records?filter=all")
+    assert cache.render_count == 2
+
+    # A change in the underlying data re-renders once the version moves.
+    _add_lifecycle(app.state.session_factory, status="pending_entry", message_id=2)
+    clock.value += 5
+    client.get("/strategy-records?filter=all")
+    client.get("/strategy-records?filter=all")
+    assert cache.render_count == 3
+
+
+def test_strategy_list_cache_is_bounded_and_keeps_latest_entry_per_query():
+    from telegram_kol_research.web_live_state import StrategyListRenderCache
+
+    cache = StrategyListRenderCache(max_entries=3)
+    for index in range(5):
+        cache.get(("q", index), "v1", lambda index=index: f"body-{index}".encode())
+    assert len(cache._entries) == 3
+    assert ("q", 0) not in cache._entries and ("q", 4) in cache._entries
+
+    assert cache.get(("q", 4), "v1", lambda: b"unused") == b"body-4"
+    assert cache.get(("q", 4), "v2", lambda: b"fresh") == b"fresh"
+    assert cache._entries[("q", 4)] == ("v2", b"fresh")

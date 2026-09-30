@@ -336,7 +336,9 @@ from telegram_kol_research.runtime_agent_telegram_evidence import (
 from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
 from telegram_kol_research.web_live_state import (
     LIVE_STATE_TTL_SECONDS,
+    STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES,
     LiveStateCache,
+    StrategyListRenderCache,
     groups_version,
     messages_version,
     positions_version,
@@ -9062,6 +9064,41 @@ def create_web_app(
                 status_code=422,
                 detail="invalid strategy record query",
             ) from exc
+        def render_strategy_list() -> bytes:
+            return _render_strategy_record_list(
+                request,
+                filter=filter,
+                normalized_chat_id=normalized_chat_id,
+                limit=limit,
+                page=page,
+            )
+
+        # The list is the console's heaviest partial and every open tab asks
+        # for it whenever the strategies version moves. Share one render per
+        # (query params, strategies, positions and groups versions).
+        try:
+            versions = _current_live_versions()
+        except Exception:
+            logger.exception("live version lookup failed; rendering uncached")
+            return HTMLResponse(render_strategy_list())
+        body = app.state.strategy_list_render_cache.get(
+            (filter, normalized_chat_id, limit, page),
+            (versions["strategies"], versions["positions"], versions["groups"]),
+            render_strategy_list,
+        )
+        return HTMLResponse(body)
+
+    def _current_live_versions() -> dict[str, str]:
+        return app.state.live_state_cache.get(_build_live_state_versions)["versions"]
+
+    def _render_strategy_record_list(
+        request: Request,
+        *,
+        filter: str,
+        normalized_chat_id: int | None,
+        limit: int,
+        page: int,
+    ) -> bytes:
         payload = build_strategy_record_payload(
             filter_name=filter,
             chat_id=normalized_chat_id,
@@ -9092,7 +9129,7 @@ def create_web_app(
             list_context_query["chat_id"] = normalized_chat_id
         list_context_query["limit"] = limit
         list_context_query["page"] = page
-        return templates.TemplateResponse(
+        response = templates.TemplateResponse(
             request,
             "_strategy_record_list.html",
             {
@@ -9114,6 +9151,7 @@ def create_web_app(
                 },
             },
         )
+        return bytes(response.body)
 
     @app.get("/strategy-records/{lifecycle_id}")
     def strategy_record_detail(
@@ -11149,6 +11187,9 @@ def create_web_app(
             ),
         }
 
+    app.state.strategy_list_render_cache = StrategyListRenderCache(
+        max_entries=STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES
+    )
     app.state.live_state_cache = LiveStateCache(
         ttl_seconds=LIVE_STATE_TTL_SECONDS,
         clock=lambda: app.state.live_state_clock(),

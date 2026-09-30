@@ -53,6 +53,7 @@ VOLATILE_SNAPSHOT_KEYS = frozenset(
 ACTIVE_LIFECYCLE_STATUSES = ("entered", "pending_entry")
 
 LIVE_STATE_TTL_SECONDS = 2.0
+STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES = 16
 
 
 def strip_volatile_snapshot_keys(value: Any) -> Any:
@@ -171,3 +172,44 @@ class LiveStateCache:
             self._value = value
             self._computed_at = self._clock()
             return value
+
+
+class StrategyListRenderCache:
+    """Latest rendered strategy-list HTML per query, valid for one version.
+
+    Keyed by the request's query parameters; an entry is reused only while the
+    (strategies, positions) version pair it was rendered for is unchanged, and
+    only the latest render per query is kept. The number of distinct queries is
+    bounded (oldest evicted) so a client cycling filters cannot grow it.
+
+    Renders for one query are single-flight: concurrent callers wait for the
+    render in progress and reuse it, so N tabs cost one render.
+    """
+
+    def __init__(self, *, max_entries: int = STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES):
+        self._max_entries = max(1, int(max_entries))
+        self._guard = threading.Lock()
+        self._entries: dict[Any, tuple[Any, bytes]] = {}
+        self._key_locks: dict[Any, threading.Lock] = {}
+        self.render_count = 0
+
+    def get(
+        self, key: Any, versions: Any, render: Callable[[], bytes]
+    ) -> bytes:
+        with self._guard:
+            key_lock = self._key_locks.setdefault(key, threading.Lock())
+        with key_lock:
+            with self._guard:
+                entry = self._entries.get(key)
+            if entry is not None and entry[0] == versions:
+                return entry[1]
+            body = render()
+            with self._guard:
+                self.render_count += 1
+                self._entries.pop(key, None)
+                self._entries[key] = (versions, body)
+                while len(self._entries) > self._max_entries:
+                    oldest = next(iter(self._entries))
+                    del self._entries[oldest]
+                    self._key_locks.pop(oldest, None)
+            return body
