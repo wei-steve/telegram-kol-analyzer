@@ -334,6 +334,14 @@ from telegram_kol_research.runtime_agent_telegram_evidence import (
     project_bounded_telegram_evidence,
 )
 from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
+from telegram_kol_research.web_live_state import (
+    LIVE_STATE_TTL_SECONDS,
+    LiveStateCache,
+    groups_version,
+    messages_version,
+    positions_version,
+    strategies_version,
+)
 from telegram_kol_research.trading_settings import (
     SymbolEntryThresholds,
     TradingSettingsConcurrencyConflict,
@@ -11045,6 +11053,83 @@ def create_web_app(
             await ensure_live_tasks_match_targets()
             status = build_monitor_status()
         return status
+
+    def _build_live_state_versions() -> dict[str, Any]:
+        """Version numbers for /api/live/state: index/PK reads and a cache file.
+
+        Never touches the exchange and never scans a table; see
+        ``web_live_state`` for the query contract.
+        """
+        snapshot = app.state.live_position_snapshot_store.read()
+        positions = positions_version(snapshot.payload if snapshot else None)
+        with app.state.session_factory() as session:
+            global_latest = session.execute(build_global_freshness_statement()).one()
+            strategies = strategies_version(session, positions=positions)
+        messages = messages_version(global_latest.raw_message_id)
+        return {
+            "versions": {
+                "messages": messages,
+                "positions": positions,
+                "strategies": strategies,
+                "groups": groups_version(
+                    messages,
+                    _group_config_stat_signature(app.state.group_config_path),
+                ),
+            },
+            "positions_captured_at": (
+                _as_aware_utc(snapshot.captured_at)
+                .astimezone(DEFAULT_LOCAL_TIMEZONE)
+                .isoformat()
+                if snapshot
+                else None
+            ),
+        }
+
+    app.state.live_state_cache = LiveStateCache(
+        ttl_seconds=LIVE_STATE_TTL_SECONDS,
+        clock=lambda: app.state.live_state_clock(),
+    )
+    app.state.live_state_clock = time.monotonic
+    app.state.live_monitor_cache = {"value": None, "at": None, "lock": None, "loop": None}
+
+    async def _live_monitor_status() -> dict[str, Any]:
+        """Monitor status, shared across tabs for one TTL (single-flight)."""
+        cache = app.state.live_monitor_cache
+        loop = asyncio.get_running_loop()
+        if cache["loop"] is not loop:
+            cache["loop"] = loop
+            cache["lock"] = asyncio.Lock()
+        async with cache["lock"]:
+            now = app.state.live_state_clock()
+            if (
+                cache["at"] is not None
+                and 0 <= now - cache["at"] < LIVE_STATE_TTL_SECONDS
+            ):
+                return cache["value"]
+            value = await api_monitor_status()
+            cache["value"] = value
+            cache["at"] = app.state.live_state_clock()
+            return value
+
+    @app.get("/api/live/state")
+    async def api_live_state():
+        """One cheap poll for the whole console (replaces monitor + freshness).
+
+        Async only because in the web role the monitor status is proxied from
+        the ingest process; the database and cache-file reads run in a worker
+        thread behind a 2 s single-flight cache.
+        """
+        state = await asyncio.to_thread(
+            app.state.live_state_cache.get, _build_live_state_versions
+        )
+        monitor = await _live_monitor_status()
+        return {
+            "server_time": _as_aware_utc(app.state.now_provider())
+            .astimezone(DEFAULT_LOCAL_TIMEZONE)
+            .isoformat(),
+            "monitor": monitor,
+            **state,
+        }
 
     @app.post("/api/refresh")
     async def refresh():
