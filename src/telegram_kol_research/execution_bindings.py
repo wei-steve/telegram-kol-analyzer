@@ -28,6 +28,7 @@ from telegram_kol_research.models import PositionAttributionAudit
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionMutationIntent
+from telegram_kol_research.models import StrategyLifecycle
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
 from telegram_kol_research.models import TriggerProtectionIntent
@@ -4138,6 +4139,30 @@ def _stamp_binding_reconcile_time(
         binding.updated_at = recovered_at
 
 
+# Same rule for strategy_lifecycles.updated_at: it is the time the lifecycle's
+# content really changed, not the time reconcile last looked at it. Bumping it
+# every round made the web strategies version and the context-state
+# fingerprint move constantly for any lifecycle holding a position or a
+# pending entry. Compare column values, not SQLAlchemy attribute history:
+# queries inside the attach/mark functions autoflush and clear the history.
+_LIFECYCLE_CONTENT_COLUMNS: tuple[str, ...] = tuple(
+    attr.key
+    for attr in sa_inspect(StrategyLifecycle).column_attrs
+    if attr.key != "updated_at"
+)
+
+
+def _lifecycle_content_snapshot(lifecycle: StrategyLifecycle) -> tuple:
+    return tuple(getattr(lifecycle, key) for key in _LIFECYCLE_CONTENT_COLUMNS)
+
+
+def _stamp_lifecycle_updated_at(
+    lifecycle: StrategyLifecycle, *, before: tuple, updated_at: datetime
+) -> None:
+    if _lifecycle_content_snapshot(lifecycle) != before:
+        lifecycle.updated_at = updated_at
+
+
 def _derive_binding_from_entry_legs(
     session,
     *,
@@ -4244,8 +4269,6 @@ def _mark_lifecycle_pending(
     binding: ExecutionBinding,
     updated_at: datetime,
 ) -> None:
-    from telegram_kol_research.models import StrategyLifecycle
-
     lifecycle = (
         session.query(StrategyLifecycle)
         .filter(StrategyLifecycle.chat_id == binding.chat_id)
@@ -4257,11 +4280,14 @@ def _mark_lifecycle_pending(
     )
     if lifecycle is None or _is_terminal_exited_lifecycle(lifecycle):
         return
+    content_before = _lifecycle_content_snapshot(lifecycle)
     lifecycle.execution_binding_id = int(binding.id)
     lifecycle.lifecycle_status = "pending_entry"
     lifecycle.exit_reason = None
     lifecycle.exited_at = None
-    lifecycle.updated_at = updated_at
+    _stamp_lifecycle_updated_at(
+        lifecycle, before=content_before, updated_at=updated_at
+    )
 
 
 def _count_reconcile_binding(
@@ -6294,8 +6320,6 @@ def _attach_binding_to_lifecycle(
     *,
     clear_expiry_review: bool = False,
 ) -> bool:
-    from telegram_kol_research.models import StrategyLifecycle
-
     lifecycle = (
         session.query(StrategyLifecycle)
         .filter(StrategyLifecycle.execution_binding_id == row.id)
@@ -6314,6 +6338,7 @@ def _attach_binding_to_lifecycle(
         )
     if lifecycle is None:
         return True
+    content_before = _lifecycle_content_snapshot(lifecycle)
     if row.status != "active" and _is_stale_unentered_lifecycle(lifecycle, updated_at):
         lifecycle.lifecycle_status = "expired"
         lifecycle.exit_reason = "expired"
@@ -6321,7 +6346,9 @@ def _attach_binding_to_lifecycle(
         lifecycle.entered_at = None
         lifecycle.entry_price_actual = None
         lifecycle.execution_binding_id = None
-        lifecycle.updated_at = updated_at
+        _stamp_lifecycle_updated_at(
+            lifecycle, before=content_before, updated_at=updated_at
+        )
         row.status = "stale"
         row.last_exchange_status = "expired_pending_entry_not_attributed"
         return False
@@ -6339,7 +6366,9 @@ def _attach_binding_to_lifecycle(
     if _is_terminal_exited_lifecycle(lifecycle) and not (
         row.status == "active" and lifecycle.exit_reason == "manual"
     ):
-        lifecycle.updated_at = updated_at
+        _stamp_lifecycle_updated_at(
+            lifecycle, before=content_before, updated_at=updated_at
+        )
         return True
     if row.status == "active" and lifecycle.lifecycle_status != "entered":
         lifecycle.lifecycle_status = "entered"
@@ -6362,7 +6391,9 @@ def _attach_binding_to_lifecycle(
         lifecycle.lifecycle_status = "entered"
         lifecycle.entered_at = updated_at
     _refresh_lifecycle_prices_from_binding_payload(lifecycle, row)
-    lifecycle.updated_at = updated_at
+    _stamp_lifecycle_updated_at(
+        lifecycle, before=content_before, updated_at=updated_at
+    )
     return True
 
 
