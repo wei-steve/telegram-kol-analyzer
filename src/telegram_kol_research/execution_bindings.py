@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
-from sqlalchemy import func
+from sqlalchemy import func, inspect as sa_inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -955,9 +955,11 @@ def _apply_reconcile_snapshot(
                 if int(binding.id) in manual_terminal_binding_ids:
                     _count_reconcile_binding(result, binding)
                     continue
+                content_before = _binding_content_snapshot(binding)
                 binding.last_exchange_status = "position_attribution_evidence_unavailable"
-                binding.recovered_at = recovered_at
-                binding.updated_at = recovered_at
+                _stamp_binding_reconcile_time(
+                    binding, before=content_before, recovered_at=recovered_at
+                )
                 _count_reconcile_binding(result, binding)
             result.updated = len(bindings)
             session.commit()
@@ -4113,6 +4115,29 @@ def _transition_leg_attribution(
     leg.updated_at = recovered_at
 
 
+# updated_at is the time the binding's content really changed; recovered_at is
+# the last reconcile check and is refreshed every round (position verification
+# freshness depends on it). Compare column values, not SQLAlchemy attribute
+# history: queries inside the derivation autoflush and clear the history.
+_BINDING_CONTENT_COLUMNS: tuple[str, ...] = tuple(
+    attr.key
+    for attr in sa_inspect(ExecutionBinding).column_attrs
+    if attr.key not in {"updated_at", "recovered_at"}
+)
+
+
+def _binding_content_snapshot(binding: ExecutionBinding) -> tuple:
+    return tuple(getattr(binding, key) for key in _BINDING_CONTENT_COLUMNS)
+
+
+def _stamp_binding_reconcile_time(
+    binding: ExecutionBinding, *, before: tuple, recovered_at: datetime
+) -> None:
+    binding.recovered_at = recovered_at
+    if _binding_content_snapshot(binding) != before:
+        binding.updated_at = recovered_at
+
+
 def _derive_binding_from_entry_legs(
     session,
     *,
@@ -4121,6 +4146,7 @@ def _derive_binding_from_entry_legs(
     live_position_ids: set[str],
     recovered_at: datetime,
 ) -> None:
+    content_before = _binding_content_snapshot(binding)
     verified_live_pos_ids = [
         str(leg.pos_id)
         for leg in sorted(legs, key=lambda item: int(item.leg_index or 0))
@@ -4207,8 +4233,9 @@ def _derive_binding_from_entry_legs(
         binding.pos_id = None
         binding.status = "stale"
         binding.last_exchange_status = "position_ownership_unassigned"
-    binding.recovered_at = recovered_at
-    binding.updated_at = recovered_at
+    _stamp_binding_reconcile_time(
+        binding, before=content_before, recovered_at=recovered_at
+    )
 
 
 def _mark_lifecycle_pending(
