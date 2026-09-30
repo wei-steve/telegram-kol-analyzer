@@ -167,3 +167,49 @@ positions-history、1 分钟 K 线），worker journal。
 1. **修复范围**：做 F1 + F2（推荐），还是只做 F1？F3 是否先不做？ → **用户：F1 + F2，F3 不做。**
 2. **两段式消息的分类**：像 raw 20064 这样「短线止盈出局 + 中长线止盈 50% 保本」的消息，继续按**全平**处理（现状，符合「有离场意愿就跟着离场」），还是改成**先减仓 50%、剩余止损改到策略入场价**？推荐维持现状，因为对跟单账户，这类消息里"短线出局"是明确动作，"中长线"是给另一类读者的建议。 → **用户：维持全平。**
 3. **三笔历史记账**（167 / 175 / 191）是否不修？推荐不修，只在状态文档里注明。 → **用户：不修。**
+
+## 8. 实施结果
+
+- 候选代码 sha：`61339348`（分支 `claude/kind-jepsen-76240c`，基于 `9941109b` / `b822e856`）。**未部署、未推送任何分支。**
+- 全量：`uv run python -m pytest -q -p no:cacheprovider`，**10936 passed / 4 skipped / 0 failed**（1178 秒）。与 `9941109b` 记录的 10918 相比净增 18 个用例，全部是本次新增。
+
+### 8.1 改动文件
+
+| 文件 | 改动 |
+|---|---|
+| `strategy_management_reconciliation.py` `_identity_is_exact` | F1：删掉无 posId 终态腿放行条件里的 `effective_action not in {full_close, full_exit}`；其余分支原样 |
+| `position_attribution.py` `canonical_live_position_economics` | F2：0 行 → `target_live_position_missing`；>1 行仍 `target_live_position_not_unique` |
+| `position_mutation_gateway.py` `_build_fresh_authority` | F2：同上（`PositionMutationAuthorityError`） |
+| `position_management_remediation.py` | F2：`pos_ids` 为空（没有一条 verified 入场腿的 posId 在活仓）→ `target_live_position_missing`；其余不精确仍 `target_live_position_not_exact`；`cancel_entry` 的 `late_fill_identity_not_exact` 不变 |
+
+未改：`strategy_management_composite_executor.py`、`strategy_management_take_profit_consumption.py:312`、`RETRYABLE_PREFLIGHT_BLOCK_REASONS`；`_planning_reason_from_attribution` 对新码原样透传（未命中任何前缀分支）。
+
+### 8.2 测试
+
+新增：
+
+- `tests/test_strategy_management_reconciliation.py`
+  - `test_full_exit_confirms_despite_pre_cancelled_unfilled_entry_leg`（4 组参数：191 形态 full_exit / full_close；167/175 形态撤单早于规划 6 小时；被**另一个**管理批次撤掉、不在本批次快照里的腿）→ `succeeded / management_close_exchange_confirmed`，E1 `closed / management_full_close_confirmed`，绑定 closed，lifecycle exited。修复前 4 组均得 frozen（先写失败测试已确认）。
+  - `test_full_exit_still_rejects_snapshotted_deferred_entry_still_pending`
+  - `test_full_exit_still_rejects_other_live_verified_entry_leg`
+  - `test_full_exit_still_rejects_terminal_unfilled_leg_of_other_strategy`
+- `tests/test_position_attribution.py::test_canonical_live_position_economics_separates_missing_from_duplicate`（0 行、只有别的 posId、2 行）
+- `tests/test_position_mutation_gateway.py::test_fresh_authority_separates_missing_from_duplicate_live_position`（同上三例，且断言未发生交易所写入）
+- `tests/test_position_management_remediation.py`：`test_management_step_reports_missing_when_no_target_position_is_live`（1 腿 / 2 腿）、`test_management_step_stays_not_exact_when_only_some_positions_are_live`、`test_management_step_stays_not_exact_for_duplicate_live_position`
+- `tests/test_strategy_management_planner.py::test_missing_and_duplicate_target_positions_block_with_distinct_reasons`（0 行 → `target_live_position_missing`，2 行 → `target_live_position_not_unique`；两者都不在重试集合，快照恢复后再规划仍 blocked、同一批次）
+
+修改的既有断言（1 处）：
+
+- `test_full_close_reconciliation_rejects_other_terminal_deferred_entries` 删去参数组 `(snapshotted=False, "management_full_close_cancelled_unfilled_entry_leg")`。它断言"不在快照里、无 posId、已终态的腿对 full_close 要冻结"，正是 F1 要去掉的行为，与第 5 节 F1 规格直接冲突；该形态已移到上面新测试里改为断言成功。保留的参数组 `(snapshotted=True, "exchange_cancelled")`（快照内的腿不是管理批次撤的 → 仍冻结）不变。
+
+F2 没有既有测试把 0 行场景断言成 `not_unique`，未改任何 F2 相关断言（`test_strategy_management_executor.py` 里的 `not_unique` 是 monkeypatch 注入的字符串，与抛出点无关）。
+
+### 8.3 规格未写明、由实施者决定的地方
+
+- 值守 F2 的"所有 verified 入场腿的 posId 都不在活仓"按 `pos_ids` 为空实现；当绑定上**根本没有**可管理的 verified 入场腿时 `pos_ids` 同样为空，也报 `target_live_position_missing`（原来报 `not_exact`）。
+- `position_mutation_authority.build_position_mutation_authority` 用单行 `[live_position]` 调 `canonical_live_position_economics`；传入行的 posId 与目标不符时，原因码随之由 `not_unique` 变为 `missing`。只是文字变化，拦截与否不变。
+
+### 8.4 同类判据核对（未改）
+
+- `strategy_management_executor._require_exact_entry_legs`：终态腿对所有 action 一律放行，F1 后两边一致。
+- `management_history_recovery._durable_identity_is_exact`：只逐条核对批次自己的腿（binding / strategy / posId / verified），不遍历绑定上的其他入场腿，**没有**同形排除，不存在 F1 的镜像缺陷。它为什么没有接管批次 191，仍按第 5 节"不在本方案内"待查。
