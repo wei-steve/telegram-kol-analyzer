@@ -2530,6 +2530,16 @@ def _load_deepcoin_live_position_rows(
                     "pos_id": pos_id,
                     "order_id": binding.order_id if binding is not None else None,
                     "position_size_text": _position_size_label(position),
+                    # Display-only, straight from the raw row cached with the
+                    # snapshot (no extra exchange read). Absent -> hidden.
+                    "last_price_text": _position_number_text(position.get("lastPx")),
+                    "unrealized_pnl_text": _position_number_text(
+                        position.get("unrealizedProfit")
+                    ),
+                    "unrealized_pnl": _float_or_none(
+                        _position_number_text(position.get("unrealizedProfit"))
+                    ),
+                    "liq_price_text": _position_liquidation_text(position),
                     "original_text": (
                         "这个交易所仓位没有本地 KOL 绑定，请人工确认归因。"
                         if binding is None
@@ -4844,6 +4854,28 @@ def _float_or_none(value: Any) -> float | None:
 def _position_text_value(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+def _position_number_text(value: Any) -> str | None:
+    """Exchange numeric text kept verbatim, or None when absent/not a number.
+
+    Used for display-only fields (last price, unrealized PnL, liquidation
+    price) copied from the raw position row already held in the cached
+    snapshot; nothing here reads the exchange.
+    """
+    text = _position_text_value(value)
+    if text is None:
+        return None
+    number = _float_or_none(text)
+    if number is None or number != number or number in (float("inf"), float("-inf")):
+        return None
+    return text
+
+
+def _position_liquidation_text(position: dict[str, Any]) -> str | None:
+    text = _position_number_text(position.get("liqPx"))
+    # Deepcoin reports 0 when there is no liquidation price to show.
+    return text if text is not None and float(text) != 0 else None
 
 
 def _position_size_label(position: dict[str, Any]) -> str | None:

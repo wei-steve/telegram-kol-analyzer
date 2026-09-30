@@ -60,6 +60,9 @@
       {% if item.entry_text %}<div><dt>开仓均价</dt><dd>{{ item.entry_text }}</dd></div>
       {% elif item.entry_price_actual %}<div><dt>开仓均价</dt><dd>{{ "%g"|format(item.entry_price_actual) }}</dd></div>{% endif %}
       {% if item.position_size_text %}<div><dt>数量</dt><dd>{{ item.position_size_text }}</dd></div>{% endif %}
+      {% if item.last_price_text %}<div data-position-metric="last-price"><dt>现价</dt><dd>{{ item.last_price_text }}</dd></div>{% endif %}
+      {% if item.unrealized_pnl_text %}<div data-position-metric="unrealized-pnl"><dt>浮动盈亏</dt><dd class="exchange-pnl{% if item.unrealized_pnl is not none and item.unrealized_pnl < 0 %} exchange-pnl-negative{% elif item.unrealized_pnl is not none and item.unrealized_pnl > 0 %} exchange-pnl-positive{% endif %}">{{ item.unrealized_pnl_text }}</dd></div>{% endif %}
+      {% if item.liq_price_text %}<div data-position-metric="liq-price"><dt>强平价</dt><dd>{{ item.liq_price_text }}</dd></div>{% endif %}
       {% if item.last_checked_at_display %}<div><dt>更新时间</dt><dd>{{ item.last_checked_at_display }}</dd></div>{% endif %}
     </dl>
     <section class="exchange-protection-orders" aria-label="止盈止损">
@@ -183,7 +186,7 @@
         {{ order_card(item) }}
       {% endif %}
     {% else %}
-      <p class="exchange-empty">{{ empty_text }}</p>
+      <p class="exchange-empty" data-live-key="empty">{{ empty_text }}</p>
     {% endfor %}
   </div>
 {%- endmacro %}
@@ -199,7 +202,7 @@
         {{ card_list(group['items'], empty_text, kind) }}
       </section>
     {% else %}
-      <p class="exchange-empty">{{ empty_text }}</p>
+      <p class="exchange-empty" data-live-key="empty">{{ empty_text }}</p>
     {% endfor %}
   </div>
 {%- endmacro %}
@@ -294,21 +297,21 @@
   </div>
 
   {% if exchange_snapshot.error %}
-    <p class="exchange-empty" role="status">Deepcoin 数据暂不可用，请稍后重试。</p>
+    <p class="exchange-empty" role="status" data-live-key="exchange-error">Deepcoin 数据暂不可用，请稍后重试。</p>
   {% endif %}
 
   <div class="exchange-tab-panels">
     <section class="exchange-tab-panel is-active" data-exchange-position-panel="positions" data-exchange-tab-loaded="true">
-      <div class="exchange-view-panel is-active" data-exchange-view-panel="list">
+      <div class="exchange-view-panel is-active" data-exchange-view-panel="list" data-live-key="view-list">
         {{ card_list(exchange_snapshot.positions | list, '暂无持仓', 'position') }}
       </div>
-      <div class="exchange-view-panel" data-exchange-view-panel="grouped">
+      <div class="exchange-view-panel" data-exchange-view-panel="grouped" data-live-key="view-grouped">
         {{ grouped_list(exchange_snapshot.grouped.positions, '暂无持仓', 'position') }}
       </div>
       {% set resting_entry_stops = exchange_snapshot.unattributed_protection_orders | selectattr('resting_entry_leg_id', 'defined') | list %}
       {% set ownerless_protection_orders = exchange_snapshot.unattributed_protection_orders | rejectattr('resting_entry_leg_id', 'defined') | list %}
       {% if resting_entry_stops %}
-        <section class="exchange-protection-orders" data-resting-entry-stops>
+        <section class="exchange-protection-orders" data-resting-entry-stops data-live-key="resting-entry-stops">
           <strong>挂单入场自带止损（入场尚未成交）</strong>
           <small class="ai-helper-text">这些止损由我们自己的挂单带上交易所，入场成交后会自动归属到新仓位。</small>
           {% for instrument_id, orders in resting_entry_stops | groupby('instrument_id') %}
@@ -332,7 +335,7 @@
         </section>
       {% endif %}
       {% if ownerless_protection_orders %}
-        <section class="exchange-protection-orders" data-unattributed-protection-orders>
+        <section class="exchange-protection-orders" data-unattributed-protection-orders data-live-key="unattributed-protection-orders">
           <strong>未归属交易所保护单</strong>
           {% for instrument_id, orders in ownerless_protection_orders | groupby('instrument_id') %}
             <div>

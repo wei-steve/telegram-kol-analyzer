@@ -1,6 +1,6 @@
 <div class="kol-strategy-list">
   {% for group in groups %}
-    <article class="kol-strategy-row{% if group.chat_id == selected_chat_id %} is-active{% endif %}">
+    <article class="kol-strategy-row{% if group.chat_id == selected_chat_id %} is-active{% endif %}" data-live-key="group-{{ group.chat_id }}">
       <button
         type="button"
         class="kol-open-button"

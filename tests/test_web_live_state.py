@@ -355,3 +355,13 @@ def test_strategy_list_cache_is_bounded_and_keeps_latest_entry_per_query():
     assert cache.get(("q", 4), "v1", lambda: b"unused") == b"body-4"
     assert cache.get(("q", 4), "v2", lambda: b"fresh") == b"fresh"
     assert cache._entries[("q", 4)] == ("v2", b"fresh")
+
+
+def test_rendered_strategy_cards_carry_a_stable_key(tmp_path):
+    app, _clock = _make_app(tmp_path)
+    lifecycle_id = _add_lifecycle(app.state.session_factory)
+
+    body = TestClient(app).get("/strategy-records?filter=all").text
+
+    assert f'data-strategy-record-key="{lifecycle_id}"' in body
+    assert "data-strategy-reorder-hint" in body
