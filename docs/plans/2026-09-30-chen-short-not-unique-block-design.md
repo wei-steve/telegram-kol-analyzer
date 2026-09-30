@@ -3,6 +3,7 @@
 - 日期：2026-09-30（时间均为 UTC）
 - 对象：陈哥群 `-1002337721508`，lifecycle 1385，执行绑定 393，管理批次 191–194，值守提案 4–6
 - 状态：**已批准（2026-09-30）：做 F1 + F2；F3 不做；两段式消息维持全平；167 / 175 / 191 历史记账不修。** 实施到候选 sha + 全量通过为止，不部署、不推 origin/main。
+- **部署：2026-09-30 23:23:50Z 部署 `45e404bc`（代码提交 `aa1bba03`，rebase 到 `73677f1c` 后全量 10936 passed / 4 skipped），回滚 `tg-deploy bba228e3700e268c3896c3451feb9b68eaf5e698`。L2 观察进行中（见第 9 节）。**
 - 生产 HEAD：`bba228e3`（另一会话的 L2 观察窗进行中，本调查全程只读）
 
 ## 1. 一句话结论
@@ -213,3 +214,11 @@ F2 没有既有测试把 0 行场景断言成 `not_unique`，未改任何 F2 相
 
 - `strategy_management_executor._require_exact_entry_legs`：终态腿对所有 action 一律放行，F1 后两边一致。
 - `management_history_recovery._durable_identity_is_exact`：只逐条核对批次自己的腿（binding / strategy / posId / verified），不遍历绑定上的其他入场腿，**没有**同形排除，不存在 F1 的镜像缺陷。它为什么没有接管批次 191，仍按第 5 节"不在本方案内"待查。
+
+## 9. 部署与观察（2026-09-30）
+
+- 预检：生产 HEAD `bba228e3`，实盘绑定 391–396 全部 closed，无在途管理批次，消息任务无积压；候选是生产 HEAD 的后代且包含 origin/main。
+- 顺序：推 `claude/kind-jepsen-76240c` → `tg-deploy 45e404bc…`（worker 3768558 / web 3768568 / ingest 3768579）→ 推 origin/main（`73677f1c..45e404bc`，非强推）→ 判决式 `PASS: 0 code files beyond production`，部署 sha 在 origin/main 上；自检同一判决式对 `bba228e3` 判 FAIL（9 个代码文件）。
+- 部署后：web / ingest / worker 健康端点 200，三服务自部署起错误行 0。
+- 观察：服务器只读监视器 `/var/lib/telegram-kol-observations/20260930-full-exit-reconcile/`（`obs.py`、`samples.jsonl`、结束时写 `RESULT`），每分钟采样；健康判据：三服务 PID 不变且 active、对账轮 >0、worker 无 ERROR/Traceback、worker loop-health 200、新批次无 `recovery_required` 且无 `management_reconciliation_identity_mismatch`；连续 30 分钟且 ≥5 条真实消息即 PASS，上限 24 小时。
+- 正向样本（第二腿先撤后 full_exit 的真实成交确认）要等自然出现，不作为本窗口的通过条件。
