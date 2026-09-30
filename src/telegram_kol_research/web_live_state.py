@@ -48,6 +48,18 @@ VOLATILE_SNAPSHOT_KEYS = frozenset(
     }
 )
 
+# Market-tick fields (raw Deepcoin names and their materialized display
+# equivalents). Strategy cards do not show them, so they must not move the
+# strategies version: with open positions they change every few seconds.
+MARKET_TICK_KEYS = frozenset(
+    {
+        "lastPx", "markPx", "unrealizedProfit", "upl", "liqPx", "useMargin", "uTime",
+        "last_price_text", "last_price", "mark_price", "mark_price_text",
+        "unrealized_pnl", "unrealized_pnl_text", "liq_price_text", "liq_price",
+        "use_margin", "last_checked_at_display",
+    }
+)
+
 # Lifecycles that are still in flight. ``ix_strategy_lifecycles_status`` makes
 # this a bounded index range (about thirty rows in production).
 ACTIVE_LIFECYCLE_STATUSES = ("entered", "pending_entry")
@@ -56,15 +68,15 @@ LIVE_STATE_TTL_SECONDS = 2.0
 STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES = 16
 
 
-def strip_volatile_snapshot_keys(value: Any) -> Any:
+def strip_volatile_snapshot_keys(value: Any, extra: frozenset = frozenset()) -> Any:
     if isinstance(value, dict):
         return {
-            str(key): strip_volatile_snapshot_keys(item)
+            str(key): strip_volatile_snapshot_keys(item, extra)
             for key, item in value.items()
-            if key not in VOLATILE_SNAPSHOT_KEYS
+            if key not in VOLATILE_SNAPSHOT_KEYS and key not in extra
         }
     if isinstance(value, (list, tuple)):
-        return [strip_volatile_snapshot_keys(item) for item in value]
+        return [strip_volatile_snapshot_keys(item, extra) for item in value]
     return value
 
 
@@ -75,16 +87,30 @@ def _short_hash(text: str) -> str:
 def positions_version(payload: dict[str, Any] | None) -> str:
     """Content hash of a cached position snapshot payload, or ``p:none``."""
 
+    return _positions_hash(payload, frozenset(), "p")
+
+
+def positions_structure_version(payload: dict[str, Any] | None) -> str:
+    """Like :func:`positions_version` but blind to market ticks.
+
+    Moves on a new/closed position, a size change or protection-order change,
+    not on price or PnL movement.
+    """
+
+    return _positions_hash(payload, MARKET_TICK_KEYS, "ps")
+
+
+def _positions_hash(payload, extra: frozenset, prefix: str) -> str:
     if payload is None:
-        return "p:none"
+        return f"{prefix}:none"
     body = json.dumps(
-        strip_volatile_snapshot_keys(payload),
+        strip_volatile_snapshot_keys(payload, extra),
         sort_keys=True,
         separators=(",", ":"),
         default=str,
         ensure_ascii=False,
     )
-    return f"p:{_short_hash(body)}"
+    return f"{prefix}:{_short_hash(body)}"
 
 
 def build_strategy_version_statements() -> list[tuple[str, Any]]:
@@ -127,8 +153,8 @@ def strategies_base_fingerprint(session) -> str:
 def strategies_version(session, *, positions: str) -> str:
     """Version of everything a strategy card shows.
 
-    Real-position state is shown on strategy cards, so the positions version
-    is folded in.
+    Real-position state (not price ticks) is shown on strategy cards, so the
+    positions *structure* version is folded in.
     """
 
     return f"s:{_short_hash(strategies_base_fingerprint(session) + ';' + positions)}"
@@ -179,17 +205,26 @@ class StrategyListRenderCache:
 
     Keyed by the request's query parameters; an entry is reused only while the
     (strategies, positions) version pair it was rendered for is unchanged, and
-    only the latest render per query is kept. The number of distinct queries is
+    only the latest render per query is kept. An entry also expires after
+    ``max_age_seconds`` so a rendered "updated at" time never looks hours old. The number of distinct queries is
     bounded (oldest evicted) so a client cycling filters cannot grow it.
 
     Renders for one query are single-flight: concurrent callers wait for the
     render in progress and reuse it, so N tabs cost one render.
     """
 
-    def __init__(self, *, max_entries: int = STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES):
+    def __init__(
+        self,
+        *,
+        max_entries: int = STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES,
+        max_age_seconds: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._max_entries = max(1, int(max_entries))
+        self._max_age = float(max_age_seconds)
+        self._clock = clock
         self._guard = threading.Lock()
-        self._entries: dict[Any, tuple[Any, bytes]] = {}
+        self._entries: dict[Any, tuple[Any, bytes, float]] = {}
         self._key_locks: dict[Any, threading.Lock] = {}
         self.render_count = 0
 
@@ -201,13 +236,17 @@ class StrategyListRenderCache:
         with key_lock:
             with self._guard:
                 entry = self._entries.get(key)
-            if entry is not None and entry[0] == versions:
+            if (
+                entry is not None
+                and entry[0] == versions
+                and 0 <= self._clock() - entry[2] < self._max_age
+            ):
                 return entry[1]
             body = render()
             with self._guard:
                 self.render_count += 1
                 self._entries.pop(key, None)
-                self._entries[key] = (versions, body)
+                self._entries[key] = (versions, body, self._clock())
                 while len(self._entries) > self._max_entries:
                     oldest = next(iter(self._entries))
                     del self._entries[oldest]

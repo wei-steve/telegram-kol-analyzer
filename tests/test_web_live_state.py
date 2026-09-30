@@ -193,7 +193,7 @@ def test_positions_version_ignores_capture_time_but_follows_content(tmp_path):
     assert second["versions"]["positions"] == first["versions"]["positions"]
     assert second["versions"]["strategies"] == first["versions"]["strategies"]
 
-    # ... a changed price does, and strategies (which show positions) follows.
+    # ... a changed price does; strategies ignores market ticks.
     store.finish_success(
         _snapshot_payload(last_px="60100", upl="14.0"),
         captured_at=NOW + timedelta(seconds=10),
@@ -201,7 +201,7 @@ def test_positions_version_ignores_capture_time_but_follows_content(tmp_path):
     clock.value += 5
     third = client.get("/api/live/state").json()
     assert third["versions"]["positions"] != first["versions"]["positions"]
-    assert third["versions"]["strategies"] != first["versions"]["strategies"]
+    assert third["versions"]["strategies"] == first["versions"]["strategies"]
 
 
 def test_positions_version_strips_volatile_keys_at_any_depth():
@@ -354,7 +354,7 @@ def test_strategy_list_cache_is_bounded_and_keeps_latest_entry_per_query():
 
     assert cache.get(("q", 4), "v1", lambda: b"unused") == b"body-4"
     assert cache.get(("q", 4), "v2", lambda: b"fresh") == b"fresh"
-    assert cache._entries[("q", 4)] == ("v2", b"fresh")
+    assert cache._entries[("q", 4)][:2] == ("v2", b"fresh")
 
 
 def test_rendered_strategy_cards_carry_a_stable_key(tmp_path):
@@ -365,3 +365,73 @@ def test_rendered_strategy_cards_carry_a_stable_key(tmp_path):
 
     assert f'data-strategy-record-key="{lifecycle_id}"' in body
     assert "data-strategy-reorder-hint" in body
+
+
+def test_price_only_change_moves_positions_but_not_strategies(tmp_path):
+    app, clock = _make_app(tmp_path)
+    client = TestClient(app)
+    store = app.state.live_position_snapshot_store
+    store.finish_success(_snapshot_payload(), captured_at=NOW)
+    clock.value += 5
+    base = _versions(client)
+
+    store.finish_success(_snapshot_payload(last_px="61000", upl="99"), captured_at=NOW)
+    clock.value += 5
+    ticked = _versions(client)
+    assert ticked["positions"] != base["positions"]
+    assert ticked["strategies"] == base["strategies"]
+
+    resized = _snapshot_payload()
+    resized["_live_source"]["positions"][0]["pos"] = "2"
+    store.finish_success(resized, captured_at=NOW)
+    clock.value += 5
+    sized = _versions(client)
+    assert sized["positions"] != base["positions"]
+    assert sized["strategies"] != base["strategies"]
+
+    added = _snapshot_payload()
+    added["_live_source"]["positions"].append({"instId": "ETH-USDT-SWAP", "posId": "pos-2", "pos": "1"})
+    store.finish_success(added, captured_at=NOW)
+    clock.value += 5
+    assert _versions(client)["strategies"] not in {base["strategies"], sized["strategies"]}
+
+
+def test_render_cache_entry_expires_after_max_age():
+    from telegram_kol_research.web_live_state import StrategyListRenderCache
+
+    clock = FakeClock()
+    cache = StrategyListRenderCache(max_age_seconds=30, clock=clock)
+    assert cache.get("k", "v", lambda: b"one") == b"one"
+    clock.value += 29
+    assert cache.get("k", "v", lambda: b"two") == b"one"
+    clock.value += 2
+    assert cache.get("k", "v", lambda: b"two") == b"two"
+    assert cache.render_count == 2
+
+
+def test_positions_panel_render_is_shared_across_tabs(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        now_provider=lambda: NOW,
+        position_snapshot_now_provider=lambda: NOW,
+    )
+    clock = FakeClock()
+    app.state.live_state_clock = clock
+    store = app.state.live_position_snapshot_store
+    store.finish_success(_snapshot_payload(), captured_at=NOW)
+    client = TestClient(app)
+    cache = app.state.positions_panel_render_cache
+
+    first = client.get("/positions-panel?initial=positions")
+    second = client.get("/positions-panel?initial=positions")
+    assert first.text == second.text and cache.render_count == 1
+
+    store.finish_success(_snapshot_payload(last_px="62000"), captured_at=NOW)
+    clock.value += 5
+    third = client.get("/positions-panel?initial=positions")
+    assert cache.render_count == 2 and "62000" in third.text
+
+    clock.value += 31  # max age forces a fresh render even with equal versions
+    client.get("/positions-panel?initial=positions")
+    assert cache.render_count == 3

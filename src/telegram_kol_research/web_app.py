@@ -341,6 +341,7 @@ from telegram_kol_research.web_live_state import (
     StrategyListRenderCache,
     groups_version,
     messages_version,
+    positions_structure_version,
     positions_version,
     strategies_version,
 )
@@ -9107,7 +9108,8 @@ def create_web_app(
 
         # The list is the console's heaviest partial and every open tab asks
         # for it whenever the strategies version moves. Share one render per
-        # (query params, strategies, positions and groups versions).
+        # (query params, strategies and groups versions; strategies already folds
+        # in the position structure, and cards show no prices).
         try:
             versions = _current_live_versions()
         except Exception:
@@ -9115,7 +9117,7 @@ def create_web_app(
             return HTMLResponse(render_strategy_list())
         body = app.state.strategy_list_render_cache.get(
             (filter, normalized_chat_id, limit, page),
-            (versions["strategies"], versions["positions"], versions["groups"]),
+            (versions["strategies"], versions["groups"]),
             render_strategy_list,
         )
         return HTMLResponse(body)
@@ -9418,14 +9420,38 @@ def create_web_app(
         request: Request,
         initial: str | None = None,
     ):
-        return templates.TemplateResponse(
-            request,
-            "_exchange_positions_panel.html",
-            (
-                build_initial_positions_panel_context(schedule_refresh=True)
-                if initial == "positions"
-                else build_positions_panel_context()
-            ),
+        def render() -> bytes:
+            return bytes(
+                templates.TemplateResponse(
+                    request,
+                    "_exchange_positions_panel.html",
+                    (
+                        build_initial_positions_panel_context(schedule_refresh=True)
+                        if initial == "positions"
+                        else build_positions_panel_context()
+                    ),
+                ).body
+            )
+
+        # Only the snapshot-backed render is shared. In the web role it merely
+        # reads the cache file (schedule_live_position_snapshot_refresh is a
+        # no-op there); in other roles a cache hit could skip the refresh
+        # scheduling that render performs, so those always render.
+        if initial != "positions" or app.state.runtime_role != "web":
+            return HTMLResponse(render())
+        try:
+            versions = _current_live_versions()
+            strategies = versions["strategies"]
+            positions = versions["positions"]
+        except Exception:
+            logger.exception("live version lookup failed; rendering uncached")
+            return HTMLResponse(render())
+        return HTMLResponse(
+            app.state.positions_panel_render_cache.get(
+                ("initial=positions",),
+                (positions, strategies),
+                render,
+            )
         )
 
     @app.get("/positions-panel/tabs/{tab_name}")
@@ -11195,10 +11221,12 @@ def create_web_app(
         ``web_live_state`` for the query contract.
         """
         snapshot = app.state.live_position_snapshot_store.read()
-        positions = positions_version(snapshot.payload if snapshot else None)
+        payload = snapshot.payload if snapshot else None
+        positions = positions_version(payload)
+        structure = positions_structure_version(payload)
         with app.state.session_factory() as session:
             global_latest = session.execute(build_global_freshness_statement()).one()
-            strategies = strategies_version(session, positions=positions)
+            strategies = strategies_version(session, positions=structure)
         messages = messages_version(global_latest.raw_message_id)
         return {
             "versions": {
@@ -11220,7 +11248,14 @@ def create_web_app(
         }
 
     app.state.strategy_list_render_cache = StrategyListRenderCache(
-        max_entries=STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES
+        max_entries=STRATEGY_LIST_RENDER_CACHE_MAX_ENTRIES,
+        max_age_seconds=30.0,
+        clock=lambda: app.state.live_state_clock(),
+    )
+    app.state.positions_panel_render_cache = StrategyListRenderCache(
+        max_entries=4,
+        max_age_seconds=30.0,
+        clock=lambda: app.state.live_state_clock(),
     )
     app.state.live_state_cache = LiveStateCache(
         ttl_seconds=LIVE_STATE_TTL_SECONDS,
@@ -11265,7 +11300,8 @@ def create_web_app(
             .astimezone(DEFAULT_LOCAL_TIMEZONE)
             .isoformat(),
             "monitor": monitor,
-            **state,
+            "versions": state["versions"],
+            "positions_captured_at": state["positions_captured_at"],
         }
 
     @app.post("/api/refresh")
