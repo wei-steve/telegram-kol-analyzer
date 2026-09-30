@@ -2782,7 +2782,9 @@ def load_strategy_record_summaries(
             lifecycle,
             decision,
             recognition,
-            binding,
+            # ExecutionBinding.updated_at is deliberately excluded: the
+            # reconcile pass rewrites it on every binding each round, so it
+            # says nothing about when this strategy actually changed.
             *lifecycle_events,
             *batches,
         ) or fallback_time
@@ -3136,10 +3138,25 @@ def load_live_bindings_without_lifecycle(
         )
         if chat_id is not None:
             query = query.filter(ExecutionBinding.chat_id == chat_id)
-        bindings = query.order_by(
-            ExecutionBinding.updated_at.desc(),
-            ExecutionBinding.id.desc(),
-        ).all()
+        # Not ordered by updated_at: reconcile rewrites it every round.
+        bindings = query.order_by(ExecutionBinding.id.desc()).all()
+        latest_event_by_binding_id: dict[int, datetime] = {}
+        if bindings:
+            latest_event_by_binding_id = {
+                int(binding_id): created_at
+                for binding_id, created_at in session.query(
+                    ExecutionEvent.execution_binding_id,
+                    func.max(ExecutionEvent.created_at),
+                )
+                .filter(
+                    ExecutionEvent.execution_binding_id.in_(
+                        [int(binding.id) for binding in bindings]
+                    )
+                )
+                .group_by(ExecutionEvent.execution_binding_id)
+                .all()
+                if binding_id is not None and created_at is not None
+            }
 
     records: list[dict[str, object]] = []
     for binding in bindings:
@@ -3163,7 +3180,16 @@ def load_live_bindings_without_lifecycle(
             "venue": "deepcoin",
             "attention": None,
             "attention_reasons": [],
-            "latest_changed_at": _latest_timestamp(binding),
+            "latest_changed_at": max(
+                filter(
+                    None,
+                    (
+                        _as_utc(binding.created_at),
+                        _as_utc(latest_event_by_binding_id.get(int(binding.id))),
+                    ),
+                ),
+                default=None,
+            ),
             "detail_href": f"/?{urlencode({'view': 'positions', 'pos_id': pos_id})}",
             "orphan_execution_binding": True,
         }
@@ -3565,7 +3591,6 @@ def _attention_lifecycle_query(
         func.coalesce(StrategyLifecycle.updated_at, epoch),
         func.coalesce(RecognitionDecision.updated_at, epoch),
         func.coalesce(MessageRecognition.updated_at, epoch),
-        func.coalesce(ExecutionBinding.updated_at, epoch),
         func.coalesce(latest_event_at, epoch),
         func.coalesce(latest_management_at, epoch),
     )

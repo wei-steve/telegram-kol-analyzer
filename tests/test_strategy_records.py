@@ -3215,3 +3215,90 @@ def test_loader_query_count_does_not_scale_with_strategy_count(tmp_path):
         event.remove(engine, "before_cursor_execute", count_selects)
 
     assert baseline_count == expanded_count == 12
+
+
+def test_binding_updated_at_does_not_drive_latest_changed_at(tmp_path):
+    # Reconcile rewrites ExecutionBinding.updated_at on every binding each
+    # round; it must feed neither the displayed time nor the SQL ordering.
+    session_factory = create_session_factory(tmp_path / "records.db")
+    ids = _seed_strategy_records(session_factory)
+    with session_factory() as session:
+        for binding in session.query(ExecutionBinding).all():
+            binding.updated_at = NOW + timedelta(hours=1)
+        session.commit()
+
+    rows = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="all",
+        limit=None,
+        now=NOW,
+    )
+    by_id = {row["lifecycle_id"]: row for row in rows}
+    assert by_id[ids["missing_stop"]]["latest_changed_at"] == NOW - timedelta(minutes=2)
+    assert all(row["latest_changed_at"] <= NOW for row in rows)
+
+    # SQL path: with limit=1 the database picks the top row by recency, which
+    # must be the lifecycle changed most recently, not the bumped binding.
+    top = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="all",
+        limit=1,
+        now=NOW,
+    )
+    assert [row["lifecycle_id"] for row in top] == [ids["missing_stop"]]
+
+    attention = load_strategy_record_summaries(
+        session_factory,
+        group_labels_by_chat_id={10: "大镖客", 20: "峰哥"},
+        filter_name="needs_attention",
+        limit=50,
+        now=NOW,
+    )
+    assert all(row["latest_changed_at"] <= NOW for row in attention)
+
+
+def test_orphan_binding_latest_changed_at_uses_event_not_updated_at(tmp_path):
+    from telegram_kol_research.strategy_records import load_live_bindings_without_lifecycle
+
+    session_factory = create_session_factory(tmp_path / "orphans.db")
+    with session_factory() as session:
+        old = _binding(
+            chat_id=10, message_id=1, symbol="BTCUSDT",
+            strategy_instance_id="orphan-old", status="active",
+        )
+        recent = _binding(
+            chat_id=10, message_id=2, symbol="ETHUSDT",
+            strategy_instance_id="orphan-recent", status="active",
+        )
+        for binding, created in ((old, NOW - timedelta(days=3)), (recent, NOW - timedelta(days=2))):
+            binding.venue = "deepcoin"
+            binding.pos_id = f"pos-{binding.message_id}"
+            binding.created_at = created
+            binding.updated_at = NOW + timedelta(hours=1)  # reconcile bump
+        session.add_all([old, recent])
+        session.flush()
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=old.id,
+                strategy_instance_id="orphan-old",
+                action="open_position",
+                status="filled",
+                chat_id=10,
+                message_id=1,
+                symbol="BTCUSDT",
+                side="long",
+                created_at=NOW - timedelta(hours=6),
+            )
+        )
+        session.commit()
+
+    records = load_live_bindings_without_lifecycle(
+        session_factory, group_labels_by_chat_id={10: "大镖客"}
+    )
+    by_symbol = {record["symbol"]: record for record in records}
+    assert by_symbol["BTCUSDT"]["latest_changed_at"] == NOW - timedelta(hours=6)
+    assert by_symbol["ETHUSDT"]["latest_changed_at"] == NOW - timedelta(days=2)
+    # Ordered by id desc, not by the bumped updated_at.
+    assert [record["symbol"] for record in records] == ["ETHUSDT", "BTCUSDT"]
