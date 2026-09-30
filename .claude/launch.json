@@ -20,6 +20,28 @@
         "data/ai-routing-preview.yaml"
       ],
       "port": 8099
+    },
+    {
+      "name": "live-data-preview",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "telegram-kol-research",
+        "web",
+        "--runtime-role",
+        "web",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8123",
+        "--database-path",
+        "data/live-data-preview.db",
+        "--config-path",
+        "data/live-data-preview-groups.yaml",
+        "--ai-recognition-config-path",
+        "data/live-data-preview.yaml"
+      ],
+      "port": 8123
     }
   ]
 }
