@@ -1,7 +1,7 @@
 # 对账每轮刷新 strategy_lifecycles.updated_at：核实与方案
 
 - 日期：2026-09-30
-- 状态：**方案待用户确认**（确认前不写代码）
+- 状态：**用户已确认（2026-09-30）：问题 1 选 A、2 照做、3 接受、4 不回填**；实施中
 - 分支：`claude/reverent-gagarin-0143e2`（已快进到 origin/main `91f02f49`，即绑定 updated_at 修复 `5b0221c8` 落地后的版本；生产同为 `91f02f49`）
 - 验证级别：L2（改的是 worker 对账写入路径，而且会改变上下文解析这条权威路径的一个输入；不改表结构、不碰交易所写入）
 - 来源：`docs/plans/2026-09-30-binding-updated-at-churn-design.md` §1.4、§6 问题 2（用户选了「另开任务」）
