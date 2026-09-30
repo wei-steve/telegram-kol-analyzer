@@ -48,6 +48,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
 from telegram_kol_research.raw_ingest import repair_history_checkpoints
+from telegram_kol_research import recognition_failure_attribution as recognition_attribution
 from telegram_kol_research.runtime_incident_adapters import (
     capture_notification_failure,
     capture_runtime_incident_best_effort,
@@ -68,6 +69,7 @@ from telegram_kol_research.system_operator_bot import (
 from telegram_kol_research.telegram_client import (
     _download_media_if_present,
     _format_sender_name,
+    _should_download_media,
     discover_dialogs,
     fetch_dialog_messages,
     filter_target_dialogs,
@@ -79,6 +81,13 @@ from telegram_kol_research.trading_settings import load_trading_settings
 
 logger = logging.getLogger(__name__)
 AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS = 60.0
+#: Image-unavailable design (docs/plans/2026-10-01-image-unavailable-text-
+#: fallback-design.md §4.5). Live retries of a failed image download, in
+#: seconds after the previous try.
+LIVE_MEDIA_RETRY_DELAYS_SECONDS: tuple[float, ...] = (20.0, 40.0)
+#: How far back the reconcile keeps retrying failed media downloads (design Q6).
+ORPHAN_MEDIA_RETRY_WINDOW = timedelta(hours=2)
+_LIVE_MEDIA_RETRY_TASKS: set[asyncio.Task] = set()
 DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS = 20.0
 DEFAULT_STALL_EXPIRY_NOTIFICATION_MIN_INTERVAL_SECONDS = 300.0
 
@@ -261,6 +270,7 @@ async def _persist_live_message_event_inline(
     enqueue_hook: (
         Callable[[list[tuple[int, int]]], Awaitable[None]] | None
     ) = None,
+    media_retry_delays: tuple[float, ...] = LIVE_MEDIA_RETRY_DELAYS_SECONDS,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow.
 
@@ -363,6 +373,26 @@ async def _persist_live_message_event_inline(
                 )
     if enqueue_hook is not None:
         await enqueue_hook(inserted_keys)
+    live_client = getattr(event, "client", None)
+    if (
+        media_retry_delays
+        and live_client is not None
+        and media_path is None
+        and _should_download_media(message)
+        and getattr(message, "id", None) is not None
+    ):
+        task = asyncio.create_task(
+            _retry_live_media_download(
+                live_client,
+                session_factory=session_factory,
+                chat_id=int(getattr(event, "chat_id")),
+                message_id=int(getattr(message, "id")),
+                media_root=media_root,
+                delays=tuple(media_retry_delays),
+            )
+        )
+        _LIVE_MEDIA_RETRY_TASKS.add(task)
+        task.add_done_callback(_LIVE_MEDIA_RETRY_TASKS.discard)
     return stats
 
 
@@ -1187,14 +1217,27 @@ def _load_orphan_media_message_ids(
     dialog_id: int,
     replay_floor: int,
     media_root: str | Path,
+    recent_since: datetime | None = None,
 ) -> set[int]:
+    """Messages of ``dialog_id`` whose media download has not succeeded yet.
+
+    Two ways in: above the reconcile's replay floor (the original rule), or
+    stored since ``recent_since``. The second one is the 2026-10-01
+    image-unavailable design §4.5-1: the floor is ``checkpoint - 5``, so in a
+    group that kept talking a failed download dropped out of the retry set
+    within minutes and was never tried again (raw 17301, 20025).
+    """
+
+    position_filter = RawMessage.message_id > replay_floor
+    if recent_since is not None:
+        position_filter = or_(position_filter, RawMessage.created_at >= recent_since)
     with session_factory() as session:
         media_rows = (
             session.query(RawMessage.message_id, MediaAsset.local_path)
             .join(MediaAsset, MediaAsset.raw_message_id == RawMessage.id)
             .filter(
                 RawMessage.chat_id == dialog_id,
-                RawMessage.message_id > replay_floor,
+                position_filter,
             )
             .all()
         )
@@ -1207,6 +1250,188 @@ def _load_orphan_media_message_ids(
             media_root=resolved_media_root,
         )
     }
+
+
+def _load_repaired_waiting_raw_ids(
+    session_factory,
+    *,
+    dialog_id: int,
+    message_ids: set[int] | list[int],
+    media_root: str | Path,
+) -> list[int]:
+    """Messages parked as ``media_unavailable_waiting`` whose image is now here.
+
+    Image-unavailable design §4.5-3. Only that reason: a message the first
+    pass already judged from its text alone is not re-run when the image
+    arrives (design Q3), because a second run could act on it twice.
+    """
+
+    if not message_ids:
+        return []
+    resolved_media_root = Path(media_root)
+    with session_factory() as session:
+        rows = (
+            session.query(RawMessage.id, MediaAsset.local_path)
+            .join(MediaAsset, MediaAsset.raw_message_id == RawMessage.id)
+            .join(
+                RecognitionDecision,
+                RecognitionDecision.raw_message_id == RawMessage.id,
+            )
+            .filter(
+                RawMessage.chat_id == int(dialog_id),
+                RawMessage.message_id.in_([int(item) for item in message_ids]),
+                RecognitionDecision.automation_reason
+                == recognition_attribution.MEDIA_UNAVAILABLE_WAITING,
+            )
+            .all()
+        )
+    usable: dict[int, bool] = {}
+    for row in rows:
+        ok = _is_usable_downloaded_media_path(
+            row.local_path, media_root=resolved_media_root
+        )
+        usable[int(row.id)] = usable.get(int(row.id), True) and ok
+    return sorted(raw_id for raw_id, ok in usable.items() if ok)
+
+
+async def _enqueue_repaired_media_messages(
+    session_factory,
+    *,
+    dialog_id: int,
+    message_ids: set[int] | list[int],
+    media_root: str | Path,
+) -> list[int]:
+    try:
+        raw_ids = await asyncio.to_thread(
+            _load_repaired_waiting_raw_ids,
+            session_factory,
+            dialog_id=dialog_id,
+            message_ids=message_ids,
+            media_root=media_root,
+        )
+    except Exception:
+        logger.exception(
+            "repaired media lookup failed chat_id=%s", dialog_id
+        )
+        return []
+    if not raw_ids:
+        return []
+    logger.info(
+        "media repaired, re-queueing waiting messages chat_id=%s raw_message_ids=%s",
+        dialog_id,
+        ",".join(str(item) for item in raw_ids),
+    )
+    return await _try_enqueue_processing_jobs(
+        session_factory,
+        raw_message_ids=raw_ids,
+        last_reason="media_repaired_enqueued",
+        resume_terminal_jobs=True,
+    )
+
+
+def _record_repaired_media_path(
+    session_factory,
+    *,
+    chat_id: int,
+    message_id: int,
+    media_path: str,
+    media_root: str | Path,
+) -> bool:
+    """Point the message's media row at a file downloaded after the fact."""
+
+    resolved_media_root = Path(media_root)
+    with session_factory() as session:
+        assets = (
+            session.query(MediaAsset)
+            .join(RawMessage, RawMessage.id == MediaAsset.raw_message_id)
+            .filter(
+                RawMessage.chat_id == int(chat_id),
+                RawMessage.message_id == int(message_id),
+            )
+            .order_by(MediaAsset.id.asc())
+            .all()
+        )
+        if not assets:
+            return False
+        asset = assets[0]
+        if _is_usable_downloaded_media_path(
+            asset.local_path, media_root=resolved_media_root
+        ) and asset.local_path == media_path:
+            return False
+        asset.local_path = media_path
+        session.commit()
+        return True
+
+
+async def _retry_live_media_download(
+    client: Any,
+    *,
+    session_factory,
+    chat_id: int,
+    message_id: int,
+    media_root: str | Path,
+    delays: tuple[float, ...],
+) -> str | None:
+    """Image-unavailable design §4.5-2: retry one failed live download soon.
+
+    The reconcile pass would retry it too, but only about every 5.6 minutes --
+    longer than the recognition of the message takes -- so raw 20102's image
+    arrived 33 s after its last retry and nobody looked again.
+    """
+
+    for delay in delays:
+        await asyncio.sleep(float(delay))
+        try:
+            fetched = await client.get_messages(int(chat_id), ids=int(message_id))
+            if fetched is None:
+                continue
+            media_path = await _download_media_if_present(
+                client,
+                dialog_id=int(chat_id),
+                message=fetched,
+                media_root=Path(media_root),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "live media retry failed chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
+                exc_info=True,
+            )
+            continue
+        if not media_path:
+            continue
+        try:
+            await asyncio.to_thread(
+                _record_repaired_media_path,
+                session_factory,
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+                media_path=media_path,
+                media_root=media_root,
+            )
+        except Exception:
+            logger.exception(
+                "live media retry could not record path chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
+            return None
+        logger.info(
+            "live media retry downloaded chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
+        await _enqueue_repaired_media_messages(
+            session_factory,
+            dialog_id=int(chat_id),
+            message_ids=[int(message_id)],
+            media_root=media_root,
+        )
+        return media_path
+    return None
 
 
 def _persist_history_reconcile_records(
@@ -1307,6 +1532,7 @@ async def run_reconcile_once(
             dialog_id=dialog_id,
             replay_floor=replay_floor,
             media_root=media_root,
+            recent_since=utc_now() - ORPHAN_MEDIA_RETRY_WINDOW,
         )
         fetch_kwargs = _filter_callable_kwargs(
             fetch_dialog_messages_fn,
@@ -1323,6 +1549,7 @@ async def run_reconcile_once(
             payload
             for payload in payloads
             if int(payload.get("message_id") or 0) > replay_floor
+            or int(payload.get("message_id") or 0) in orphan_msg_ids
         ]
         records = [
             normalize_message_payload(payload, archived_target_group=True)
@@ -1350,6 +1577,13 @@ async def run_reconcile_once(
                 session_factory,
                 message_keys=inserted_keys,
                 last_reason="history_reconcile_enqueued",
+            )
+        if orphan_msg_ids:
+            await _enqueue_repaired_media_messages(
+                session_factory,
+                dialog_id=dialog_id,
+                message_ids=orphan_msg_ids,
+                media_root=media_root,
             )
         if authoritative_processor is None:
             logger.error(

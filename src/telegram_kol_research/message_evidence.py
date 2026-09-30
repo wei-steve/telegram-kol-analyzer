@@ -399,6 +399,15 @@ def build_current_message_input_fingerprint(
         )
 
 
+#: 2026-10-01 image-unavailable design. Set on the first-pass payload by
+#: ``recognition_experiments.run_mimo_authoritative_for_message`` when it ran
+#: without one or more declared images ({"image_missing": true,
+#: "missing_image_asset_ids": [...]}). Stored in the normalized evidence so the
+#: replay / recovery reconstruction does not lose it. Leading underscore: ours,
+#: never the model's.
+INPUT_DEGRADATION_KEY = "_input_degradation"
+
+
 def normalize_mimo_evidence(
     payload: Mapping[str, Any],
     *,
@@ -455,6 +464,9 @@ def normalize_mimo_evidence(
     # a decision yet. ``authoritative_recognition._load_current_mimo_evidence_result``
     # reads both back; writing without reading would drop the field silently on
     # the replay/recovery path (design §10 B1/B2).
+    degradation = payload.get(INPUT_DEGRADATION_KEY)
+    if isinstance(degradation, Mapping):
+        normalized_evidence[INPUT_DEGRADATION_KEY] = dict(degradation)
     parsed_classes = parse_message_classes(payload)
     if parsed_classes.present:
         normalized_evidence["message_classes"] = parsed_classes.to_payload()

@@ -226,6 +226,8 @@ REASON_LABELS = {
     "mimo_authoritative_failed_exhausted": "权威模型调用失败且重试已耗尽，这条消息没有被识别",
     "first_pass_contract_violation": "首轮识别输出违反分类契约，这条消息没有被执行",
     "context_contract_failed": "上下文分析返回了不合规的结果，这条消息没有被执行",
+    "media_unavailable_waiting": "图片没下载到且没有文字，等图片补下载后会重新识别",
+    "image_missing_price_not_in_text": "图片缺失，仅按文字识别，但结果里的价位不在文字中，没有执行",
     "management_not_actionable": "消息是意向/条件句而非指令，已拒绝写入交易所",
     "authoritative_gap_recovery_expired": "补识别窗口已过，这条消息始终没有被识别",
     "context_resolution_failed": "上下文解析失败",

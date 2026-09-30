@@ -55,7 +55,11 @@ from telegram_kol_research.message_classification import (
     message_class_identities,
     parse_message_classes,
 )
+from telegram_kol_research.image_missing_price_gate import (
+    assess_image_missing_prices,
+)
 from telegram_kol_research.message_evidence import (
+    INPUT_DEGRADATION_KEY,
     build_current_message_input_fingerprint,
     claim_message_evidence_extraction,
     finalize_claimed_mimo_message_evidence,
@@ -117,6 +121,8 @@ from telegram_kol_research.recognition_execution_runtime import (
     periodic_lease_heartbeat,
 )
 from telegram_kol_research.recognition_experiments import (
+    IMAGE_MISSING_INPUT_KIND_SUFFIX,
+    IMAGE_UNAVAILABLE_ERROR,
     MimoAuthoritativeResult,
     _latest_provider_request_telemetry,
     _provider_usage_audit,
@@ -124,6 +130,7 @@ from telegram_kol_research.recognition_experiments import (
     build_authoritative_context_for_message,
     first_pass_contract_violation_codes,
     is_first_pass_contract_violation,
+    is_image_missing_input_kind,
     run_mimo_authoritative_for_message,
 )
 from telegram_kol_research.strategy_thread_candidates import (
@@ -658,6 +665,12 @@ def _load_current_mimo_evidence_result(
     rejected_count = normalized.get("entry_fragments_rejected_count")
     if isinstance(rejected_count, int) and rejected_count > 0:
         payload["entry_fragments_rejected_count"] = rejected_count
+    degradation = normalized.get(INPUT_DEGRADATION_KEY)
+    image_missing = isinstance(degradation, dict) and bool(
+        degradation.get("image_missing")
+    )
+    if image_missing:
+        payload[INPUT_DEGRADATION_KEY] = degradation
     status = str(payload.get("recognition_result") or "")
     if status not in {"是策略", "非策略"}:
         lifecycle = payload["lifecycle_event"]
@@ -679,7 +692,11 @@ def _load_current_mimo_evidence_result(
         MimoAuthoritativeResult(
             raw_message_id=int(raw_message_id),
             payload=payload,
-            input_kind="text+image" if payload["evidence"]["images"] else "text",
+            input_kind=(
+                "text+image" + IMAGE_MISSING_INPUT_KIND_SUFFIX
+                if image_missing
+                else "text+image" if payload["evidence"]["images"] else "text"
+            ),
             model=row.model,
             status=status,
             prompt_versions=(
@@ -1552,6 +1569,15 @@ def assess_message_authoritatively(
             raw_message_id,
             ",".join(first_pass_contract_violation_codes(mimo)),
         )
+    if (
+        mimo.error_message
+        and str(mimo.error_message).strip() == IMAGE_UNAVAILABLE_ERROR
+    ):
+        # Image-unavailable design §4.4: every image is missing and there is
+        # no text to judge instead. Retrying on a timer only helps if the file
+        # happens to land inside the backoff; the ingest re-queues the message
+        # when it does, so end here without spending retries.
+        terminal_failure_reason = recognition_attribution.MEDIA_UNAVAILABLE_WAITING
     if not mimo.error_message and mimo.status != "识别失败":
         (
             evidence,
@@ -1718,7 +1744,32 @@ def assess_message_authoritatively(
                     status="识别失败",
                     error_message="context resolution failed",
                 )
-    if mimo.error_message or mimo.status == "识别失败":
+    image_missing_refusal = None
+    if (
+        not mimo.error_message
+        and mimo.status != "识别失败"
+        and is_image_missing_input_kind(mimo.input_kind)
+    ):
+        # Image-unavailable design §4.3 (option 乙): judged without its image,
+        # a result may only place an order whose price is in this message's
+        # own text. Checked on the final payload, after the context pass.
+        image_missing_refusal = assess_image_missing_prices(
+            _raw_message_text(session_factory, raw_message_id), mimo.payload
+        )
+        if image_missing_refusal is not None:
+            terminal_failure_reason = (
+                recognition_attribution.IMAGE_MISSING_PRICE_NOT_IN_TEXT
+            )
+            logger.warning(
+                "image missing price not in text raw_message_id=%s field=%s",
+                raw_message_id,
+                image_missing_refusal.field,
+            )
+    if (
+        mimo.error_message
+        or mimo.status == "识别失败"
+        or image_missing_refusal is not None
+    ):
         agreement_status, differences = "authoritative_failed", []
     else:
         agreement_status, differences = "pending", []
@@ -2027,6 +2078,12 @@ def _run_v1_authority_with_audit(
         fallback_from=fallback_from,
         projection_fingerprint=completed.projection_fingerprint,
     )
+
+
+def _raw_message_text(session_factory: sessionmaker, raw_message_id: int) -> str:
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        return str(raw_message.text or "") if raw_message is not None else ""
 
 
 def _message_input_kind(
@@ -2374,6 +2431,14 @@ def _failure_point_for(reason: str) -> str:
         recognition_attribution.CONTEXT_CONTRACT_FAILED: (
             "the contextual second pass returned a contract failure; the "
             "message was not executed and is not retried"
+        ),
+        recognition_attribution.MEDIA_UNAVAILABLE_WAITING: (
+            "every image of the message is missing and it has no text; not "
+            "retried, re-queued when the image is downloaded"
+        ),
+        recognition_attribution.IMAGE_MISSING_PRICE_NOT_IN_TEXT: (
+            "the image could not be read, the text was judged alone, and an "
+            "order price in the result is not in the message text; not executed"
         ),
         recognition_attribution.GAP_RECOVERY_EXPIRED: (
             "no authoritative decision before the recovery window closed; the "

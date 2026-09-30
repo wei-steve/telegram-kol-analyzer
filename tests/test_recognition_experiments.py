@@ -403,7 +403,7 @@ def test_build_mimo_payload_uses_raw_image_without_ocr_text(tmp_path):
     assert "thinking" not in payload
 
 
-def test_authoritative_mimo_fails_closed_when_declared_image_is_missing(
+def test_authoritative_mimo_falls_back_to_text_when_declared_image_is_missing(
     tmp_path,
     monkeypatch,
 ):
@@ -443,10 +443,9 @@ def test_authoritative_mimo_fails_closed_when_declared_image_is_missing(
         media_root=tmp_path / "media",
     )
 
-    assert result.input_kind == "text+image"
-    assert result.status == "识别失败"
-    assert "unavailable or unreadable" in result.error_message
-    assert model_calls == []
+    # Image-unavailable design §4.1: the text is judged on its own, marked.
+    assert result.input_kind == "text+image_missing"
+    assert len(model_calls) == 1
 
 
 def test_build_mimo_payload_skips_empty_images_and_uses_configured_prompt(tmp_path):

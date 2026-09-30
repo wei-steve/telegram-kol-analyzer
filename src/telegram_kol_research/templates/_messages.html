@@ -213,12 +213,14 @@
         'mimo_authoritative_failed_exhausted': '权威识别失败（重试已耗尽）',
         'first_pass_contract_violation': '首轮输出违反分类契约（已终止，不重试）',
         'context_contract_failed': '上下文分析契约失败（已终止，不重试）',
+        'media_unavailable_waiting': '图片缺失且无文字（等图片补下载后重新识别）',
+        'image_missing_price_not_in_text': '图片缺失，价位不在文字中（未执行）',
         'mimo_authoritative_not_safely_applied': '权威结果未安全应用',
         'mimo_no_action': '未识别出可执行动作',
         'not_projected': '未投影为候选',
         'ambiguous_candidate_projection': '候选投影不唯一'
       } %}
-      {% set image_not_sent = message.media_assets and runtime and runtime.input_kind == 'text' %}
+      {% set image_not_sent = message.media_assets and runtime and (runtime.input_kind == 'text' or (runtime.input_kind or '').endswith('image_missing')) %}
       {% set low_confidence = confidence is not none and confidence < 0.25 %}
       {% set medium_confidence = confidence is not none and confidence >= 0.25 and confidence < 0.8 %}
       {% set runtime_retry_count = (runtime.provider_retry_count + runtime.whole_run_retry_count) if runtime else 0 %}

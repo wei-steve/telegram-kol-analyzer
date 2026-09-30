@@ -42,6 +42,7 @@ from telegram_kol_research.message_classification import (
     parse_message_classes,
 )
 from telegram_kol_research.message_evidence import (
+    INPUT_DEGRADATION_KEY,
     build_current_message_input_fingerprint,
     build_message_input_fingerprint,
 )
@@ -133,6 +134,30 @@ class MimoModelAttempt:
     started_at: Any
     completed_at: Any
     duration_ms: int
+
+
+#: 2026-10-01 image-unavailable design
+#: (docs/plans/2026-10-01-image-unavailable-text-fallback-design.md).
+#:
+#: The one input the first pass cannot recover from on its own: every image of
+#: the message is missing *and* there is no text to fall back on. The file may
+#: still arrive (the ingest reconcile re-downloads it), so this is not a
+#: contract failure -- ``assess_message_authoritatively`` ends it under
+#: ``media_unavailable_waiting`` and the ingest re-queues the message once the
+#: file is there.
+IMAGE_UNAVAILABLE_ERROR = "image media is declared but unavailable or unreadable"
+#: Appended to ``input_kind`` when at least one declared image could not be
+#: read and the first pass ran on what was left ("text+image" ->
+#: "text+image_missing", "image" -> "image_missing"). It is what every audit row
+#: (experiment, run, decision) and the Web card show, and what the execution
+#: gate keys on.
+IMAGE_MISSING_INPUT_KIND_SUFFIX = "_missing"
+#: The payload carries the same fact under ``INPUT_DEGRADATION_KEY`` (defined in
+#: ``message_evidence``, which stores it on the evidence row).
+
+
+def is_image_missing_input_kind(input_kind: str | None) -> bool:
+    return str(input_kind or "").endswith("image" + IMAGE_MISSING_INPUT_KIND_SUFFIX)
 
 
 #: Prefix of the error text a fatal ``message_classes`` violation leaves in the
@@ -537,14 +562,15 @@ def run_mimo_authoritative_for_message(
                 status="识别失败",
                 error_message="message has no readable text or image",
             )
+        image_assets = [asset for asset in media_assets if _is_image_asset(asset)]
         unreadable_images = [
             asset
-            for asset in media_assets
-            if _is_image_asset(asset)
-            and _media_asset_to_data_url(asset, media_root=media_root) is None
+            for asset in image_assets
+            if _media_asset_to_data_url(asset, media_root=media_root) is None
         ]
-        if unreadable_images:
-            error_message = "image media is declared but unavailable or unreadable"
+        has_text = bool((raw_message.text or "").strip())
+        if unreadable_images and not has_text and len(unreadable_images) == len(image_assets):
+            error_message = IMAGE_UNAVAILABLE_ERROR
             experiment = _upsert_experiment_result(
                 session,
                 raw_message=raw_message,
@@ -562,6 +588,20 @@ def run_mimo_authoritative_for_message(
                 model=model_config.model,
                 status=experiment.status,
                 error_message=error_message,
+            )
+        if unreadable_images:
+            # Degrade rather than give up: the request below carries only the
+            # images that could be read (``_build_mimo_payload`` already drops
+            # the rest), and nothing in it tells the model an image is missing
+            # -- with no image the contract forbids ``图片不可读``, so the text is
+            # judged exactly as a plain text message is today (design Q2).
+            input_kind = input_kind + IMAGE_MISSING_INPUT_KIND_SUFFIX
+            logger.warning(
+                "authoritative first pass without unreadable images "
+                "raw_message_id=%s missing_asset_ids=%s input_kind=%s",
+                raw_message_id,
+                ",".join(str(asset.id) for asset in unreadable_images),
+                input_kind,
             )
         payload: dict[str, Any] = {}
         error_message: str | None = None
@@ -593,6 +633,16 @@ def run_mimo_authoritative_for_message(
                 ",".join(item.model_id for item in model_attempts),
                 answered_model.model if answered_model is not None else "none",
             )
+        if unreadable_images and not error_message and isinstance(payload, dict):
+            payload = {
+                **payload,
+                INPUT_DEGRADATION_KEY: {
+                    "image_missing": True,
+                    "missing_image_asset_ids": [
+                        int(asset.id) for asset in unreadable_images
+                    ],
+                },
+            }
         used_model = answered_model or model_config
         experiment = _upsert_experiment_result(
             session,

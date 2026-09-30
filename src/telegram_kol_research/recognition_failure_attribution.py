@@ -128,6 +128,28 @@ TERMINAL_CONTRACT_FAILURE_REASONS = frozenset(
     {FIRST_PASS_CONTRACT_VIOLATION, CONTEXT_CONTRACT_FAILED}
 )
 
+#: 2026-10-01 image-unavailable design
+#: (docs/plans/2026-10-01-image-unavailable-text-fallback-design.md §4.3-4.4).
+#: Two terminal, fail-closed outcomes of a first pass that could not see a
+#: declared image. Neither is retried by the message processing job
+#: (``TerminalAuthoritativeProcessingFailed``); both are alerted, because in a
+#: group that trades an unseen image can be an order nobody executed.
+#:
+#: ``media_unavailable_waiting``: every image is missing and there is no text to
+#: judge instead. Not a contract failure -- the file may still arrive, and the
+#: ingest re-queues the message when it does
+#: (``telegram_live_listener._enqueue_repaired_media_messages``). Before this the
+#: job retried five times over ~3.5 minutes and, if the file came later (raw
+#: 20102: 33 s later), nobody looked again.
+#: ``image_missing_price_not_in_text``: the text was judged without the image
+#: and the result carries an order price that is not in this message's text
+#: (``image_missing_price_gate``).
+MEDIA_UNAVAILABLE_WAITING = "media_unavailable_waiting"
+IMAGE_MISSING_PRICE_NOT_IN_TEXT = "image_missing_price_not_in_text"
+IMAGE_MISSING_TERMINAL_REASONS = frozenset(
+    {MEDIA_UNAVAILABLE_WAITING, IMAGE_MISSING_PRICE_NOT_IN_TEXT}
+)
+
 #: Refusal by the execution-layer actionability gate
 #: (``management_actionability``): the text is an intention, a hypothetical, or
 #: a price-trigger comment rather than an order. Recorded as
@@ -185,6 +207,7 @@ ALERTED_REASONS = frozenset(
         MEDIA_UNREADABLE,
         *AUTHORITY_NOT_PRODUCED_REASONS,
         *TERMINAL_CONTRACT_FAILURE_REASONS,
+        *IMAGE_MISSING_TERMINAL_REASONS,
     }
 )
 
