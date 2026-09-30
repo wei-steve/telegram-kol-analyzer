@@ -1,7 +1,7 @@
 # 对账每轮刷新 execution_bindings.updated_at：源头与方案
 
 - 日期：2026-09-30
-- 状态：**用户已确认（2026-09-30）：问题 1 选 A、2 另开任务、3 不回填、4 不改**；实施中
+- 状态：**用户已确认（2026-09-30）：问题 1 选 A、2 另开任务、3 不回填、4 不改**；**候选 `5b0221c8` 已完成，全量 10905 passed / 4 skipped / 0 failed（17 分 22 秒），未部署、未推 origin/main，部署由调度会话排期**
 - 分支：`claude/bold-kapitsa-caf323`（基于 origin/main `b5ec59e2`，生产 `7b9d2c40`）
 - 验证级别：L2（改的是 worker 对账写入路径；不改表结构、不碰交易所写入）
 - 来源：网页实时数据会话的排查（`docs/plans/2026-09-30-web-live-data-and-positions-first-design.md` 1.4 b、第 6 节问题 5）
@@ -123,3 +123,12 @@
 | 2 | 持仓中那条生命周期 `updated_at` 也每轮刷新（1.4），它会让网页 strategies 版本号每轮变、并可能让上下文重解析的指纹跳过失效 | 本批一起改；另开任务（先审计 `strategy_lifecycles.updated_at` 的读者，并用生产数据核实上下文重解析是否真的多跑了） | **另开任务**。读者更多、牵涉上下文解析（权威路径），不混进本批 |
 | 3 | 195 条已关闭绑定的 `updated_at` 历史值已被覆盖，部署后会停在部署前最后一轮的时刻，网页历史列表的「退出时间」仍不对 | 不回填；回填（按订单腿终态时间等推一个值写回，属于生产数据修复，L3） | **不回填**，本批不做数据修复；若网页需要，由网页侧改用交易所历史或订单腿时间显示 |
 | 4 | 持仓那条入场腿的 `updated_at` 也每轮跳（1.4），让 touched 计数恒含持仓那条绑定 | 本批一起改；不改 | **不改**，影响小 |
+
+## 7. 实施结果（2026-09-30）
+
+- 候选代码提交 `5b0221c8`（Sonnet 5 子代理实现，Opus 5.5 审阅），只改 `execution_bindings.py`（+37/−5）和新增 `tests/test_binding_updated_at_churn.py`（15 个测试，覆盖第 5 节 1–6）。
+- 实现：模块级从 `ExecutionBinding` 映射列推出「内容列」（去掉 `updated_at`、`recovered_at`）；`_derive_binding_from_entry_legs` 入口记快照、出口按值比较；快照不完整分支同样处理。`recovered_at` 照旧每轮写。
+- 第 5 节第 4 条的「过期未入场把 active 改成 stale」在这个函数里走不到（进入 `_attach_binding_to_lifecycle` 前状态刚被设成 `active`，而过期分支要求非 `active`），改为一个结构性测试钉住；按值比较即使将来可达也能捕获。
+- 全量：`10905 passed, 4 skipped`，0 失败。开发中 `test_absent_conditional_entry_reconcile.py::test_the_reconciler_actually_prints_the_hold` 在特定文件顺序下失败，基线提交同样失败，属既有顺序依赖；全量顺序下通过。
+- 没有改动任何既有测试；没有碰网页实时数据会话的文件。
+- 部署后观察按第 4 节。
