@@ -21,6 +21,7 @@
       >
         {{ monitor_status.label if monitor_status else ('监控中' if live_listener_enabled else '已断开') }}
       </span>
+      <span class="live-status" data-live-status role="status" aria-live="off">实时 · 更新于 --:--:--</span>
       {% if database_stale_hours is not none %}
         <span class="freshness-badge" title="数据新鲜度">{{ "%.1fh"|format(database_stale_hours) }}</span>
       {% endif %}

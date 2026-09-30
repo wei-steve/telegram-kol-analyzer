@@ -1700,6 +1700,9 @@ body {
   overflow-wrap: anywhere;
 }
 
+.exchange-metric-grid dd.exchange-pnl-positive { color: var(--color-profit); }
+.exchange-metric-grid dd.exchange-pnl-negative { color: var(--color-loss); }
+
 .exchange-metric-grid .protection-state--present_but_ambiguous {
   color: #fbbf24;
 }
@@ -4904,4 +4907,53 @@ pre { white-space: pre-wrap; }
   .execution-summary { grid-template-columns: 1fr; }
   .execution-card-head { display: grid; }
   .execution-binding-state { justify-items: start; }
+}
+
+/* ── Live data patching ── */
+/* Scroll compensation is done in app.js; the browser's own scroll anchoring
+   would apply the same correction a second time. */
+html,
+.message-list,
+[data-strategy-record-scroll] {
+  overflow-anchor: none;
+}
+
+.live-status {
+  font-size: 0.72rem;
+  color: #64748b;
+  white-space: nowrap;
+}
+
+.live-status.is-paused {
+  color: var(--color-risk);
+}
+
+.live-status a,
+.live-status .live-reload-button {
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+.strategy-live-reorder-hint {
+  align-self: start;
+}
+
+@keyframes live-updated-fade {
+  from { background-color: rgba(96, 165, 250, 0.22); }
+  to { background-color: transparent; }
+}
+
+.live-updated {
+  animation: live-updated-fade 1.2s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-updated {
+    animation: none;
+  }
 }

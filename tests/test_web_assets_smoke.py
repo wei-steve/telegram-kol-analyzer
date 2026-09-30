@@ -1,3 +1,4 @@
+from pathlib import Path
 import shutil
 import subprocess
 import textwrap
@@ -238,10 +239,14 @@ def test_app_js_polls_for_updates_even_when_sse_stays_quiet(tmp_path):
     response = client.get("/static/app.js")
 
     assert response.status_code == 200
-    assert "startPollingUpdates" in response.text
+    # The legacy notice-and-click poller stays reachable behind the rollback
+    # switch; the default path is the single live-state poller, and no SSE
+    # connection is opened any more (it never received events in production).
+    assert "function startPollingUpdates" in response.text
     assert "window.setInterval" in response.text
-    assert "connectLiveUpdates();" in response.text
+    assert "startLiveStatePolling();" in response.text
     assert "startPollingUpdates();" in response.text
+    assert "connectLiveUpdates" not in response.text
 
 
 def test_focus_recovery_checks_positions_without_replacing_visible_panel(tmp_path):
@@ -308,6 +313,7 @@ def test_position_snapshot_assets_use_bounded_automatic_refresh(tmp_path):
     refresh_source = js[refresh_start:refresh_end]
     harness = textwrap.dedent(
         f"""
+        const LIVE_PATCH_ENABLED = false;  // the retry timers are the rollback path
         const POSITION_SNAPSHOT_RETRY_DELAYS = [1000, 2000, 4000];
         let positionSnapshotRetryTimer = null;
         let positionSnapshotRetryToken = 0;
@@ -1735,21 +1741,6 @@ def test_strategy_record_controller_defers_live_changes_and_preserves_last_succe
     assert "if (force || revealChanges)" not in load_block
 
 
-def test_strategy_record_reconnect_marks_changes_without_reloading_the_page(tmp_path):
-    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
-        "/static/app.js"
-    ).text
-    start = js.index("function connectLiveUpdates")
-    end = js.index("\nfunction startPollingUpdates", start)
-    block = js[start:end]
-
-    assert "source.onopen" in block
-    assert "noteStrategyRecordChanges();" in block
-    assert "await refreshMonitorStatus();" in block
-    assert "state: 'monitoring'" not in block
-    assert "window.location.reload" not in block
-
-
 def test_monitor_status_updates_all_badges_and_caches_only_successful_reads(tmp_path):
     js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
         "/static/app.js"
@@ -2352,7 +2343,7 @@ def test_activity_timeline_freshness_check_runs_every_poll_not_only_on_global_ch
     assert "setNewMessagesButtonVisible(timelinePanel, true)" in check_block
 
     refresh_start = js.index("async function refreshFromDatabaseChanges")
-    refresh_end = js.index("\nfunction connectLiveUpdates", refresh_start)
+    refresh_end = js.index("\nfunction startPollingUpdates", refresh_start)
     refresh_block = js[refresh_start:refresh_end]
     # Called once when the baseline snapshot is first captured, and again on
     # every later poll -- never gated behind `if (globalChanged)`.
@@ -2367,3 +2358,176 @@ def test_activity_timeline_freshness_check_runs_every_poll_not_only_on_global_ch
 # in tests/test_web_activity_timeline.py::
 # test_activity_timeline_new_message_baseline_is_max_id_not_newest_loaded_card,
 # alongside load_latest_raw_message_id()'s own EXPLAIN-plan tests.
+
+
+# ── live data patching (design 2026-09-30, batch 2) ─────────────────────────
+
+
+def _app_js(tmp_path) -> str:
+    return TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+
+
+def _function_body(js: str, name: str) -> str:
+    start = js.index(f"function {name}(")
+    ends = [
+        js.find(marker, start + 1)
+        for marker in ("\nfunction ", "\nasync function ", "\nclass ", "\nconst ")
+    ]
+    end = min(position for position in ends if position != -1)
+    return js[start:end]
+
+
+def test_live_polling_replaces_sse_and_is_gated_by_visibility(tmp_path):
+    js = _app_js(tmp_path)
+
+    assert "new EventSource(" not in js
+    assert "'/api/events'" not in js
+    assert "const LIVE_PATCH_ENABLED = true;" in js
+    assert "const LIVE_POLL_INTERVAL_MS = 5000;" in js
+    assert "const LIVE_RETRY_BACKOFF_MS = [5000, 10000, 20000, 30000];" in js
+    assert "'/api/live/state'" in js
+    # Polls only while the tab is visible; comes back on visible/focus.
+    assert "document.visibilityState !== 'visible'" in _function_body(
+        js, "liveStatePollOnce"
+    )
+    assert "document.visibilityState !== 'visible'" in _function_body(
+        js, "liveScheduleNext"
+    )
+    start_block = _function_body(js, "startLiveStatePolling")
+    assert "'visibilitychange'" in start_block
+    assert "addEventListener('focus'" in start_block
+    # The default path starts the live poller and skips the legacy one.
+    ready = js[js.index("window.addEventListener('DOMContentLoaded'"):]
+    assert ready.index("if (LIVE_PATCH_ENABLED)") < ready.index("startLiveStatePolling();")
+    assert ready.index("startLiveStatePolling();") < ready.index("startPollingUpdates();")
+
+
+def test_live_patch_helpers_never_rebuild_panels_or_set_busy(tmp_path):
+    js = _app_js(tmp_path)
+
+    for name in (
+        "patchKeyedList",
+        "patchElement",
+        "patchCard",
+        "patchContent",
+        "patchChildList",
+        "liveReplaceContent",
+        "liveSyncAttributes",
+        "withLiveScrollAnchor",
+        "liveRefreshPositions",
+        "liveRefreshStrategies",
+        "liveInsertNewMessageCards",
+        "liveRefreshGroupList",
+        "liveRefreshGroupMessages",
+        "livePatchActiveView",
+        "liveStatePollOnce",
+    ):
+        body = _function_body(js, name)
+        assert "replaceChildren" not in body, name
+        assert "innerHTML" not in body, name
+        assert "aria-busy" not in body, name
+        assert "setAttribute('aria-busy'" not in body, name
+    # Patching preserves what the user is doing inside a card.
+    assert "liveCardIsBusy" in _function_body(js, "patchCard")
+    assert "isEqualNode" in _function_body(js, "liveMarkupEqual")
+    assert "LIVE_IGNORED_ATTRIBUTES" in js
+
+
+def test_live_patch_keys_and_status_line_are_wired(tmp_path):
+    js = _app_js(tmp_path)
+    css = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.css"
+    ).text
+
+    for key in (
+        "data-strategy-record-key",
+        "data-position-pos-id",
+        "data-message-raw-id",
+        "data-exchange-group-name",
+    ):
+        assert f"'{key}'" in js
+    assert "排序有变化 · 点击重排" not in js  # lives in the template, not the script
+    assert "实时 · 更新于" in js
+    assert "实时更新暂停，正在重试…（上次更新" in js
+    assert "登录已过期，点此重新登录" in js
+    assert "/login?next=/" in js
+    assert "页面已更新，点此刷新" in js
+    assert "LIVE_PATCH_ENABLED || !strategyRecordHasPendingChanges" in js
+    assert ".live-updated" in css and "prefers-reduced-motion" in css
+    assert "overflow-anchor: none" in css
+
+
+def test_index_page_has_live_status_line_and_positions_first_default(tmp_path):
+    body = TestClient(create_web_app(database_path=tmp_path / "research.db")).get("/").text
+
+    assert "data-live-status" in body
+
+
+def test_strategy_list_template_carries_keys_and_reorder_hint(tmp_path):
+    template = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "telegram_kol_research"
+        / "templates"
+        / "_strategy_record_list.html"
+    ).read_text(encoding="utf-8")
+
+    assert 'data-strategy-record-key="' in template
+    assert "record.lifecycle_id is not none" in template
+    assert "pos:{{ record.pos_id }}" in template
+    assert "binding:{{ record.binding_id }}" in template
+    assert "排序有变化 · 点击重排" in template
+    assert "data-strategy-reorder-hint" in template
+
+
+def test_live_pure_helpers_behave(tmp_path):
+    if shutil.which("node") is None:
+        pytest.skip("Node.js is required for the live helper behavior test")
+    js = _app_js(tmp_path)
+    start = js.index("const LIVE_STATE_URL")
+    end = js.index("function liveActiveView")
+    view_key = _function_body(js, "liveViewKey")
+    retry = _function_body(js, "liveRetryDelay")
+    harness = textwrap.dedent(
+        """
+        const versions = { positions: 'p1', strategies: 's1', messages: 'r1', groups: 'g1' };
+        const eq = (a, b) => { if (a !== b) throw new Error(`${a} !== ${b}`); };
+        eq(liveViewKey('positions', versions), 'p1|s1');
+        eq(liveViewKey('strategies', versions), 's1');
+        eq(liveViewKey('activity', versions), 'r1');
+        eq(liveViewKey('groups', versions), 'g1|r1');
+        eq(liveViewKey('more', versions), null);
+        // 1 failure is silent and retried at the normal pace; then 10/20/30 s.
+        liveState.failures = 0; eq(liveRetryDelay(), 5000);
+        liveState.failures = 1; eq(liveRetryDelay(), 5000);
+        liveState.failures = 2; eq(liveRetryDelay(), 10000);
+        liveState.failures = 3; eq(liveRetryDelay(), 20000);
+        liveState.failures = 4; eq(liveRetryDelay(), 30000);
+        liveState.failures = 40; eq(liveRetryDelay(), 30000);
+        eq(liveFormatClock('2026-09-30T10:05:12+08:00'), '10:05:12');
+        eq(liveFormatClock('2026-09-30T02:05:12+00:00'), '10:05:12');
+        eq(liveFormatClock('nonsense'), '--:--:--');
+        """
+    )
+    result = subprocess.run(
+        [
+            "node",
+            "-e",
+            "\n".join(
+                (
+                    "const LIVE_PATCH_ENABLED = true; let workbenchLoadState = {};",
+                    js[start:end],
+                    view_key,
+                    retry,
+                    harness,
+                )
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr

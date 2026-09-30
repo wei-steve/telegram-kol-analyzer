@@ -1,3 +1,7 @@
+// Rollback switch (design 2026-09-30, section 5): false restores the old
+// "notice + click to update" behaviour without reverting the patching code.
+const LIVE_PATCH_ENABLED = true;
+
 let latestFreshnessSnapshot = null;
 let latestMonitorStatus = null;
 let currentSelectedChatId = null;
@@ -238,6 +242,11 @@ function setNewMessagesButtonVisible(panel = getMessagePanel(), visible = false)
   }
   button.hidden = !visible;
   button.classList.toggle('is-visible', Boolean(visible));
+  if (!visible) {
+    // Live patching counts messages inserted above the viewport; reaching the
+    // top (or clicking the button) acknowledges them.
+    delete panel.dataset.liveNewCount;
+  }
 }
 
 function setMessageCardCollapsed(card, collapsed) {
@@ -1075,6 +1084,11 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   if (newMessagesButton && newMessagesButton.dataset.newMessagesBound !== 'true') {
     newMessagesButton.dataset.newMessagesBound = 'true';
     newMessagesButton.addEventListener('click', async () => {
+      if (LIVE_PATCH_ENABLED && panel.dataset.liveGap !== 'true') {
+        // Live patching already inserted the new cards; just go to them.
+        scrollMessagePanelToTop(panel);
+        return;
+      }
       newMessagesButton.disabled = true;
       try {
         if (isTimelinePanel) {
@@ -1439,6 +1453,10 @@ async function loadGroupDetailCompanion({
 
 function bindGroupAutomationToggles() {
   document.querySelectorAll('[data-toggle-group-automation]').forEach((button) => {
+    // Live patching keeps existing rows (and their listeners), so re-binding
+    // must not stack a second click handler.
+    if (button.dataset.groupToggleBound === 'true') return;
+    button.dataset.groupToggleBound = 'true';
     // 甲-3: the sidebar status line is nowhere near this button, so a failure
     // also lands on the button itself as its tooltip. Captured at bind time so
     // a later success can put the original description back.
@@ -1592,7 +1610,12 @@ function clearDashboardPanelLoadError() {
 
 class WorkbenchAssetVersionMismatchError extends Error {}
 
+class WorkbenchAuthExpiredError extends Error {}
+
 function handleWorkbenchAssetVersionMismatch(serverVersion) {
+  // Once live polling runs, a deploy is announced ("页面已更新，点此刷新")
+  // instead of reloading the page under the user.
+  if (typeof handleLiveAssetVersionMismatch === 'function' && handleLiveAssetVersionMismatch()) return;
   const status = document.querySelector?.('[data-exchange-tab-refresh-status]');
   if (status) status.textContent = '检测到新版本，正在刷新…';
   const markerKey = 'telegram-workbench:asset-refresh-target';
@@ -1606,8 +1629,16 @@ function handleWorkbenchAssetVersionMismatch(serverVersion) {
 }
 
 async function fetchWorkbenchHtml(url, options = {}) {
+  return (await fetchWorkbenchResponse(url, options)).text;
+}
+
+async function fetchWorkbenchResponse(url, options = {}) {
   const requestUrl = `${url}${url.includes('?') ? '&' : '?'}_t=${Date.now()}`;
   const response = await fetch(requestUrl, { ...options, cache: 'no-store' });
+  if (response.status === 401) throw new WorkbenchAuthExpiredError('登录已过期');
+  if (response.redirected && new URL(response.url).pathname === '/login') {
+    throw new WorkbenchAuthExpiredError('登录已过期');
+  }
   if (!response.ok) throw new Error(`请求失败 (${response.status})`);
   const pageVersion = document.documentElement?.dataset?.workbenchAssetVersion || '';
   const serverVersion = response.headers?.get?.('X-Workbench-Asset-Version') || '';
@@ -1617,7 +1648,7 @@ async function fetchWorkbenchHtml(url, options = {}) {
       `workbench asset version changed from ${pageVersion} to ${serverVersion}`,
     );
   }
-  return response.text();
+  return { text: await response.text(), response };
 }
 
 async function fetchWorkbenchPartial(url, selector, options = {}) {
@@ -1761,11 +1792,14 @@ function updateStrategyRecordStatus({ error = null } = {}) {
 function updateStrategyRecordChangesBadge() {
   const badge = document.querySelector('[data-strategy-new-changes]');
   if (!badge) return;
-  badge.hidden = !strategyRecordHasPendingChanges;
+  // Live patching updates the list in place, so "something changed somewhere"
+  // no longer needs a badge (it lit on any group's new message).
+  badge.hidden = LIVE_PATCH_ENABLED || !strategyRecordHasPendingChanges;
   badge.textContent = '有新变化，点击查看';
 }
 
 function noteStrategyRecordChanges() {
+  if (LIVE_PATCH_ENABLED) return;
   strategyRecordHasPendingChanges = true;
   updateStrategyRecordChangesBadge();
 }
@@ -1889,7 +1923,7 @@ function bindStrategyRecordController() {
       loadStrategyRecords({ force: true, attemptedSelection, scrollMode: 'reset' });
     });
   }
-  root.querySelectorAll('[data-strategy-record-refresh], [data-strategy-record-retry], [data-strategy-new-changes]')
+  root.querySelectorAll('[data-strategy-record-refresh], [data-strategy-record-retry], [data-strategy-new-changes], [data-strategy-reorder-hint]')
     .forEach((button) => {
       if (button.dataset.strategyRecordActionBound === 'true') return;
       button.dataset.strategyRecordActionBound = 'true';
@@ -2030,6 +2064,9 @@ function schedulePositionSnapshotRefresh(
   { preserveRetryBudget = false } = {},
 ) {
   cancelPositionSnapshotRefresh({ resetRetryBudget: !preserveRetryBudget });
+  // Live patching keeps the panel current on its own; the retry timers below
+  // would replace the whole panel instead.
+  if (LIVE_PATCH_ENABLED) return;
   if (!root || root.dataset.positionSnapshotState === 'current') return;
   if (positionSnapshotRetryAttempt >= POSITION_SNAPSHOT_RETRY_DELAYS.length) return;
   const token = positionSnapshotRetryToken;
@@ -2320,6 +2357,8 @@ function setWorkbenchView(requestedView) {
   const dashboardPanel = view === 'positions' ? 'exchange-positions' : null;
   setActiveDashboardPanel(dashboardPanel);
   ensureWorkbenchViewLoaded(view);
+  // Content loaded earlier may be stale; catch it up right away.
+  liveStatePollNow();
 }
 
 async function openDashboardPanel(tab) {
@@ -5093,58 +5132,6 @@ async function refreshFromDatabaseChanges() {
   }
 }
 
-function connectLiveUpdates() {
-  if (window.EventSource) {
-    const source = new EventSource('/api/events');
-    source.addEventListener('message', async (event) => {
-      let payload = null;
-      try {
-        payload = JSON.parse(event.data || '{}');
-      } catch {
-        payload = null;
-      }
-      if (!payload) return;
-      noteStrategyRecordChanges();
-      const homePending = document.querySelector('[data-new-home-events]');
-      if (homePending) {
-        const count = Number(homePending.dataset.count || 0) + 1;
-        homePending.dataset.count = String(count);
-        homePending.textContent = `有 ${count} 条新动态`;
-        homePending.hidden = false;
-      }
-      await refreshGroupList();
-      const currentChatId = getSelectedChatId();
-      if (Number(payload.chat_id || 0) !== currentChatId) {
-        return;
-      }
-      const activeView = document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView;
-      if (activeView === 'messages') {
-        await refreshCurrentGroupPanel({ deferIfMessageListAwayFromTop: true });
-        markWorkbenchLoaded('messages');
-        markWorkbenchLoaded('strategies');
-      } else if (activeView === 'strategies') {
-        updateStrategyRecordChangesBadge();
-      }
-    });
-    let sseWasDisconnected = false;
-    source.onerror = () => {
-      sseWasDisconnected = true;
-      setAiStatus('实时连接中断，自动重连中...', true);
-      // Do NOT call source.close() — let the browser's built-in
-      // EventSource reconnection handle it with exponential backoff.
-    };
-    source.onopen = async () => {
-      if (sseWasDisconnected) {
-        sseWasDisconnected = false;
-        setAiStatus('实时连接已恢复，有新变化时可手动查看。');
-        await refreshMonitorStatus();
-        noteStrategyRecordChanges();
-      }
-    };
-    return;
-  }
-}
-
 function startPollingUpdates() {
   window.setInterval(async () => {
     await refreshMonitorStatus();
@@ -5209,6 +5196,9 @@ function requestLiveActionConfirmation(button) {
 
 function bindBoundPositionCloseButtons() {
   document.querySelectorAll('[data-close-bound-position]').forEach((button) => {
+    // Live patching adds cards after first bind, so binding must be idempotent.
+    if (button.dataset.closeBoundPositionBound === 'true') return;
+    button.dataset.closeBoundPositionBound = 'true';
     button.addEventListener('click', async () => {
       const posId = button.dataset.posId;
       const card = button.closest('.exchange-position-card');
@@ -5423,6 +5413,744 @@ function initLogViewer() {
   resetAndLoad();
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// Live data: one 5 s version poll + in-place patching of changed cards.
+// Design: docs/plans/2026-09-30-web-live-data-and-positions-first-design.md
+//
+// Nothing below rebuilds a panel: the fetched partial is diffed against the
+// live DOM and only the nodes that differ are touched, so scroll position,
+// open <details>, form values and focus survive. LIVE_PATCH_ENABLED = false
+// restores the previous notice-and-click behaviour (rollback switch).
+// ═════════════════════════════════════════════════════════════════════════
+
+const LIVE_STATE_URL = '/api/live/state';
+const LIVE_POLL_INTERVAL_MS = 5000;
+const LIVE_RETRY_BACKOFF_MS = [5000, 10000, 20000, 30000];
+const LIVE_PAUSE_AFTER_FAILURES = 2;
+const LIVE_FLASH_MS = 1200;
+const LIVE_SCROLL_ANCHOR_MIN = 24;
+const LIVE_POSITION_STALE_SECONDS = 30;
+const LIVE_CARD_SELECTOR = '[data-position-pos-id], [data-strategy-record-key], [data-message-card]';
+const LIVE_KEY_ATTRIBUTES = [
+  'data-live-key',
+  'data-strategy-record-key',
+  'data-position-pos-id',
+  'data-message-raw-id',
+  'data-exchange-group-name',
+  'data-strategy-record-filter',
+  'data-service-health',
+];
+// State the page's own scripts toggle on elements. The live DOM is the source
+// of truth for these; a fetched partial never overwrites them.
+const LIVE_PRESERVED_CLASSES = new Set([
+  'is-active',
+  'is-updating',
+  'is-visible',
+  'is-message-collapsed',
+  'live-updated',
+  'strategy-record-position-target',
+]);
+const LIVE_IGNORED_ATTRIBUTES = new Set([
+  'hidden', 'disabled', 'open', 'aria-current', 'aria-selected', 'aria-busy', 'aria-expanded',
+]);
+const LIVE_TIME_FORMAT = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+const liveState = {
+  timer: null,
+  inFlight: false,
+  stopped: false,
+  failures: 0,
+  lastOkClock: null,
+  applied: {},
+  pendingCards: new Map(),
+  focusHookInstalled: false,
+  started: false,
+};
+
+class LiveAuthExpiredError extends Error {}
+
+function liveFormatClock(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--:--:--';
+  const parts = {};
+  LIVE_TIME_FORMAT.formatToParts(date).forEach((part) => { parts[part.type] = part.value; });
+  return `${parts.hour === '24' ? '00' : parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function liveActiveView() {
+  return document.querySelector('[data-trader-dashboard]')?.dataset.activeWorkbenchView || 'positions';
+}
+
+function liveKeyOf(element) {
+  for (const attribute of LIVE_KEY_ATTRIBUTES) {
+    const value = element.getAttribute(attribute);
+    if (value !== null && value !== '') return `${attribute}=${value}`;
+  }
+  return null;
+}
+
+function liveKeyedChildren(parent, keyOf) {
+  const counters = new Map();
+  return Array.from(parent.children).map((element) => {
+    let key = keyOf(element);
+    if (key === null || key === undefined) {
+      const tag = element.tagName;
+      const index = counters.get(tag) || 0;
+      counters.set(tag, index + 1);
+      key = `#${tag}:${index}`;
+    }
+    return { element, key };
+  });
+}
+
+function liveIsIgnored(element) {
+  return element.hasAttribute('data-live-ignore');
+}
+
+function liveIsCard(element) {
+  return element.matches(LIVE_CARD_SELECTOR);
+}
+
+// A copy of `element` with everything the page's own scripts add stripped, so
+// "did the server's markup change?" is not answered by "the user opened a
+// <details>" or "a bind function stamped a flag".
+function liveComparable(element) {
+  const clone = element.cloneNode(true);
+  [clone, ...clone.querySelectorAll('*')].forEach((node) => {
+    Array.from(node.attributes).forEach((attribute) => {
+      if (LIVE_IGNORED_ATTRIBUTES.has(attribute.name) || /^data-.*-bound$/.test(attribute.name)) {
+        node.removeAttribute(attribute.name);
+      }
+    });
+    LIVE_PRESERVED_CLASSES.forEach((name) => node.classList.remove(name));
+    if (node.getAttribute('class') === '') node.removeAttribute('class');
+    if (node.hasAttribute('data-live-ignore')) {
+      while (node.firstChild) node.removeChild(node.firstChild);
+    }
+  });
+  return clone;
+}
+
+function liveMarkupEqual(current, next) {
+  return liveComparable(current).isEqualNode(liveComparable(next));
+}
+
+function liveSyncClass(current, next) {
+  const preserved = Array.from(current.classList).filter((name) => LIVE_PRESERVED_CLASSES.has(name));
+  const wanted = Array.from(next.classList).filter((name) => !LIVE_PRESERVED_CLASSES.has(name));
+  const value = [...wanted, ...preserved].join(' ');
+  if (current.className !== value) current.className = value;
+}
+
+function liveSyncAttributes(current, next) {
+  const isControl = /^(INPUT|TEXTAREA|SELECT|OPTION)$/.test(current.tagName);
+  Array.from(next.attributes).forEach((attribute) => {
+    const name = attribute.name;
+    if (LIVE_IGNORED_ATTRIBUTES.has(name)) return;
+    if (name === 'class') {
+      liveSyncClass(current, next);
+      return;
+    }
+    if (isControl && (name === 'value' || name === 'checked' || name === 'selected')) return;
+    if (current.getAttribute(name) !== attribute.value) current.setAttribute(name, attribute.value);
+  });
+  Array.from(current.attributes).forEach((attribute) => {
+    const name = attribute.name;
+    if (LIVE_IGNORED_ATTRIBUTES.has(name) || name === 'class' || /^data-.*-bound$/.test(name)) return;
+    if (!next.hasAttribute(name)) current.removeAttribute(name);
+  });
+}
+
+function liveHasDirectText(element) {
+  return Array.from(element.childNodes).some(
+    (node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim() !== '',
+  );
+}
+
+// Swap an element's content while keeping the element itself (and so every
+// listener bound to it). Used only for mixed text/element content, which
+// cannot be diffed child by child.
+function liveReplaceContent(current, next) {
+  while (current.firstChild) current.removeChild(current.firstChild);
+  Array.from(next.childNodes).forEach((node) => current.appendChild(document.importNode(node, true)));
+}
+
+function liveFlash(element) {
+  if (!element || !element.classList) return;
+  element.classList.add('live-updated');
+  window.setTimeout(() => element.classList.remove('live-updated'), LIVE_FLASH_MS);
+}
+
+// A card is "busy" while the user is working inside it: editing a control,
+// holding focus on a button, or with a request in flight. Patching waits.
+function liveCardIsBusy(card) {
+  const active = document.activeElement;
+  if (
+    active
+    && active !== card
+    && card.contains(active)
+    && active.matches('input, textarea, select, button, summary, [contenteditable="true"]')
+  ) return true;
+  return Boolean(card.querySelector('[aria-busy="true"]'));
+}
+
+function liveInstallFocusHook() {
+  if (liveState.focusHookInstalled) return;
+  liveState.focusHookInstalled = true;
+  document.addEventListener('focusout', () => {
+    window.setTimeout(liveFlushPendingCards, 0);
+  });
+}
+
+function liveFlushPendingCards() {
+  Array.from(liveState.pendingCards.entries()).forEach(([card, next]) => {
+    if (!card.isConnected) {
+      liveState.pendingCards.delete(card);
+      return;
+    }
+    if (liveCardIsBusy(card)) return;
+    liveState.pendingCards.delete(card);
+    withLiveScrollAnchor(card.parentElement || card, () => {
+      patchElement(card, next, { reorder: false, removeMissing: true });
+    });
+  });
+}
+
+function patchCard(current, next, context) {
+  if (liveMarkupEqual(current, next)) {
+    liveState.pendingCards.delete(current);
+    return current;
+  }
+  if (liveCardIsBusy(current)) {
+    liveState.pendingCards.set(current, next);
+    liveInstallFocusHook();
+    return current;
+  }
+  liveState.pendingCards.delete(current);
+  liveSyncAttributes(current, next);
+  patchContent(current, next, context);
+  liveFlash(current);
+  return current;
+}
+
+function patchContent(current, next, context) {
+  if (/^(TEXTAREA|SELECT)$/.test(current.tagName)) return;
+  const currentHasElements = current.children.length > 0;
+  const nextHasElements = next.children.length > 0;
+  if (!currentHasElements && !nextHasElements) {
+    if (current.textContent !== next.textContent) current.textContent = next.textContent;
+    return;
+  }
+  if (liveHasDirectText(current) || liveHasDirectText(next)) {
+    if (!liveMarkupEqual(current, next)) liveReplaceContent(current, next);
+    return;
+  }
+  patchChildList(current, next, context);
+}
+
+function patchElement(current, next, context = {}) {
+  if (liveIsIgnored(current) || liveIsIgnored(next)) return current;
+  if (current.tagName !== next.tagName) {
+    const replacement = document.importNode(next, true);
+    current.replaceWith(replacement);
+    if (liveIsCard(replacement)) liveFlash(replacement);
+    return replacement;
+  }
+  if (liveIsCard(current)) return patchCard(current, next, context);
+  liveSyncAttributes(current, next);
+  patchContent(current, next, context);
+  return current;
+}
+
+// Match children by a stable key. Matched children are patched in place;
+// new keys are inserted at their server position; missing keys are removed.
+// Existing children are only moved when context.reorder is set -- otherwise a
+// changed order is reported through context.orderChanged so the caller can
+// offer a "re-sort" instead of shuffling cards under the user's eyes.
+function patchChildList(current, next, context = {}) {
+  const keyOf = context.keyOf || liveKeyOf;
+  const currentEntries = liveKeyedChildren(current, keyOf);
+  const nextEntries = liveKeyedChildren(next, keyOf);
+  const currentByKey = new Map(currentEntries.map((entry) => [entry.key, entry.element]));
+  const finalByKey = new Map();
+  const seen = new Set();
+  let previous = null;
+  nextEntries.forEach(({ element: nextElement, key }) => {
+    let element = currentByKey.get(key);
+    if (element) {
+      seen.add(key);
+      element = patchElement(element, nextElement, context);
+    } else {
+      element = document.importNode(nextElement, true);
+      if (previous) previous.after(element);
+      else current.prepend(element);
+      if (liveIsCard(element)) liveFlash(element);
+      if (context.inserted) context.inserted.push(element);
+    }
+    finalByKey.set(key, element);
+    previous = element;
+  });
+  if (context.removeMissing !== false) {
+    currentEntries.forEach(({ element, key }) => {
+      if (!seen.has(key)) element.remove();
+    });
+  }
+  const currentOrder = liveKeyedChildren(current, keyOf).map((entry) => entry.key);
+  const wantedOrder = nextEntries.map((entry) => entry.key).filter((key) => finalByKey.has(key));
+  const sameOrder = wantedOrder.length === currentOrder.length
+    && wantedOrder.every((key, index) => key === currentOrder[index]);
+  if (sameOrder) return;
+  if (context.reorder) {
+    wantedOrder.forEach((key, index) => {
+      const element = finalByKey.get(key);
+      const reference = current.children[index];
+      if (reference !== element) current.insertBefore(element, reference || null);
+    });
+  } else {
+    context.orderChanged = true;
+  }
+}
+
+// Generic entry point for a container of keyed items (cards, group rows...).
+function patchKeyedList(currentContainer, nextContainer, options = {}) {
+  const { keyAttr = null, reorder = false, removeMissing = true } = options;
+  const context = {
+    reorder,
+    removeMissing,
+    keyOf: keyAttr
+      ? (element) => {
+        const value = element.getAttribute(keyAttr);
+        return value === null || value === '' ? null : `${keyAttr}=${value}`;
+      }
+      : liveKeyOf,
+    inserted: [],
+    orderChanged: false,
+  };
+  patchChildList(currentContainer, nextContainer, context);
+  return context;
+}
+
+function liveFindScrollParent(element) {
+  for (let node = element.parentElement; node && node !== document.body; node = node.parentElement) {
+    const overflowY = window.getComputedStyle(node).overflowY;
+    if ((overflowY === 'auto' || overflowY === 'scroll') && node.scrollHeight > node.clientHeight) {
+      return node;
+    }
+  }
+  return null;
+}
+
+// Keep the first card the user can see exactly where it is while content above
+// it is inserted, removed or resized. Applies to the window and to the inner
+// scroll containers alike; at the very top nothing is compensated, so new
+// cards simply appear where the user is looking.
+function withLiveScrollAnchor(root, mutate) {
+  let anchor = null;
+  let scroller = null;
+  let anchorTop = 0;
+  for (const candidate of root.querySelectorAll(LIVE_CARD_SELECTOR)) {
+    const rect = candidate.getBoundingClientRect();
+    if (rect.height === 0) continue;
+    const parent = liveFindScrollParent(candidate);
+    const base = parent ? parent.getBoundingClientRect().top : 0;
+    if (rect.bottom > base + 1) {
+      anchor = candidate;
+      scroller = parent;
+      anchorTop = rect.top;
+      break;
+    }
+  }
+  const scrollTop = scroller ? scroller.scrollTop : window.scrollY;
+  const result = mutate();
+  if (anchor && anchor.isConnected && scrollTop > LIVE_SCROLL_ANCHOR_MIN) {
+    const delta = anchor.getBoundingClientRect().top - anchorTop;
+    if (Math.abs(delta) >= 1) {
+      if (scroller) scroller.scrollTop += delta;
+      else window.scrollBy(0, delta);
+    }
+  }
+  return result;
+}
+
+// ── Per-view patchers ────────────────────────────────────────────────────
+
+function liveViewIsBusy(view) {
+  return Boolean(workbenchLoadState[view]?.promise);
+}
+
+async function liveRefreshPositions() {
+  if (liveViewIsBusy('positions')) return false;
+  const container = document.querySelector('[data-lazy-workbench="positions"]');
+  const current = container?.querySelector('[data-exchange-position-tabs]');
+  if (!current) return false;
+  const next = await fetchWorkbenchPartial(
+    '/positions-panel?initial=positions',
+    '[data-exchange-position-tabs]',
+  );
+  if (current !== container.querySelector('[data-exchange-position-tabs]')) return false;
+  const curPanel = current.querySelector('[data-exchange-position-panel="positions"]');
+  const nextPanel = next.querySelector('[data-exchange-position-panel="positions"]');
+  if (!curPanel || !nextPanel) throw new Error('返回内容不完整');
+  withLiveScrollAnchor(current, () => {
+    const context = { reorder: true, removeMissing: true };
+    ['data-position-snapshot-version', 'data-position-snapshot-state', 'data-position-snapshot-captured-at']
+      .forEach((name) => {
+        const value = next.getAttribute(name);
+        if (value === null) current.removeAttribute(name);
+        else if (current.getAttribute(name) !== value) current.setAttribute(name, value);
+      });
+    const curStatus = current.querySelector('[data-position-snapshot-status]');
+    const nextStatus = next.querySelector('[data-position-snapshot-status]');
+    if (curStatus && nextStatus) patchElement(curStatus, nextStatus, context);
+    const curTab = current.querySelector('[data-exchange-position-tab="positions"]');
+    const nextTab = next.querySelector('[data-exchange-position-tab="positions"]');
+    if (curTab && nextTab && curTab.textContent.trim() !== nextTab.textContent.trim()) {
+      curTab.textContent = nextTab.textContent.trim();
+    }
+    const errorSelector = ':scope > [data-live-key="exchange-error"]';
+    const curError = current.querySelector(errorSelector);
+    const nextError = next.querySelector(errorSelector);
+    if (nextError && !curError) {
+      current.querySelector('.exchange-tab-panels')?.before(document.importNode(nextError, true));
+    } else if (!nextError && curError) {
+      curError.remove();
+    }
+    patchElement(curPanel, nextPanel, context);
+  });
+  bindBoundPositionCloseButtons();
+  return true;
+}
+
+function liveSetReorderHint(root, visible) {
+  const hint = root?.querySelector('[data-strategy-reorder-hint]');
+  if (hint) hint.hidden = !visible;
+}
+
+async function liveRefreshStrategies() {
+  if (liveViewIsBusy('strategies')) return false;
+  const current = document.querySelector('[data-strategy-record-list]');
+  if (!current) return false;
+  const selection = strategyRecordSelectionFromRoot(current);
+  const requestId = strategyRecordRequestId;
+  const next = await fetchWorkbenchPartial(
+    `/strategy-records?${currentStrategyRecordParams(selection)}`,
+    '[data-strategy-record-list]',
+  );
+  if (
+    requestId !== strategyRecordRequestId
+    || current !== document.querySelector('[data-strategy-record-list]')
+    || !strategyRecordSelectionMatches(selection)
+  ) return false;
+  const context = { reorder: false, removeMissing: true, orderChanged: false };
+  withLiveScrollAnchor(current, () => {
+    patchElement(current, next, context);
+  });
+  lastSuccessfulStrategyRecordAt = new Date().toISOString();
+  bindStrategyRecordController();
+  liveSetReorderHint(current, context.orderChanged);
+  return true;
+}
+
+function liveShowNewMessages(panel, count, { gap = false } = {}) {
+  if (!panel) return;
+  const total = Number(panel.dataset.liveNewCount || '0') + count;
+  panel.dataset.liveNewCount = String(total);
+  if (gap) panel.dataset.liveGap = 'true';
+  const button = panel.querySelector('[data-new-messages-button]');
+  if (button) button.textContent = gap ? '有新消息 ↑' : `有 ${total} 条新消息 ↑`;
+  setNewMessagesButtonVisible(panel, true);
+}
+
+// Fetch only the message cards newer than the panel's baseline and splice them
+// in above the existing ones. The panel itself is never rebuilt.
+async function liveInsertNewMessageCards(panel, buildUrl) {
+  if (!panel || panel.dataset.liveGap === 'true') return false;
+  const after = Number(panel.dataset.latestRawMessageId || '0');
+  const { text, response } = await fetchWorkbenchResponse(buildUrl(after));
+  if (!panel.isConnected || after !== Number(panel.dataset.latestRawMessageId || '0')) return false;
+  const nextPanel = new DOMParser().parseFromString(text, 'text/html').querySelector('[data-messages-panel]');
+  const nextList = nextPanel?.querySelector('[data-message-list]');
+  const currentList = panel.querySelector('[data-message-list]');
+  if (!nextList || !currentList) throw new Error('返回内容不完整');
+  if (response.headers?.get?.('X-Timeline-Gap') === '1') {
+    liveShowNewMessages(panel, 0, { gap: true });
+    return true;
+  }
+  const known = new Set(
+    Array.from(currentList.querySelectorAll('[data-message-card]')).map((card) => card.dataset.messageRawId),
+  );
+  const cards = Array.from(nextList.querySelectorAll('[data-message-card]'))
+    .filter((card) => !known.has(card.dataset.messageRawId));
+  const newest = Number(nextPanel.dataset.latestRawMessageId || '0');
+  if (newest > after) panel.dataset.latestRawMessageId = String(newest);
+  if (!cards.length) return true;
+  const scroller = getMessageScrollContainer(panel);
+  const atTop = isMessagePanelAtTop(panel);
+  const heightBefore = scroller ? scroller.scrollHeight : 0;
+  const topBefore = scroller ? scroller.scrollTop : 0;
+  const fragment = document.createDocumentFragment();
+  cards.forEach((card) => fragment.appendChild(document.importNode(card, true)));
+  currentList.prepend(fragment);
+  if (scroller && !atTop) {
+    scroller.scrollTop = topBefore + (scroller.scrollHeight - heightBefore);
+  }
+  bindMessagePanelControls(panel);
+  updateMessageInsightView(panel);
+  Array.from(currentList.children).slice(0, cards.length).forEach(liveFlash);
+  if (!atTop) liveShowNewMessages(panel, cards.length);
+  return true;
+}
+
+async function liveRefreshActivity() {
+  if (liveViewIsBusy('activity')) return false;
+  const panel = getActivityMessagesPanel();
+  if (!panel) return false;
+  return liveInsertNewMessageCards(
+    panel,
+    (after) => `/activity/timeline?after_raw_message_id=${after}`,
+  );
+}
+
+async function liveRefreshGroupList() {
+  const container = document.querySelector('[data-lazy-workbench="groups"]');
+  const current = container?.querySelector('.kol-strategy-list');
+  if (!current) return false;
+  const selectedChatId = getSelectedChatId();
+  const next = await fetchWorkbenchPartial(
+    `/groups?selected_chat_id=${selectedChatId}`,
+    '.kol-strategy-list',
+  );
+  if (current !== container.querySelector('.kol-strategy-list')) return false;
+  if (sidebarLooksLikeZeroRegression(current, next)) return true;
+  patchElement(current, next, { reorder: true, removeMissing: true });
+  bindGroupLinks();
+  bindGroupAutomationToggles();
+  refreshGroupPickerOptions();
+  const stillThere = selectedChatId
+    && document.querySelector(`[data-group-link][data-chat-id="${selectedChatId}"]`);
+  if (selectedChatId && !stillThere) {
+    document.querySelector('[data-group-link]')?.click();
+  } else {
+    syncSelectedGroupState(selectedChatId);
+  }
+  return true;
+}
+
+async function liveRefreshGroupMessages() {
+  const chatId = getSelectedChatId();
+  const panel = getMessagePanel();
+  if (!chatId || !panel || panel.dataset.messageScope === 'all') return false;
+  if (Number(panel.dataset.chatId || '0') !== chatId) return false;
+  const filters = getMessageFilterState(panel);
+  if (filters.searchText || filters.senderName) return false;
+  return liveInsertNewMessageCards(
+    panel,
+    (after) => `/groups/${chatId}/messages?after_raw_message_id=${after}`,
+  );
+}
+
+async function liveRefreshGroups(versions) {
+  if (liveViewIsBusy('groups')) return false;
+  let ok = true;
+  if (liveState.applied.groupsList !== versions.groups) {
+    ok = (await liveRefreshGroupList()) && ok;
+    if (ok) liveState.applied.groupsList = versions.groups;
+  }
+  if (liveState.applied.groupsMessages !== versions.messages) {
+    const patched = await liveRefreshGroupMessages();
+    if (patched) liveState.applied.groupsMessages = versions.messages;
+    ok = patched && ok;
+  }
+  return ok;
+}
+
+function liveViewKey(view, versions) {
+  if (view === 'positions') return `${versions.positions}|${versions.strategies}`;
+  if (view === 'strategies') return versions.strategies;
+  if (view === 'activity') return versions.messages;
+  if (view === 'groups') return `${versions.groups}|${versions.messages}`;
+  return null;
+}
+
+async function livePatchActiveView(versions) {
+  const view = liveActiveView();
+  const key = liveViewKey(view, versions);
+  if (key === null || liveState.applied[view] === key) return;
+  let patched = false;
+  if (view === 'positions') patched = await liveRefreshPositions();
+  else if (view === 'strategies') patched = await liveRefreshStrategies();
+  else if (view === 'activity') patched = await liveRefreshActivity();
+  else if (view === 'groups') patched = await liveRefreshGroups(versions);
+  // A view that is not loaded yet (or is loading) stays "not applied" so the
+  // next poll tries again; a view that was patched is not fetched until its
+  // version moves.
+  if (patched) liveState.applied[view] = key;
+}
+
+// ── Poller ───────────────────────────────────────────────────────────────
+
+function liveStatusElement() {
+  return document.querySelector('[data-live-status]');
+}
+
+function liveRenderStatus() {
+  const element = liveStatusElement();
+  if (!element) return;
+  const paused = liveState.failures >= LIVE_PAUSE_AFTER_FAILURES;
+  element.classList.toggle('is-paused', paused);
+  element.classList.remove('is-expired');
+  const last = liveState.lastOkClock ? liveState.lastOkClock : '--:--:--';
+  element.textContent = paused
+    ? `实时更新暂停，正在重试…（上次更新 ${last}）`
+    : `实时 · 更新于 ${last}`;
+}
+
+function liveShowLoginExpired() {
+  liveState.stopped = true;
+  const element = liveStatusElement();
+  if (!element) return;
+  element.classList.add('is-paused', 'is-expired');
+  const link = document.createElement('a');
+  link.href = '/login?next=/';
+  link.textContent = '登录已过期，点此重新登录';
+  element.textContent = '';
+  element.appendChild(link);
+}
+
+// Called from handleWorkbenchAssetVersionMismatch: after a deploy the page's
+// scripts and markup no longer match the server, so stop patching and let the
+// user reload when ready (never an automatic reload).
+function handleLiveAssetVersionMismatch() {
+  if (!LIVE_PATCH_ENABLED || !liveState.started) return false;
+  liveState.stopped = true;
+  const element = liveStatusElement();
+  if (element) {
+    element.classList.add('is-paused');
+    element.textContent = '';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'live-reload-button';
+    button.textContent = '页面已更新，点此刷新';
+    button.addEventListener('click', () => window.location.reload());
+    element.appendChild(button);
+  }
+  return true;
+}
+
+async function fetchLiveState() {
+  const response = await fetch(LIVE_STATE_URL, {
+    cache: 'no-store',
+    headers: { Accept: 'application/json' },
+  });
+  if (response.status === 401) throw new LiveAuthExpiredError('unauthorized');
+  if (response.redirected && new URL(response.url).pathname === '/login') {
+    throw new LiveAuthExpiredError('redirected to login');
+  }
+  if (!response.ok) throw new Error(`live state request failed (${response.status})`);
+  const pageVersion = document.documentElement?.dataset?.workbenchAssetVersion || '';
+  const serverVersion = response.headers?.get?.('X-Workbench-Asset-Version') || '';
+  if (pageVersion && serverVersion && pageVersion !== serverVersion) {
+    handleWorkbenchAssetVersionMismatch(serverVersion);
+    throw new WorkbenchAssetVersionMismatchError('asset version changed');
+  }
+  const state = await response.json();
+  if (!state || typeof state.versions !== 'object' || state.versions === null) {
+    throw new Error('live state response malformed');
+  }
+  return state;
+}
+
+function liveUpdatePositionsFreshness(state) {
+  const root = document.querySelector('[data-lazy-workbench="positions"] [data-exchange-position-tabs]');
+  const status = root?.querySelector('[data-position-snapshot-status]');
+  if (!status || !state.positions_captured_at) return;
+  const age = (Date.parse(state.server_time) - Date.parse(state.positions_captured_at)) / 1000;
+  if (Number.isNaN(age)) return;
+  const current = root.dataset.positionSnapshotState;
+  if (current !== 'current' && current !== 'stale') return;
+  const wanted = age > LIVE_POSITION_STALE_SECONDS ? 'stale' : 'current';
+  if (wanted === current) return;
+  root.dataset.positionSnapshotState = wanted;
+  status.classList.remove(`position-snapshot-status--${current}`);
+  status.classList.add(`position-snapshot-status--${wanted}`);
+  const label = status.querySelector('span');
+  if (label) {
+    label.textContent = wanted === 'stale'
+      ? '持仓快照已超过 30 秒，正在等待刷新'
+      : '持仓数据刚刚更新';
+  }
+}
+
+function liveScheduleNext(delay) {
+  window.clearTimeout(liveState.timer);
+  liveState.timer = null;
+  if (liveState.stopped || document.visibilityState !== 'visible') return;
+  liveState.timer = window.setTimeout(liveStatePollOnce, delay);
+}
+
+function liveRetryDelay() {
+  if (liveState.failures <= 0) return LIVE_POLL_INTERVAL_MS;
+  return LIVE_RETRY_BACKOFF_MS[Math.min(liveState.failures, LIVE_RETRY_BACKOFF_MS.length) - 1];
+}
+
+async function liveStatePollOnce() {
+  liveState.timer = null;
+  if (liveState.stopped || liveState.inFlight || document.visibilityState !== 'visible') return;
+  liveState.inFlight = true;
+  try {
+    const state = await fetchLiveState();
+    if (liveState.failures > 0) liveState.applied = {};
+    latestMonitorStatus = state.monitor || null;
+    if (state.monitor) setMonitorStatus(state.monitor);
+    liveUpdatePositionsFreshness(state);
+    await livePatchActiveView(state.versions);
+    liveState.failures = 0;
+    liveState.lastOkClock = liveFormatClock(state.server_time);
+    liveRenderStatus();
+  } catch (error) {
+    if (error instanceof WorkbenchAssetVersionMismatchError) return;
+    if (error instanceof LiveAuthExpiredError || error instanceof WorkbenchAuthExpiredError) {
+      liveShowLoginExpired();
+      return;
+    }
+    liveState.failures += 1;
+    liveRenderStatus();
+  } finally {
+    liveState.inFlight = false;
+    liveScheduleNext(liveRetryDelay());
+  }
+}
+
+// Poll right away (tab became visible, window regained focus, view switched).
+function liveStatePollNow() {
+  if (!LIVE_PATCH_ENABLED || !liveState.started || liveState.stopped) return;
+  if (liveState.inFlight) return;
+  window.clearTimeout(liveState.timer);
+  liveState.timer = null;
+  liveStatePollOnce();
+}
+
+function startLiveStatePolling() {
+  liveState.started = true;
+  liveInstallFocusHook();
+  liveRenderStatus();
+  liveStatePollOnce();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') liveStatePollNow();
+    else {
+      window.clearTimeout(liveState.timer);
+      liveState.timer = null;
+    }
+  });
+  window.addEventListener('focus', liveStatePollNow);
+}
+
 function bindLivePositionAttributionButtons() {
   document.querySelectorAll('[data-bind-live-position]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -5502,7 +6230,14 @@ window.addEventListener('DOMContentLoaded', () => {
   bindLivePositionAttributionButtons();
   setAiStatus('');
   resetInitialMessagePanelScroll();
-  connectLiveUpdates();
+  if (LIVE_PATCH_ENABLED) {
+    // One 5 s version poll replaces the monitor/freshness pair and the (dead
+    // in split-process production) SSE stream; it also patches the active view.
+    startLiveStatePolling();
+    return;
+  }
+
+  // Rollback path: notice-and-click updates, as before live patching.
   refreshMonitorStatus();
   refreshFromDatabaseChanges();
   startPollingUpdates();
