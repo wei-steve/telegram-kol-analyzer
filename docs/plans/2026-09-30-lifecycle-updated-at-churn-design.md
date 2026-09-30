@@ -1,7 +1,7 @@
 # 对账每轮刷新 strategy_lifecycles.updated_at：核实与方案
 
 - 日期：2026-09-30
-- 状态：**用户已确认（2026-09-30）：问题 1 选 A、2 照做、3 接受、4 不回填**；实施中
+- 状态：**用户已确认（2026-09-30）：问题 1 选 A、2 照做、3 接受、4 不回填**；**候选 `6d85b94f` 已完成，全量 10918 passed / 4 skipped / 0 failed（约 16 分钟），未部署、未推 origin/main，部署由调度会话排期**
 - 分支：`claude/reverent-gagarin-0143e2`（已快进到 origin/main `91f02f49`，即绑定 updated_at 修复 `5b0221c8` 落地后的版本；生产同为 `91f02f49`）
 - 验证级别：L2（改的是 worker 对账写入路径，而且会改变上下文解析这条权威路径的一个输入；不改表结构、不碰交易所写入）
 - 来源：`docs/plans/2026-09-30-binding-updated-at-churn-design.md` §1.4、§6 问题 2（用户选了「另开任务」）
@@ -116,3 +116,13 @@
 | 2 | 核实结果显示上下文这边只省约 1 次 AI 调用 / 月，主要收益在网页版本号、列表「最近变化」与排序、不再误打 `reanalysis_capped`。按 L2 做（30 分钟、≥5 条消息的观察窗）是否仍值得 | 照做；搁置 | **照做**。改动小、读者审计没有变坏项，网页局部更新（7b9d2c40）正受它影响 |
 | 3 | 修复后，持仓中的策略在列表里不再永远显示「刚刚」、不再永远排最前，而是按真实最后变化时间排 | 接受；要持仓优先另行处理 | **接受**。持仓优先由网页侧「持仓优先」面板承担（7b9d2c40），不靠这个时间戳 |
 | 4 | 当前持仓 / 挂单生命周期的 `updated_at` 已被覆盖，部署后停在最后一轮时刻 | 不回填；回填（数据修复，L3） | **不回填**，只有 1 行，且没有读者依赖它的历史值 |
+
+## 8. 实施结果（2026-09-30）
+
+- 候选代码提交 `6d85b94f`（Sonnet 5 子代理实现，Opus 5.5 审阅），基于 origin/main `91f02f49`：只改 `execution_bindings.py`（+39/−8）并新增 `tests/test_lifecycle_updated_at_churn.py`（13 个测试）。
+- 实现：模块级从 `StrategyLifecycle` 映射列推出内容列（去掉 `updated_at`）；`_attach_binding_to_lifecycle` 在找到生命周期后记快照，三处写入都改为「内容变了才写」；`_mark_lifecycle_pending` 同样处理。两处函数内的局部导入改为模块级导入（无循环导入）。
+- 偏离：第 6 节第 3 条「终态已退出挂在 active 绑定上」从对账入口走不到——`_is_terminal_exited_lifecycle` 只认 `kol_signal`/`manual`，前者在绑定 active 时先被重开，后者被显式跳过；过期未入场分支同理（进入前绑定刚被设为 active）。这两个分支改用直接调用的单元测试钉住，另加「kol_signal 重开一次后 0 写入」的对账测试。
+- 旧代码对照（本会话复跑）：把 `execution_bindings.py` 换回 `2f79b4b9` 版本，13 个新测试中 9 个失败（0 写入、指纹稳定、网页版本号稳定几类），4 个「真实变化必须前进」的测试照常通过；新代码 13 个全过。
+- 相关测试：新测试 + `test_binding_updated_at_churn.py` 28 passed；文件名含 context_resolution / execution_binding / web_live_state / lifecycle 的测试 376 passed。
+- 全量：`10918 passed, 4 skipped`，0 失败（958 秒）。没有改动任何既有测试。
+- 部署后观察按第 5 节。
