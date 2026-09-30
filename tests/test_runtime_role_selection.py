@@ -1154,8 +1154,13 @@ def test_monitor_badge_is_updated_only_from_monitor_status_endpoint():
         / "app.js"
     )
     script = script_path.read_text(encoding="utf-8")
-    live_updates = script.split("function connectLiveUpdates()", 1)[1].split(
-        "function startPollingUpdates()", 1
+    # The SSE listener (connectLiveUpdates) was retired for the live-state
+    # poller (docs/plans/2026-09-30-web-live-data-and-positions-first-design.md).
+    # Its only monitor input is ``state.monitor``, which /api/live/state builds
+    # from the same api_monitor_status the badge endpoint serves.
+    assert "function connectLiveUpdates()" not in script
+    live_poll = script.split("async function liveStatePollOnce()", 1)[1].split(
+        "function liveStatePollNow()", 1
     )[0]
     freshness = script.split("async function refreshFromDatabaseChanges()", 1)[
         1
@@ -1164,8 +1169,8 @@ def test_monitor_badge_is_updated_only_from_monitor_status_endpoint():
         1
     ].split("function getMessagePanel()", 1)[0]
 
-    assert "setMonitorStatus(" not in live_updates
-    assert "await refreshMonitorStatus();" in live_updates
+    assert live_poll.count("setMonitorStatus(") == 1
+    assert "setMonitorStatus(state.monitor)" in live_poll
     assert "setMonitorStatus(" not in freshness
     assert "state: 'unknown'" in monitor_refresh
     assert "label: '状态未知'" in monitor_refresh
