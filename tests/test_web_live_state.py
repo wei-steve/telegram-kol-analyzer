@@ -307,6 +307,10 @@ def test_live_state_queries_never_scan_tables_with_bound_parameters(tmp_path):
             session, dict(build_strategy_version_statements())["active_lifecycles"]
         )
         assert any(
-            "ix_strategy_lifecycles_status" in step and "SEARCH" in step
+            # The table carries two equivalent single-column status indexes
+            # (ix_strategy_lifecycles_status and the column's own
+            # ..._lifecycle_status); SQLite may pick either.
+            step.startswith("SEARCH strategy_lifecycles USING INDEX ix_strategy_lifecycles_")
+            and "status" in step
             for step in active_plan
         ), active_plan

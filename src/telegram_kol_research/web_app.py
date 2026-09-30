@@ -379,6 +379,7 @@ from telegram_kol_research.web_queries import (
     load_home_event_rows,
     load_latest_raw_message_id,
     load_timeline_message_page,
+    load_timeline_messages_after,
     list_execution_strategy_overview,
     load_lifecycle_counts,
     load_lifecycle_counts_by_chat_id,
@@ -10865,14 +10866,63 @@ def create_web_app(
             ),
         }
 
+    ACTIVITY_INCREMENTAL_LIMIT = 50
+
+    def _activity_incremental_response(
+        request: Request,
+        after_raw_message_id: int,
+        *,
+        chat_id: int | None = None,
+    ):
+        """Only the cards newer than ``after_raw_message_id`` (live patching).
+
+        Same ``_messages.html`` fragment as load-more, so the frontend can lift
+        the ``[data-message-card]`` nodes out. ``X-Timeline-Gap: 1`` means more
+        than the limit arrived and the client should reload instead of patch.
+        """
+        messages, gap = load_timeline_messages_after(
+            app.state.session_factory,
+            after_raw_message_id=max(0, after_raw_message_id),
+            limit=ACTIVITY_INCREMENTAL_LIMIT,
+            chat_id=chat_id,
+            include_recognition_labels=app.state.runtime_role in {"all", "web"},
+            model_labels=_ai_model_labels(app.state.ai_recognition_config_path),
+        )
+        newest_raw_id = max(
+            (int(item["raw_message_id"]) for item in messages),
+            default=max(0, after_raw_message_id),
+        )
+        context = _activity_page_context(
+            messages=messages,
+            has_more=False,
+            latest_raw_message_id=newest_raw_id,
+        )
+        if chat_id is not None:
+            context.update(
+                {
+                    "timeline_scope": "group",
+                    "selected_chat_id": chat_id,
+                    "show_group_name": False,
+                }
+            )
+        response = templates.TemplateResponse(request, "_messages.html", context)
+        if gap:
+            response.headers["X-Timeline-Gap"] = "1"
+        return response
+
     @app.get("/activity/timeline")
-    def activity_timeline(request: Request):
+    def activity_timeline(request: Request, after_raw_message_id: int | None = None):
         """Cross-group activity timeline shell: header + first page of cards.
 
         Read-only; shows every chat with rows in ``raw_messages``, newest
         first by (posted_at, id) -- see
         docs/plans/2026-09-28-dynamics-cross-group-timeline-design.md.
+
+        With ``after_raw_message_id`` it returns only the newer cards instead
+        of the shell (same fragment as ``/activity/messages``).
         """
+        if after_raw_message_id is not None:
+            return _activity_incremental_response(request, after_raw_message_id)
         messages, has_more = load_timeline_message_page(
             app.state.session_factory,
             page_size=MESSAGE_PAGE_SIZE,
@@ -10891,12 +10941,19 @@ def create_web_app(
         )
 
     @app.get("/activity/messages")
-    def activity_messages(request: Request, before_raw_message_id: int | None = None):
+    def activity_messages(
+        request: Request,
+        before_raw_message_id: int | None = None,
+        after_raw_message_id: int | None = None,
+    ):
         """Next cross-group timeline page (load-more).
 
         Same fragment shape as ``/groups/{chat_id}/messages``: renders
         ``_messages.html`` directly for the caller to splice into the list.
+        ``after_raw_message_id`` instead returns only newer cards (live patch).
         """
+        if after_raw_message_id is not None:
+            return _activity_incremental_response(request, after_raw_message_id)
         messages, has_more = load_timeline_message_page(
             app.state.session_factory,
             page_size=MESSAGE_PAGE_SIZE,
@@ -10917,7 +10974,14 @@ def create_web_app(
         before_message_id: int | None = None,
         search_text: str | None = None,
         sender_name: str | None = None,
+        after_raw_message_id: int | None = None,
     ):
+        if after_raw_message_id is not None:
+            # Live patch: only this group's cards newer than the panel's
+            # baseline (same fragment shape; filters are not supported here).
+            return _activity_incremental_response(
+                request, after_raw_message_id, chat_id=chat_id
+            )
         monitor_status = build_monitor_status()
         messages, has_more = load_group_message_page(
             app.state.session_factory,

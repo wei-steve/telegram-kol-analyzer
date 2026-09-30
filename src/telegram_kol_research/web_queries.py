@@ -628,6 +628,59 @@ def load_timeline_message_page(
         )
 
 
+def load_timeline_messages_after(
+    session_factory: sessionmaker,
+    *,
+    after_raw_message_id: int,
+    limit: int,
+    chat_id: int | None = None,
+    include_recognition_labels: bool = False,
+    model_labels: Mapping[str, str] | None = None,
+) -> tuple[list[dict[str, object | None]], bool]:
+    """Messages inserted after ``after_raw_message_id`` for live patching.
+
+    Selection is by the integer primary key (``id > ?``, a rowid range seek),
+    not by ``posted_at``: a message back-filled late by reconcile has a larger
+    ``id`` but an older ``posted_at`` and must still reach a page that already
+    loaded everything up to ``after_raw_message_id``. The result is returned in
+    the timeline's display order ``(posted_at DESC, id DESC)`` so the caller
+    can splice it at the top; a back-filled older message therefore also lands
+    at the top of the inserted block (accepted: it is new to this viewer).
+
+    The second element is True when more than ``limit`` rows are newer -- the
+    newest ``limit`` are returned and the caller should fall back to a full
+    reload instead of patching a gap.
+    """
+
+    with session_factory() as session:
+        query = session.query(RawMessage).filter(
+            RawMessage.id > int(after_raw_message_id)
+        )
+        if chat_id is not None:
+            # Optional single-group scope (the groups view's message panel).
+            query = query.filter(RawMessage.chat_id == int(chat_id))
+        raw_messages = query.order_by(RawMessage.id.desc()).limit(limit + 1).all()
+        gap = len(raw_messages) > limit
+        raw_messages = raw_messages[:limit]
+        raw_messages.sort(
+            key=lambda row: (
+                row.posted_at is not None,
+                row.posted_at or datetime.min,
+                row.id,
+            ),
+            reverse=True,
+        )
+        return (
+            _serialize_raw_messages(
+                session,
+                raw_messages,
+                include_recognition_labels=include_recognition_labels,
+                model_labels=model_labels,
+            ),
+            gap,
+        )
+
+
 def load_latest_raw_message_id(session_factory: sessionmaker) -> int:
     """Return ``max(raw_messages.id)``, or 0 if the table is empty.
 

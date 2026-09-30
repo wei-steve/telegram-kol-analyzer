@@ -19,6 +19,7 @@ from telegram_kol_research.web_app import create_web_app, _timeline_group_names_
 from telegram_kol_research.web_queries import (
     load_latest_raw_message_id,
     load_timeline_message_page,
+    load_timeline_messages_after,
 )
 
 BASE_TIME = datetime(2026, 9, 28, 12, 0, tzinfo=UTC)
@@ -480,3 +481,155 @@ def test_group_messages_route_has_no_group_badge_and_keeps_single_group_filters(
     assert "data-before-message-id=" in body
     assert "data-before-raw-message-id=" not in body
     assert 'data-message-scope="all"' not in body
+
+
+# ── incremental (live patch) endpoint ────────────────────────────────────────
+
+
+def _card_raw_ids(body: str) -> list[int]:
+    import re
+
+    return [int(value) for value in re.findall(r'data-message-raw-id="(\d+)"', body)]
+
+
+def test_incremental_timeline_returns_only_newer_cards_in_display_order(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    _seed_interleaved_messages(session_factory, count_per_chat=3, chat_ids=(11, 22))
+    client = TestClient(create_web_app(database_path=database_path))
+    baseline = load_latest_raw_message_id(session_factory)
+
+    # Nothing newer: an empty card list and an unchanged baseline.
+    empty = client.get(f"/activity/timeline?after_raw_message_id={baseline}")
+    assert empty.status_code == 200
+    assert _card_raw_ids(empty.text) == []
+    assert f'data-latest-raw-message-id="{baseline}"' in empty.text
+    assert "X-Timeline-Gap" not in empty.headers
+
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(
+                    chat_id=11, message_id=90, text="newest post",
+                    posted_at=BASE_TIME + timedelta(hours=2),
+                ),
+                # Back-filled: larger id, older posted_at than the message above.
+                RawMessage(
+                    chat_id=22, message_id=91, text="late backfill",
+                    posted_at=BASE_TIME - timedelta(hours=5),
+                ),
+            ]
+        )
+        session.commit()
+        ids = {
+            row.text: row.id
+            for row in session.query(RawMessage).filter(RawMessage.id > baseline)
+        }
+
+    for path in ("/activity/timeline", "/activity/messages"):
+        response = client.get(f"{path}?after_raw_message_id={baseline}")
+        assert response.status_code == 200
+        assert 'data-message-scope="all"' in response.text
+        # Display order (posted_at DESC): the dated post first, the backfill
+        # (older posted_at, larger id) second -- both are new to this viewer.
+        assert _card_raw_ids(response.text) == [
+            ids["newest post"],
+            ids["late backfill"],
+        ]
+        assert f'data-latest-raw-message-id="{max(ids.values())}"' in response.text
+        assert "data-load-more" not in response.text
+
+
+def test_incremental_timeline_flags_a_gap_when_more_than_the_limit_arrived(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        for index in range(55):
+            session.add(
+                RawMessage(
+                    chat_id=1, message_id=index + 1, text=f"m{index}",
+                    posted_at=BASE_TIME + timedelta(minutes=index),
+                )
+            )
+        session.commit()
+    client = TestClient(create_web_app(database_path=database_path))
+
+    response = client.get("/activity/timeline?after_raw_message_id=0")
+
+    assert response.headers["X-Timeline-Gap"] == "1"
+    assert len(_card_raw_ids(response.text)) == 50
+    # The newest 50 are kept, not the oldest.
+    assert max(_card_raw_ids(response.text)) == 55
+
+
+def test_incremental_group_messages_are_scoped_to_one_chat(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    _seed_interleaved_messages(session_factory, count_per_chat=2, chat_ids=(11, 22))
+    client = TestClient(create_web_app(database_path=database_path))
+    baseline = load_latest_raw_message_id(session_factory)
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=11, message_id=50, text="mine",
+                           posted_at=BASE_TIME + timedelta(hours=1)),
+                RawMessage(chat_id=22, message_id=51, text="other chat",
+                           posted_at=BASE_TIME + timedelta(hours=1)),
+            ]
+        )
+        session.commit()
+        mine = session.query(RawMessage.id).filter(RawMessage.text == "mine").scalar()
+
+    response = client.get(f"/groups/11/messages?after_raw_message_id={baseline}")
+
+    assert response.status_code == 200
+    assert _card_raw_ids(response.text) == [mine]
+    assert "message-group-badge" not in response.text
+
+
+def test_group_message_panel_carries_a_raw_id_baseline(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    _seed_interleaved_messages(session_factory, count_per_chat=2, chat_ids=(11,))
+    client = TestClient(create_web_app(database_path=database_path))
+
+    body = client.get("/groups/11/messages").text
+
+    newest = max(_card_raw_ids(body))
+    assert f'data-latest-raw-message-id="{newest}"' in body
+
+
+def test_incremental_queries_use_the_primary_key_range_with_bound_parameters(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    statements: list[tuple[str, tuple]] = []
+    with session_factory() as session:
+        engine = session.get_bind()
+
+        @event.listens_for(engine, "before_cursor_execute")
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            if "FROM raw_messages" in statement and "raw_messages.id >" in statement:
+                statements.append((statement, tuple(parameters)))
+
+        try:
+            load_timeline_messages_after(
+                session_factory, after_raw_message_id=5, limit=50
+            )
+            load_timeline_messages_after(
+                session_factory, after_raw_message_id=5, limit=50, chat_id=11
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", capture)
+        assert len(statements) == 2
+        for statement, parameters in statements:
+            rows = (
+                session.connection()
+                .exec_driver_sql(f"EXPLAIN QUERY PLAN {statement}", parameters)
+                .fetchall()
+            )
+            plan = [row[-1] for row in rows]
+            # Global: rowid range seek. Chat-scoped: ix_raw_messages_chat_id
+            # narrowed further by the rowid bound. Never a scan.
+            assert any(
+                "INTEGER PRIMARY KEY" in step or "rowid>?" in step for step in plan
+            ), plan
+            assert not [s for s in plan if s.startswith("SCAN raw_messages")], plan
