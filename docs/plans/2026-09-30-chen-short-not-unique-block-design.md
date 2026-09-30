@@ -2,7 +2,7 @@
 
 - 日期：2026-09-30（时间均为 UTC）
 - 对象：陈哥群 `-1002337721508`，lifecycle 1385，执行绑定 393，管理批次 191–194，值守提案 4–6
-- 状态：**结论与方案待用户确认**，确认前不写代码
+- 状态：**已批准（2026-09-30）：做 F1 + F2；F3 不做；两段式消息维持全平；167 / 175 / 191 历史记账不修。** 实施到候选 sha + 全量通过为止，不部署、不推 origin/main。
 - 生产 HEAD：`bba228e3`（另一会话的 L2 观察窗进行中，本调查全程只读）
 
 ## 1. 一句话结论
@@ -122,7 +122,17 @@ positions-history、1 分钟 K 线），worker journal。
 ### F2（建议做，小）：把 0 行和多行拆成两个原因码
 
 `canonical_live_position_economics` 在 0 行时报 `target_live_position_missing`，多于 1 行时仍报 `target_live_position_not_unique`。值守的 `target_live_position_not_exact` 同样细分。
-这只改原因码的文字，不改拦截与否。需要同步检查引用这个字符串的地方：`RETRYABLE_PREFLIGHT_BLOCK_REASONS`、值守规则 D1/D2 的过滤、`docs/composite-upstream-fix-status.md` 里把它当作 `[position_missing]` 的映射、页面文案。
+这只改原因码的文字，不改拦截与否，也不改重试属性（两者都不在 `RETRYABLE_PREFLIGHT_BLOCK_REASONS` 里，blocked 仍是终态）。
+
+**实施范围（2026-09-30 定稿）**，`git grep` 核对过，生产代码里没有任何地方按这两个字符串做分支判断：
+
+| 位置 | 改法 |
+|---|---|
+| `position_attribution.canonical_live_position_economics`（151 行） | 0 行 → `target_live_position_missing`；>1 行 → 保持 `target_live_position_not_unique` |
+| `position_mutation_gateway._build_fresh_authority`（1032 行） | 同上 |
+| `position_management_remediation`（797 / 813 行） | 所有 verified 入场腿的 posId 都不在活仓 → `target_live_position_missing`；其余不精确情形保持 `target_live_position_not_exact`；`late_fill_identity_not_exact` 分支不变 |
+
+**不改**：`strategy_management_composite_executor.py` 各处（执行期、结果是 `recovery_required`，1709 行已把 0 行当作已平）；`strategy_management_take_profit_consumption.py:312`（语义是"读不到实时数量"，`docs/composite-upstream-fix-status.md:361` 有定义）。
 
 ### F3（可选，待定）：已有全平在途时，后续管理指令直接视为"已被全平覆盖"
 
@@ -154,6 +164,6 @@ positions-history、1 分钟 K 线），worker journal。
 
 ## 7. 需要用户拍板的问题
 
-1. **修复范围**：做 F1 + F2（推荐），还是只做 F1？F3 是否先不做？
-2. **两段式消息的分类**：像 raw 20064 这样「短线止盈出局 + 中长线止盈 50% 保本」的消息，继续按**全平**处理（现状，符合「有离场意愿就跟着离场」），还是改成**先减仓 50%、剩余止损改到策略入场价**？推荐维持现状，因为对跟单账户，这类消息里"短线出局"是明确动作，"中长线"是给另一类读者的建议。
-3. **三笔历史记账**（167 / 175 / 191）是否不修？推荐不修，只在状态文档里注明。
+1. **修复范围**：做 F1 + F2（推荐），还是只做 F1？F3 是否先不做？ → **用户：F1 + F2，F3 不做。**
+2. **两段式消息的分类**：像 raw 20064 这样「短线止盈出局 + 中长线止盈 50% 保本」的消息，继续按**全平**处理（现状，符合「有离场意愿就跟着离场」），还是改成**先减仓 50%、剩余止损改到策略入场价**？推荐维持现状，因为对跟单账户，这类消息里"短线出局"是明确动作，"中长线"是给另一类读者的建议。 → **用户：维持全平。**
+3. **三笔历史记账**（167 / 175 / 191）是否不修？推荐不修，只在状态文档里注明。 → **用户：不修。**
