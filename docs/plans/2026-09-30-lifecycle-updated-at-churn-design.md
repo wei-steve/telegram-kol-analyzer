@@ -1,7 +1,7 @@
 # 对账每轮刷新 strategy_lifecycles.updated_at：核实与方案
 
 - 日期：2026-09-30
-- 状态：**用户已确认（2026-09-30）：问题 1 选 A、2 照做、3 接受、4 不回填**；**候选 `6d85b94f` 已完成，全量 10918 passed / 4 skipped / 0 failed（约 16 分钟），未部署、未推 origin/main，部署由调度会话排期**
+- 状态：**已部署 `bba228e3`（2026-09-30 16:00:10Z，回滚 `91f02f49`），L2 观察 PASS**（见第 9 节）
 - 分支：`claude/reverent-gagarin-0143e2`（已快进到 origin/main `91f02f49`，即绑定 updated_at 修复 `5b0221c8` 落地后的版本；生产同为 `91f02f49`）
 - 验证级别：L2（改的是 worker 对账写入路径，而且会改变上下文解析这条权威路径的一个输入；不改表结构、不碰交易所写入）
 - 来源：`docs/plans/2026-09-30-binding-updated-at-churn-design.md` §1.4、§6 问题 2（用户选了「另开任务」）
@@ -126,3 +126,14 @@
 - 相关测试：新测试 + `test_binding_updated_at_churn.py` 28 passed；文件名含 context_resolution / execution_binding / web_live_state / lifecycle 的测试 376 passed。
 - 全量：`10918 passed, 4 skipped`，0 失败（958 秒）。没有改动任何既有测试。
 - 部署后观察按第 5 节。
+
+## 9. 部署与观察（2026-09-30）
+
+- rebase 到 origin/main `8980537a`（只多文档），候选代码 `bba228e3` 与全量通过的 `6d85b94f` 代码相同。部署前生产 `91f02f49`，候选是其后代，无在途时效性操作。
+- 16:00:10Z `tg-deploy bba228e3`；worker / web / ingest 均 active。origin/main 推到 `9941109b`（比生产只多文档），判决式检查 `PASS: 0 code files beyond production`（同一检查对 `91f02f49` 输入给出 FAIL，自测通过）。
+- 观察：服务器只读监视器每分钟采样，证据 `/var/log/telegram-kol-l2/20260930-lifecycle-churn.jsonl`（422 个样本）与 `.summary`。
+  - **有持仓 / 挂单期间（16:01–18:48Z，167 个样本）**：生命周期 1390（active）、1389（open）的 `updated_at` 从部署前最后一轮 15:59:56 起不再前进，绑定 `recovered_at` 每轮前进；共 2 次前进，都是真实内容变化（18:29 1389 `management_action → expiry_review_requested`，18:30 1390 `→ terminal_cleanup_required`）。无「内容没变却前进」、无 `recovered_at` 停滞。
+  - strategies 版本（活跃生命周期 `count, max(updated_at)`）持仓期间除上述真实变化与生命周期新增 / 退出外保持不变（部署前每 7–20 秒变一次）。
+  - 上下文重解析：整段调度 111 次 `pending_reanalysis`，实际重解析 2 次（`superseded`），其余走「指纹未变跳过」。
+  - 判定窗口 22:35–23:04Z：30 分钟全部正常、6 条真实消息，PASS。该窗口内已无持仓，核心论断由上面的持仓期样本证明。
+  - 异常：17:49–17:51Z 3 个样本记到 worker Traceback，是消息 20102 的识别调用失败（`AuthoritativeProcessingFailed`，`provider_requests=0`），属识别路径，与本改动无关。
