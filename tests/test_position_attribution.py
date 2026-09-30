@@ -2,6 +2,7 @@ import pytest
 
 from telegram_kol_research.position_attribution import (
     FillEvidence,
+    PositionAttributionError,
     LegEvidence,
     PositionEvidence,
     canonical_live_position_economics,
@@ -182,6 +183,40 @@ def test_canonical_live_position_economics_accepts_deepcoin_mrg_position_key():
             "position_mode": "split",
         },
     )
+
+
+_LIVE_ROW = {
+    "instId": "BTC-USDT-SWAP",
+    "posId": "pos-1",
+    "posSide": "short",
+    "pos": "6",
+    "avgPx": "85271.5",
+    "mgnMode": "cross",
+    "mrgPosition": "split",
+}
+
+
+@pytest.mark.parametrize(
+    ("live_positions", "expected_reason"),
+    [
+        # batches 192-194: our own full exit already closed the posId
+        ([], "target_live_position_missing"),
+        ([{**_LIVE_ROW, "posId": "pos-other"}], "target_live_position_missing"),
+        ([_LIVE_ROW, dict(_LIVE_ROW)], "target_live_position_not_unique"),
+    ],
+)
+def test_canonical_live_position_economics_separates_missing_from_duplicate(
+    live_positions, expected_reason
+):
+    with pytest.raises(PositionAttributionError) as excinfo:
+        canonical_live_position_economics(
+            live_positions,
+            target_pos_ids=["pos-1"],
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+        )
+
+    assert str(excinfo.value) == expected_reason
 
 
 def test_equivalent_permutation_assignment_is_explicit_stable_and_evidenced():

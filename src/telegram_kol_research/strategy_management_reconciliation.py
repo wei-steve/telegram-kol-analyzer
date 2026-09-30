@@ -1030,11 +1030,17 @@ def _identity_is_exact(session, batch, legs) -> bool:
         ):
             continue
         if (
-            batch.effective_action not in {"full_close", "full_exit"}
-            and not row.pos_id
+            not row.pos_id
             and str(row.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
             and int(row.id) not in deferred_leg_ids
         ):
+            # A leg that ended before planning without ever opening a
+            # position (e.g. a conservative limit leg cancelled by the entry
+            # path) cannot hold exposure.  The executor's preflight
+            # (_require_exact_entry_legs) already skips every terminal entry
+            # leg for all actions, including full_close/full_exit; rejecting
+            # it here froze exchange-confirmed full exits (batches 167, 175,
+            # 191).  Deferred-snapshot legs keep their stricter rules below.
             continue
         if int(row.id) in deferred_leg_ids:
             if _is_management_cancelled_deferred_entry_leg(row):

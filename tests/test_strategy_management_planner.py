@@ -4193,6 +4193,48 @@ def test_retryable_preflight_blocked_batch_replans_when_snapshot_recovers(
         assert session.query(StrategyManagementLeg).count() == 1
 
 
+@pytest.mark.parametrize(
+    ("live_positions", "expected_reason"),
+    [
+        # batches 192-194: the target posId was already closed (0 rows)
+        ((), "target_live_position_missing"),
+        (("pos-b", "pos-b"), "target_live_position_not_unique"),
+    ],
+)
+def test_missing_and_duplicate_target_positions_block_with_distinct_reasons(
+    monkeypatch, tmp_path, live_positions, expected_reason
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, _, _ = _persist_exact_management_target(session_factory)
+    _disable_reconciliation(monkeypatch, planner)
+
+    blocked = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin(
+            [dict(_position()) for _ in live_positions]
+        ),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+    repeated = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert expected_reason not in planner.RETRYABLE_PREFLIGHT_BLOCK_REASONS
+    assert blocked.status == "blocked"
+    assert blocked.reason_code == expected_reason
+    # Neither reason is retryable: the blocked batch stays terminal.
+    assert repeated.status == "blocked"
+    assert repeated.reason_code == expected_reason
+    assert repeated.batch.id == blocked.batch.id
+
+
 def test_preflight_blocked_batch_with_existing_leg_is_not_replanned(
     monkeypatch, tmp_path
 ):

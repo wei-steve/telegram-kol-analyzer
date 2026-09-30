@@ -783,6 +783,15 @@ def build_position_management_remediation_plan(
                     or len(pos_ids) != len(entry_legs)
                     or not exact_live_identity
                 ):
+                    # No verified entry posId is live at all -> the position
+                    # is gone; anything else inexact stays "not_exact".
+                    identity_reason = (
+                        "late_fill_identity_not_exact"
+                        if directive.intent == "cancel_entry"
+                        else "target_live_position_missing"
+                        if not pos_ids
+                        else "target_live_position_not_exact"
+                    )
                     conflicts.append(
                         {
                             "raw_message_id": int(raw_message.id),
@@ -791,11 +800,7 @@ def build_position_management_remediation_plan(
                             "strategy_instance_id": str(
                                 binding.strategy_instance_id
                             ),
-                            "reason": (
-                                "late_fill_identity_not_exact"
-                                if directive.intent == "cancel_entry"
-                                else "target_live_position_not_exact"
-                            ),
+                            "reason": identity_reason,
                         }
                     )
                     static_steps.append(
@@ -807,11 +812,7 @@ def build_position_management_remediation_plan(
                             item=item,
                             action_kind=directive.intent,
                             state="blocked",
-                            reason=(
-                                "late_fill_identity_not_exact"
-                                if directive.intent == "cancel_entry"
-                                else "target_live_position_not_exact"
-                            ),
+                            reason=identity_reason,
                         )
                     )
                     continue

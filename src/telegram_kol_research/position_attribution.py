@@ -147,6 +147,10 @@ def canonical_live_position_economics(
     result: list[dict[str, str]] = []
     for pos_id in sorted(rows_by_pos_id):
         matches = rows_by_pos_id[pos_id]
+        if not matches:
+            # Zero rows means the position is gone (e.g. already closed),
+            # which is a different fact from a duplicated posId.
+            raise PositionAttributionError("target_live_position_missing")
         if len(matches) != 1:
             raise PositionAttributionError("target_live_position_not_unique")
         row = matches[0]

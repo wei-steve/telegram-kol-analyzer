@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 import json
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -10,6 +12,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.position_mutation_authority import (
     PositionMutationAuthority,
+    PositionMutationAuthorityError,
 )
 from telegram_kol_research.position_mutation_gateway import (
     PositionMutationGateway,
@@ -911,3 +914,40 @@ def test_failed_terminal_cas_returns_durable_current_status(tmp_path):
 
     assert blocked.status == "submitting"
     assert failed.status == "recovery_required"
+
+
+@pytest.mark.parametrize(
+    ("positions", "expected_reason"),
+    [
+        ([], "target_live_position_missing"),
+        ([OTHER_POSITION], "target_live_position_missing"),
+        (
+            [SISTER_POSITION, dict(SISTER_POSITION)],
+            "target_live_position_not_unique",
+        ),
+    ],
+)
+def test_fresh_authority_separates_missing_from_duplicate_live_position(
+    tmp_path, positions, expected_reason
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    client = FakeDeepcoinClient()
+    client.positions = positions
+
+    with pytest.raises(PositionMutationAuthorityError) as excinfo:
+        submit_exact_position_sltp(
+            session_factory=session_factory,
+            deepcoin_client=client,
+            pos_id="pos-sister",
+            payload={
+                "instId": "BTC-USDT-SWAP",
+                "posId": "pos-sister",
+                "slTriggerPx": "63000",
+            },
+            idempotency_key="fresh-authority-missing-vs-duplicate",
+            live_execution_gate=lambda: True,
+            now_provider=lambda: NOW,
+        )
+
+    assert str(excinfo.value) == expected_reason
+    assert client.set_position_sltp_calls == []

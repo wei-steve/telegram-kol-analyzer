@@ -477,6 +477,95 @@ def test_cancel_entry_late_fill_never_includes_unrelated_position(tmp_path):
     ] == ["pos-1"]
 
 
+def _add_second_verified_entry_leg(session_factory, *, pos_id="pos-2"):
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        binding.pos_id = f"pos-1,{pos_id}"
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="market",
+                order_id="entry-2",
+                pos_id=pos_id,
+                venue="deepcoin",
+                status="active",
+                attribution_status="verified",
+            )
+        )
+        session.commit()
+
+
+@pytest.mark.parametrize("second_leg", [False, True])
+def test_management_step_reports_missing_when_no_target_position_is_live(
+    tmp_path, second_leg
+):
+    class MissingPositionClient(_ReadOnlyClient):
+        def list_positions(self):
+            return []
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    if second_leg:
+        _add_second_verified_entry_leg(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=MissingPositionClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [conflict["reason"] for conflict in plan.conflicts] == [
+        "target_live_position_missing"
+    ]
+    assert [step.reason for step in plan.chains[0].steps] == [
+        "target_live_position_missing"
+    ]
+
+
+def test_management_step_stays_not_exact_when_only_some_positions_are_live(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+    _add_second_verified_entry_leg(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=_ReadOnlyClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [conflict["reason"] for conflict in plan.conflicts] == [
+        "target_live_position_not_exact"
+    ]
+
+
+def test_management_step_stays_not_exact_for_duplicate_live_position(tmp_path):
+    class DuplicatePositionClient(_ReadOnlyClient):
+        def list_positions(self):
+            row = super().list_positions()[0]
+            return [row, dict(row)]
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    _persist_failed_partial_management(session_factory)
+
+    plan = build_position_management_remediation_plan(
+        session_factory,
+        deepcoin_client=DuplicatePositionClient(),
+        now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert [conflict["reason"] for conflict in plan.conflicts] == [
+        "target_live_position_not_exact"
+    ]
+
+
 def test_confirmed_late_fill_full_exit_resolves_original_cancel_step(tmp_path):
     class NoPositionClient(_ReadOnlyClient):
         def list_positions(self):

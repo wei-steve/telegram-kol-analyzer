@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -1197,10 +1197,13 @@ def test_full_close_reconciliation_requires_every_deferred_entry_allowlist_row(
     assert stored.reason_code == "management_reconciliation_identity_mismatch"
 
 
+# The former (False, "management_full_close_cancelled_unfilled_entry_leg")
+# case moved to test_full_exit_confirms_despite_pre_cancelled_unfilled_entry_leg:
+# a terminal, never-filled entry leg outside the deferred snapshot is accepted
+# for every action, matching the executor preflight (2026-09-30, F1).
 @pytest.mark.parametrize(
     ("snapshotted", "terminal_reason"),
     [
-        (False, "management_full_close_cancelled_unfilled_entry_leg"),
         (True, "exchange_cancelled"),
     ],
 )
@@ -1552,3 +1555,166 @@ def test_composite_restored_partial_failure_is_never_reprocessed_as_close_phase(
     assert stored.reason_code == "protection_replacement_failed_and_restored"
     assert [leg.status for leg in stored.legs] == ["succeeded", "restored"]
     assert stored.legs[1].last_error == {"stage": "replace_protection"}
+
+
+def _add_pre_cancelled_unfilled_entry_leg(
+    session_factory, batch, *, strategy_instance_id=None, snapshotted=False,
+    status="exchange_cancelled", terminal_reason="cancel_regular_entry",
+    cancelled_at=NOW,
+):
+    """Production shape of batches 167/175/191: the conservative limit leg was
+    cancelled by another path before management planning, never filled, never
+    got a posId, and is therefore absent from the batch's deferred snapshot."""
+
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=(
+                strategy_instance_id or binding.strategy_instance_id
+            ),
+            leg_index=1,
+            purpose="entry",
+            order_kind="limit",
+            order_id="conservative-limit-entry",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status=status,
+            terminal_reason=terminal_reason,
+            last_verified_at=cancelled_at,
+        )
+        session.add(leg)
+        session.flush()
+        if snapshotted:
+            stored_batch = session.get(StrategyManagementBatch, batch.id)
+            snapshot = json.loads(stored_batch.target_snapshot_json)
+            snapshot["identity"]["deferred_entry_leg_ids"] = [leg.id]
+            stored_batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+        return int(leg.id)
+
+
+@pytest.mark.parametrize(
+    ("action", "status", "terminal_reason", "cancelled_hours_before"),
+    [
+        # batch 191: E2 cancelled seconds after E1 filled, ~18 min before plan
+        ("full_exit", "exchange_cancelled", "cancel_regular_entry", 0),
+        ("full_close", "exchange_cancelled", "cancel_regular_entry", 0),
+        # batches 167/175: the cancel happened hours before planning
+        ("full_exit", "exchange_cancelled", "cancel_regular_entry", 6),
+        # cancelled by an earlier management batch, absent from this snapshot
+        (
+            "full_close",
+            "cancelled",
+            "management_full_close_cancelled_unfilled_entry_leg",
+            0,
+        ),
+    ],
+)
+def test_full_exit_confirms_despite_pre_cancelled_unfilled_entry_leg(
+    tmp_path, action, status, terminal_reason, cancelled_hours_before
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action=action, sizes=("6",), preflight=("6",))
+    cancelled_id = _add_pre_cancelled_unfilled_entry_leg(
+        sf,
+        batch,
+        status=status,
+        terminal_reason=terminal_reason,
+        cancelled_at=NOW - timedelta(hours=cancelled_hours_before),
+    )
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+        filled = session.get(
+            ExecutionOrderLeg, stored.legs[0].execution_order_leg_id
+        )
+        cancelled = session.get(ExecutionOrderLeg, cancelled_id)
+    assert result.succeeded == 1
+    assert (stored.status, stored.reason_code) == (
+        "succeeded",
+        "management_close_exchange_confirmed",
+    )
+    assert stored.legs[0].status == "confirmed"
+    assert filled.status == "closed"
+    assert filled.terminal_reason == "management_full_close_confirmed"
+    assert binding.status == "closed"
+    assert lifecycle.lifecycle_status == "exited"
+    assert lifecycle.exit_reason == "kol_signal"
+    assert cancelled.status == status
+    assert cancelled.terminal_reason == terminal_reason
+
+
+def test_full_exit_still_rejects_snapshotted_deferred_entry_still_pending(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_exit", sizes=("6",), preflight=("6",))
+    _add_pre_cancelled_unfilled_entry_leg(
+        sf, batch, snapshotted=True, status="pending", terminal_reason=None
+    )
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert (stored.status, stored.reason_code) == (
+        "recovery_required",
+        "management_reconciliation_identity_mismatch",
+    )
+
+
+def test_full_exit_still_rejects_other_live_verified_entry_leg(tmp_path):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_exit", sizes=("6",), preflight=("6",))
+    _add_pre_cancelled_unfilled_entry_leg(sf, batch)
+    with sf() as session:
+        binding = session.get(ExecutionBinding, batch.execution_binding_id)
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                strategy_instance_id=binding.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="market",
+                order_id="unmanaged-live-entry",
+                pos_id="pos-unmanaged",
+                venue="deepcoin",
+                attribution_status="verified",
+                attribution_evidence_json='{"policy_version":2}',
+                status="active",
+            )
+        )
+        session.commit()
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert (stored.status, stored.reason_code) == (
+        "recovery_required",
+        "management_reconciliation_identity_mismatch",
+    )
+
+
+def test_full_exit_still_rejects_terminal_unfilled_leg_of_other_strategy(
+    tmp_path,
+):
+    sf = create_session_factory(tmp_path / "research.db")
+    batch = _persist_batch(sf, action="full_exit", sizes=("6",), preflight=("6",))
+    _add_pre_cancelled_unfilled_entry_leg(
+        sf, batch, strategy_instance_id="deepcoin:other:strategy:BTC:short"
+    )
+
+    result = _reconcile_management(sf, positions=[])
+
+    stored = load_management_batch(sf, batch.id)
+    assert result.frozen == 1
+    assert (stored.status, stored.reason_code) == (
+        "recovery_required",
+        "management_reconciliation_identity_mismatch",
+    )

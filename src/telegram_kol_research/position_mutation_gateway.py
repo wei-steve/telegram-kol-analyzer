@@ -1028,6 +1028,8 @@ def _build_fresh_authority(
     matches = [
         row for row in positions if str(row.get("posId") or "") == str(pos_id)
     ]
+    if not matches:
+        raise PositionMutationAuthorityError("target_live_position_missing")
     if len(matches) != 1:
         raise PositionMutationAuthorityError("target_live_position_not_unique")
     with session_factory() as session:
