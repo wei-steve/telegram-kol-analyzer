@@ -1785,3 +1785,15 @@ def test_state_labels_cover_recognition_and_execution_vocabulary():
     assert _strategy_state_label("filled", "execution") == "已成交"
     assert _strategy_state_label("cancelled", "execution") == "已撤单"
     assert _strategy_state_label("brand_new_code", "execution") == "brand_new_code"
+
+
+def test_strategy_record_list_shows_render_time_in_beijing_time_not_latest_message(tmp_path):
+    client, _ = _client(tmp_path)
+
+    response = client.get("/strategy-records", params={"filter": "needs_attention"})
+
+    assert response.status_code == 200
+    # now_provider is NOW = 2026-07-17 08:30 UTC = 16:30 Asia/Shanghai.
+    assert "列表更新于 07-17 16:30:00" in response.text
+    assert 'data-last-success-at="2026-07-17T16:30:00+08:00"' in response.text
+    assert "上次成功更新" not in response.text

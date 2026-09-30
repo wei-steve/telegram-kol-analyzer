@@ -2011,19 +2011,42 @@ def _strategy_state_label(value: object, kind: str) -> str:
     return _STRATEGY_STATE_LABELS.get(kind, {}).get(text.strip().lower(), text)
 
 
-def _strategy_local_time(value: object) -> str:
-    """``MM-DD HH:mm`` in Asia/Shanghai, or an empty string when unknown."""
+def _as_aware_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value
 
+
+def _to_local_datetime(value: object) -> datetime | None:
     if isinstance(value, str):
         try:
             value = datetime.fromisoformat(value)
         except ValueError:
-            return ""
+            return None
     if not isinstance(value, datetime):
-        return ""
+        return None
     if value.tzinfo is None:
         value = value.replace(tzinfo=UTC)
-    return value.astimezone(DEFAULT_LOCAL_TIMEZONE).strftime("%m-%d %H:%M")
+    return value.astimezone(DEFAULT_LOCAL_TIMEZONE)
+
+
+def _strategy_local_time(value: object) -> str:
+    """``MM-DD HH:mm`` in Asia/Shanghai, or an empty string when unknown."""
+
+    local = _to_local_datetime(value)
+    return local.strftime("%m-%d %H:%M") if local is not None else ""
+
+
+def _strategy_local_time_seconds(value: object) -> str:
+    """``MM-DD HH:mm:ss`` in Asia/Shanghai, or an empty string when unknown."""
+
+    local = _to_local_datetime(value)
+    return local.strftime("%m-%d %H:%M:%S") if local is not None else ""
+
+
+def _local_clock_seconds(value: object) -> str:
+    """``HH:mm:ss`` in Asia/Shanghai, or an empty string when unknown."""
+
+    local = _to_local_datetime(value)
+    return local.strftime("%H:%M:%S") if local is not None else ""
 
 
 STRATEGY_RECORD_STATUS_BUCKETS = ("executing", "pending_entry", "finished", "other")
@@ -7636,6 +7659,10 @@ def create_web_app(
     templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
     templates.env.filters["strategy_state_label"] = _strategy_state_label
     templates.env.filters["strategy_local_time"] = _strategy_local_time
+    templates.env.filters["strategy_local_time_seconds"] = (
+        _strategy_local_time_seconds
+    )
+    templates.env.filters["local_clock_seconds"] = _local_clock_seconds
     app.mount(
         "/static",
         StaticFiles(directory=str(Path(__file__).parent / "static")),
@@ -9068,7 +9095,9 @@ def create_web_app(
                 "applied_page": page,
                 "detail_query": urlencode(list_context_query),
                 "group_options": group_options,
-                "last_success_at": freshness["latest_message_at"],
+                "last_success_at": _as_aware_utc(app.state.now_provider()).astimezone(
+                    DEFAULT_LOCAL_TIMEZONE
+                ),
                 "service_states": {
                     "telegram": monitor_status["state"],
                     "database": database_state,
@@ -9371,6 +9400,9 @@ def create_web_app(
 
     @app.get("/")
     def index(request: Request, view: str | None = None):
+        # Positions is the default landing page (design 2026-09-30 4.1): render
+        # it server-side from the cached snapshot, never calling the exchange.
+        render_initial_positions = view is None or view == "positions"
         freshness = load_database_freshness(
             app.state.session_factory,
             now=app.state.now_provider(),
@@ -9389,9 +9421,9 @@ def create_web_app(
             "database_stale_hours": freshness["stale_hours"],
             "asset_version": app.state.asset_version,
             "render_deferred_more": False,
-            "render_initial_positions": view == "positions",
+            "render_initial_positions": render_initial_positions,
         }
-        if view == "positions":
+        if render_initial_positions:
             context.update(
                 build_initial_positions_panel_context(allow_sync_refresh=False)
             )

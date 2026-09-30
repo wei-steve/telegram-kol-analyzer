@@ -18,7 +18,7 @@
 
   <aside class="workbench-load-status" data-strategy-record-status aria-live="polite">
     <span data-strategy-record-last-success>
-      {% if last_success_at %}上次成功更新：{{ last_success_at }}{% else %}尚未完成更新{% endif %}
+      {% if last_success_at %}列表更新于 {{ last_success_at|strategy_local_time_seconds }}{% else %}尚未完成更新{% endif %}
     </span>
     <button type="button" class="secondary-button" data-strategy-record-retry hidden>重试</button>
   </aside>
@@ -31,7 +31,7 @@
     <div
       class="home-service-health{% if service_states.database == 'stale' %} is-stale{% endif %}"
       aria-label="服务状态"
-      data-last-success-at="{{ last_success_at or '' }}"
+      data-last-success-at="{{ last_success_at.isoformat() if last_success_at else '' }}"
       data-exchange-state="{{ exchange_state }}"
     >
       <span data-service-health="telegram">Telegram · {{ service_states.telegram }}</span>

@@ -239,7 +239,7 @@
       {% endif %}
       {% if position_snapshot.captured_at %}
         <time datetime="{{ position_snapshot.captured_at.isoformat() }}">
-          {{ position_snapshot.captured_at.strftime('%H:%M:%S') }} UTC
+          {{ position_snapshot.captured_at|local_clock_seconds }}
         </time>
       {% endif %}
     </div>

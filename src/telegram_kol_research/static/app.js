@@ -1722,11 +1722,26 @@ function resetStrategyRecordScrollPosition() {
   });
 }
 
+const STRATEGY_RECORD_TIME_FORMAT = new Intl.DateTimeFormat('zh-CN', {
+  timeZone: 'Asia/Shanghai',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
 function formatStrategyRecordSuccessTime(value) {
   if (!value) return '尚未完成更新';
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return `上次成功更新：${value}`;
-  return `上次成功更新：${date.toLocaleString()}`;
+  if (Number.isNaN(date.getTime())) return `列表更新于 ${value}`;
+  const parts = {};
+  STRATEGY_RECORD_TIME_FORMAT.formatToParts(date).forEach((part) => {
+    parts[part.type] = part.value;
+  });
+  const hour = parts.hour === '24' ? '00' : parts.hour;
+  return `列表更新于 ${parts.month}-${parts.day} ${hour}:${parts.minute}:${parts.second}`;
 }
 
 function updateStrategyRecordStatus({ error = null } = {}) {
@@ -2276,14 +2291,14 @@ function setActiveDashboardPanel(tab) {
   }
 }
 
-const WORKBENCH_VIEWS = ['strategies', 'positions', 'activity', 'groups', 'more'];
+const WORKBENCH_VIEWS = ['positions', 'strategies', 'activity', 'groups', 'more'];
 
 function setWorkbenchView(requestedView) {
   const dashboard = document.querySelector('[data-trader-dashboard]');
   const buttons = document.querySelectorAll('[data-workbench-view]');
   const panels = document.querySelectorAll('[data-workbench-panel]');
   if (!dashboard || !buttons.length || !panels.length) return;
-  const view = WORKBENCH_VIEWS.includes(requestedView) ? requestedView : 'strategies';
+  const view = WORKBENCH_VIEWS.includes(requestedView) ? requestedView : 'positions';
   if (view !== 'positions') cancelPositionSnapshotRefresh();
   dashboard.dataset.activeWorkbenchView = view;
   dashboard.classList.remove(...WORKBENCH_VIEWS.map((item) => `mobile-view-${item}`));
@@ -2311,7 +2326,7 @@ async function openDashboardPanel(tab) {
   const dashboard = document.querySelector('[data-trader-dashboard]');
   if (!dashboard) return false;
   if (tab === 'main') {
-    setWorkbenchView(dashboard.getAttribute('data-return-workbench-view') || 'strategies');
+    setWorkbenchView(dashboard.getAttribute('data-return-workbench-view') || 'positions');
     return true;
   }
   if (tab === 'exchange-positions') {
@@ -2331,7 +2346,7 @@ async function openDashboardPanel(tab) {
   if (WORKBENCH_VIEWS.includes(currentView)) {
     dashboard.setAttribute('data-return-workbench-view', currentView);
   } else if (!dashboard.hasAttribute('data-return-workbench-view')) {
-    dashboard.setAttribute('data-return-workbench-view', 'strategies');
+    dashboard.setAttribute('data-return-workbench-view', 'positions');
   }
   dashboard.dataset.activeWorkbenchView = 'settings';
   document.querySelectorAll('[data-workbench-panel]').forEach((panel) => {
@@ -2380,7 +2395,7 @@ function bindWorkbenchNavigation() {
     if (button.dataset.workbenchViewBound === 'true') return;
     button.dataset.workbenchViewBound = 'true';
     button.addEventListener('click', () => {
-      setWorkbenchView(button.dataset.workbenchView || 'strategies');
+      setWorkbenchView(button.dataset.workbenchView || 'positions');
     });
   });
   document.querySelectorAll('[data-legacy-workbench-view]').forEach((button) => {
@@ -2406,8 +2421,8 @@ function scheduleInitialWorkbenchView() {
   const requestedView = params.get('view');
   window.requestAnimationFrame(() => {
     window.requestAnimationFrame(async () => {
-      setWorkbenchView(requestedView || 'strategies');
-      if (requestedView === 'positions') {
+      setWorkbenchView(requestedView || 'positions');
+      if (!requestedView || requestedView === 'positions') {
         await ensureWorkbenchViewLoaded('positions');
         await focusRequestedPosition();
       }

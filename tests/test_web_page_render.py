@@ -1334,9 +1334,7 @@ def test_root_shell_skips_group_strategy_and_configuration_loaders(tmp_path, mon
 
     for loader_name in (
         "load_group_rows",
-        "list_pending_strategies",
         "load_lifecycle_counts_by_chat_id",
-        "list_holding_strategies",
         "load_trading_settings",
         "load_ai_recognition_config",
         "list_recognition_profiles",
@@ -1507,7 +1505,9 @@ def test_index_page_is_a_lightweight_shell_without_deepcoin_or_message_timeline(
     assert '/strategy-records?filter=needs_attention' in response.text
     assert "must be deferred until messages view opens" not in response.text
     assert "data-message-card" not in response.text
-    assert "data-exchange-position-tabs" not in response.text
+    # Positions is the default landing page and is rendered server-side from
+    # the cached snapshot (never a synchronous exchange call).
+    assert "data-exchange-position-tabs" in response.text
 
 
 def test_deferred_home_and_positions_partials_render_independently(tmp_path):
@@ -1677,6 +1677,10 @@ def test_positions_panel_fresh_snapshot_avoids_deepcoin_read(tmp_path):
     assert f'data-position-snapshot-version="{saved.version}"' in response.text
     assert 'data-position-snapshot-state="current"' in response.text
     assert "持仓数据刚刚更新" in response.text
+    # 08:15 UTC is shown as Beijing time; the ISO attribute keeps the instant.
+    assert "16:15:15 UTC" not in response.text
+    assert re.search(r"<time datetime=\"2026-07-31T08:15:00[^\"]*\">\s*16:15:00\s*</time>", response.text)
+    assert " UTC\n" not in response.text.split("持仓数据刚刚更新", 1)[1].split("</div>", 1)[0]
 
 
 def test_split_web_position_loaders_never_construct_a_deepcoin_client(tmp_path):
@@ -2793,8 +2797,8 @@ def test_mobile_navigation_has_exactly_five_primary_destinations(tmp_path):
     assert desktop_nav is not None
     assert mobile_nav is not None
     for view, label in (
-        ("strategies", "策略"),
         ("positions", "持仓"),
+        ("strategies", "策略"),
         ("activity", "动态"),
         ("groups", "群组"),
         ("more", "更多"),
@@ -2805,10 +2809,14 @@ def test_mobile_navigation_has_exactly_five_primary_destinations(tmp_path):
     assert 'data-workbench-view="home"' not in mobile_nav.group(0)
     assert 'data-workbench-view="messages"' not in mobile_nav.group(0)
     assert 'data-workbench-view="management-batches"' not in mobile_nav.group(0)
-    assert re.search(
-        r'data-workbench-view="strategies"[^>]*aria-current="page"',
-        mobile_nav.group(0),
-    )
+    for nav in (mobile_nav, desktop_nav):
+        views = re.findall(r'data-workbench-view="([a-z-]+)"', nav.group(0))
+        assert views == ["positions", "strategies", "activity", "groups", "more"]
+        assert re.search(
+            r'data-workbench-view="positions"[^>]*aria-current="page"',
+            nav.group(0),
+        )
+        assert nav.group(0).count('aria-current="page"') == 1
     assert 'data-workbench-view="management-batches"' not in desktop_nav.group(0)
     more_panel = re.search(
         r'<section class="workbench-panel more-workbench-panel".*?</section>',
@@ -6249,4 +6257,38 @@ def test_strategy_mid_panel_shows_chronological_lifecycle_events(tmp_path):
         < response.text.index("分批止盈30%")
         < response.text.index("多单继续持有，等待拉升")
         < response.text.index("止损触发")
+    )
+
+
+def test_default_landing_renders_positions_panel_without_calling_exchange(tmp_path):
+    def exploding_factory():
+        raise AssertionError("root page must not call the exchange")
+
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            deepcoin_client_factory=exploding_factory,
+        )
+    )
+
+    default = client.get("/")
+    explicit = client.get("/?view=positions")
+    strategies = client.get("/?view=strategies")
+
+    for response in (default, explicit):
+        assert response.status_code == 200
+        assert "data-exchange-position-tabs" in response.text
+        positions_start = response.text.index('data-workbench-panel="positions"')
+        assert "is-active" in response.text[
+            response.text.rindex("<section", 0, positions_start):positions_start
+        ]
+        strategies_start = response.text.index('data-workbench-panel="strategies"')
+        assert "is-active" not in response.text[
+            response.text.rindex("<section", 0, strategies_start):strategies_start
+        ]
+    assert strategies.status_code == 200
+    assert "data-exchange-position-tabs" not in strategies.text
+    assert 'data-strategy-records-url="/strategy-records?filter=needs_attention"' in strategies.text
+    assert re.search(
+        r'data-lazy-workbench="strategies"[^>]*aria-busy="false"', strategies.text
     )

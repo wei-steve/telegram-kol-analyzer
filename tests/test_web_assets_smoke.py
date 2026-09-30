@@ -1887,7 +1887,7 @@ def test_app_js_binds_mobile_work_navigation_to_existing_dashboard_views(tmp_pat
     assert response.status_code == 200
     assert "function bindMobileWorkNavigation" in response.text
     assert "[data-workbench-view]" in response.text
-    assert "const WORKBENCH_VIEWS = ['strategies', 'positions', 'activity', 'groups', 'more'];" in response.text
+    assert "const WORKBENCH_VIEWS = ['positions', 'strategies', 'activity', 'groups', 'more'];" in response.text
     assert "view === 'positions' ? 'exchange-positions' : null" in response.text
     assert "bindMobileWorkNavigation();" in response.text
 
@@ -1909,16 +1909,37 @@ def test_app_js_binds_workbench_navigation_and_home_event_filters(tmp_path):
     assert "[data-group-picker-search]" in response.text
 
 
-def test_app_js_defaults_to_strategy_records_and_keeps_orphan_position_deep_link(tmp_path):
+def test_app_js_defaults_to_positions_and_keeps_orphan_position_deep_link(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
     js = client.get("/static/app.js").text
 
     assert "home: { key: null, promise: null }" not in js
     assert "activity: { key: null, promise: null }" in js
     assert "groups: { key: null, promise: null }" in js
-    assert "setWorkbenchView(requestedView || 'strategies')" in js
+    assert "setWorkbenchView(requestedView || 'positions')" in js
     assert "params.get('view')" in js
     assert "setWorkbenchView('positions')" in js
+    # Every default / fallback of the workbench view is positions.
+    assert "WORKBENCH_VIEWS.includes(requestedView) ? requestedView : 'positions'" in js
+    assert "data-return-workbench-view') || 'positions'" in js
+    assert "button.dataset.workbenchView || 'positions'" in js
+    assert "setAttribute('data-return-workbench-view', 'strategies')" not in js
+    assert "|| 'strategies'" not in js
+
+
+def test_app_js_formats_strategy_list_time_in_beijing_time(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    start = js.index("function formatStrategyRecordSuccessTime")
+    end = js.index("function updateStrategyRecordStatus", start)
+    block = js[start:end]
+
+    assert "timeZone: 'Asia/Shanghai'" in js
+    assert "列表更新于" in block
+    assert "上次成功更新" not in js
+    assert "toLocaleString()" not in block
+    assert "尚未完成更新" in block
 
 
 def test_app_js_schedules_initial_requested_view_after_first_paint(tmp_path):
@@ -1932,9 +1953,9 @@ def test_app_js_schedules_initial_requested_view_after_first_paint(tmp_path):
     dom_ready = js[dom_ready_start:]
 
     assert scheduler.count("window.requestAnimationFrame") >= 2
-    assert "setWorkbenchView(requestedView || 'strategies')" in scheduler
+    assert "setWorkbenchView(requestedView || 'positions')" in scheduler
     assert "scheduleInitialWorkbenchView();" in dom_ready
-    assert "setWorkbenchView(requestedView || 'strategies')" not in dom_ready
+    assert "setWorkbenchView(requestedView || 'positions')" not in dom_ready
     assert "focusRequestedPosition().catch(() => {});" not in dom_ready
     assert "await ensureWorkbenchViewLoaded('positions')" in scheduler
 
