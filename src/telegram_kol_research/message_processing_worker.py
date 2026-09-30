@@ -164,8 +164,10 @@ class TerminalAuthoritativeProcessingFailed(RuntimeError):
 def _terminal_contract_failure_reason(processing_result: Any) -> str | None:
     """First-pass phase 3: a fail-closed outcome a retry cannot repair.
 
-    ``first_pass_contract_violation`` / ``context_contract_failed`` are set on
-    the assessment by ``assess_message_authoritatively``; the decision already
+    ``first_pass_contract_violation`` / ``context_contract_failed`` (and, since
+    the 2026-10-01 image-unavailable design, ``media_unavailable_waiting`` /
+    ``image_missing_price_not_in_text``) are set on the assessment by
+    ``assess_message_authoritatively``; the decision already
     carries the same value as its automation reason, so the entry admission
     barrier reads it as terminal, and the wakeups ran inside the authoritative
     processor. All that is left for the job is not to be queued again.

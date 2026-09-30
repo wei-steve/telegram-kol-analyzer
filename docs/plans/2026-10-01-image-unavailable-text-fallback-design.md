@@ -77,7 +77,7 @@
 
 - **送给模型的内容不加任何「图片缺失」提示**（推荐，见问题 Q2）。纯文字输入时 `input_reading.image_quality = none`，契约 §3.5 禁止模型输出 `图片不可读`，模型只能按文字的真实类别判；这和现在处理纯文字消息完全同一条路径，不引入新的模型行为。
 - 缺图标记记在我们自己的记录里：`MimoAuthoritativeResult` 增加 `missing_image_asset_ids`；`input_kind` 在 `recognition_experiments` / `mimo_recognition_runs` / `recognition_decisions` 三处都会带上 `text+image_missing`，网页、值守 casefile 直接能看到。
-- `message_evidence.normalize_mimo_evidence`：降级成功时 `extraction_status` 记 `image_unavailable_text_only`（现在成功一律记 `completed`，会把缺图信息丢掉）。
+- `message_evidence.normalize_mimo_evidence`：降级成功时 `extraction_status` 仍记 `completed`（回放 / 恢复路径只复用 `completed` 的证据行），缺图标记 `_input_degradation` 存进 `normalized_evidence`，重建时据此恢复 `input_kind=text+image_missing`。（实施时修正：原稿写的是新状态 `image_unavailable_text_only`，那样会让回放路径复用不到这行证据。）
 - 需要逐一检查所有 `input_kind == "text+image"` 的精确比较，确认新取值不会落进错误分支（实现时列清单）。
 - `evidence_backfill.py:333` 同样调这个函数：回放旧消息（图片已被 14 天清理）时也会降级为文字，结果带标记——这是想要的。
 - `prompt_testing.py:245` 的独立拦截**不动**（提示词测试就是要测图）。
@@ -114,7 +114,7 @@
 
 ### 4.5 修补下载（ingest，`telegram_live_listener`）
 
-1. **补下载窗口改按时间**：`_load_orphan_media_message_ids` 现在是 `message_id > checkpoint − 5`；改为「`message_id > checkpoint − 5` **或** 入库时间在最近 N 小时内（推荐 2 小时）」。17301、20025 这种就不会永久丢。
+1. **补下载窗口改按时间**：`_load_orphan_media_message_ids` 现在是 `message_id > checkpoint − 5`；改为「`message_id > checkpoint − 5` **或** 发出时间（`posted_at`）在最近 2 小时内」。17301、20025 这种就不会永久丢。用发出时间而不是入库时间：历史回填会在现在写入几个月前的消息，不能因此扩大窗口。限制：reconcile 每轮只取每个群最近 50 条，2 小时内超过 50 条的群，更早的仍补不到。
 2. **失败后尽快补**：实时下载失败时，由 ingest 安排一次定向补下载（推荐 +20 秒、+60 秒两次，只针对这一条），不等 5.6 分钟的 reconcile。
 3. **补到后重新入队**：reconcile / 定向补下载把某条消息的 `local_path` 从不可用变成可用时，若该消息当前决策是「缺图终态」（§4.4）→ 重新入队识别，`last_reason=media_repaired_enqueued`。**已按文字降级识别成功的不重跑**（Q3）。
 

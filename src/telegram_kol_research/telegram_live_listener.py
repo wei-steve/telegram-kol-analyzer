@@ -1222,7 +1222,7 @@ def _load_orphan_media_message_ids(
     """Messages of ``dialog_id`` whose media download has not succeeded yet.
 
     Two ways in: above the reconcile's replay floor (the original rule), or
-    stored since ``recent_since``. The second one is the 2026-10-01
+    posted since ``recent_since``. The second one is the 2026-10-01
     image-unavailable design §4.5-1: the floor is ``checkpoint - 5``, so in a
     group that kept talking a failed download dropped out of the retry set
     within minutes and was never tried again (raw 17301, 20025).
@@ -1230,7 +1230,9 @@ def _load_orphan_media_message_ids(
 
     position_filter = RawMessage.message_id > replay_floor
     if recent_since is not None:
-        position_filter = or_(position_filter, RawMessage.created_at >= recent_since)
+        # ``posted_at``, not ``created_at``: a history backfill stores a
+        # months-old message now, and that one must not widen the window.
+        position_filter = or_(position_filter, RawMessage.posted_at >= recent_since)
     with session_factory() as session:
         media_rows = (
             session.query(RawMessage.message_id, MediaAsset.local_path)

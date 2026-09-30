@@ -425,7 +425,15 @@ def test_authoritative_mimo_falls_back_to_text_when_declared_image_is_missing(
     model_calls: list[dict] = []
     monkeypatch.setattr(
         "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
-        lambda **kwargs: model_calls.append(kwargs) or {},
+        lambda **kwargs: model_calls.append(kwargs)
+        or {
+            "recognition_result": "非策略",
+            "reason": "text only",
+            "strategy": {},
+            "lifecycle_event": {"event_type": "none"},
+            "input_reading": {"observed_text": "BTC short caption", "image_quality": "none"},
+            "confidence": 0.5,
+        },
     )
     result = run_mimo_authoritative_for_message(
         session_factory,
