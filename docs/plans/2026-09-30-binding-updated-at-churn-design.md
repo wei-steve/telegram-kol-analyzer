@@ -1,7 +1,7 @@
 # 对账每轮刷新 execution_bindings.updated_at：源头与方案
 
 - 日期：2026-09-30
-- 状态：**用户已确认（2026-09-30）：问题 1 选 A、2 另开任务、3 不回填、4 不改**；**候选 `5b0221c8` 已完成，全量 10905 passed / 4 skipped / 0 failed（17 分 22 秒），未部署、未推 origin/main，部署由调度会话排期**
+- 状态：**已部署 `91f02f49`（代码 `5b0221c8`，2026-09-30 07:31Z，回滚 `7b9d2c40`），L2 观察通过**
 - 分支：`claude/bold-kapitsa-caf323`（基于 origin/main `b5ec59e2`，生产 `7b9d2c40`）
 - 验证级别：L2（改的是 worker 对账写入路径；不改表结构、不碰交易所写入）
 - 来源：网页实时数据会话的排查（`docs/plans/2026-09-30-web-live-data-and-positions-first-design.md` 1.4 b、第 6 节问题 5）
@@ -132,3 +132,15 @@
 - 全量：`10905 passed, 4 skipped`，0 失败。开发中 `test_absent_conditional_entry_reconcile.py::test_the_reconciler_actually_prints_the_hold` 在特定文件顺序下失败，基线提交同样失败，属既有顺序依赖；全量顺序下通过。
 - 没有改动任何既有测试；没有碰网页实时数据会话的文件。
 - 部署后观察按第 4 节。
+
+## 8. 部署与观察（2026-09-30）
+
+- 用户确认后部署。部署前：生产 `7b9d2c40` 是候选祖先；零在途（管理批次 0、worker 命令 / 消息作业均终态；29 条 `submitted` 平仓预留是 07-11～08-14 的历史残留）。
+- `tg-deploy 91f02f49…` → worker / web / ingest active（worker 07:31:28Z 启动），web 200。origin/main 推到 `91f02f49`（非强推）；部署后判决 `PASS: 0 code files beyond production`。**回滚 = `tg-deploy 7b9d2c4054fdcf5c7477f3b6c82040b83e457a5d`**。
+- L2 观察窗 07:32:53Z–08:02:54Z（31 个样本全部健康，5 条新消息）：
+  - 对账轮次 `touched_binding_count`：197 → **1**（31 轮全为 1；剩下的是持仓那条绑定，因入场腿 `updated_at` 每轮跳，即问题 4，按决定不改）；
+  - 部署后 `updated_at` 前进的绑定：**0 条**；
+  - `recovered_at` 仍每轮刷新，最大滞后 22.7 s；持仓绑定 392 始终在列；
+  - worker 错误 0；值守新开案例 0。
+- 证据：服务器 `/var/lib/telegram-kol-observations/20260930-binding-churn/`（`samples.jsonl`、`RESULT`）。
+- 后续：生命周期 `updated_at` 同类问题由调度会话另派会话处理（也改 `execution_bindings.py`）。
