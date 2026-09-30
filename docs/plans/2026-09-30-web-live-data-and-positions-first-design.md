@@ -276,3 +276,16 @@
   - 迟到回填的旧消息会插在顶部，之后点「加载更多」时可能重复出现。
   - 共享渲染的持仓状态行最多滞后 30 秒，前端会按 `server_time` 纠正新鲜度文字。
 - 源头问题（第 6 节问题 5）已另开任务卡片「Stop reconcile bumping binding updated_at every round」。
+
+## 9. 部署与观察（2026-09-30）
+
+- 部署：`tg-deploy 7b9d2c40`（06:35 UTC），worker、web、ingest 均为 active。回滚点是 `tg-deploy 3a26f5d1`。
+- origin/main 已推到 `7b9d2c40`（未强推）。OFFENDERS 判决式先分别用必定 FAIL、必定 PASS 的输入自测，结论为 **PASS: 0 code files beyond production**。
+- L1 观察：06:35:50–06:39:52 UTC，新增 5 条真实消息（raw id 19917 → 19922），达到目标后停止，**PASS**。每分钟采样一次，全部正常：
+  - `/api/live/state` 的响应时间 0.04–0.06 秒；
+  - `/strategy-records` 0.12–0.36 秒；
+  - `/positions-panel` 0.04–0.05 秒；
+  - worker 写的仓位缓存每次采样都在 1–5 秒内刚更新过，说明 worker 循环一直在跑；
+  - 三个服务的 err 级日志为 0。
+  - 旧脚本对 `/api/freshness`、`/api/monitor-status` 和 `/api/events` 的请求，从 22 次/分钟降到 0，是还没刷新的旧标签页逐渐消失。
+- 证据：服务器 `/root/web-live-l1-20260930.log`，采样脚本 `/root/web-live-l1-sample.sh`（只读）。
