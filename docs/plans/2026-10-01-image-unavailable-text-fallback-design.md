@@ -173,3 +173,12 @@
 - 观察：30 分钟 ≥5 条真实消息；缺图正向样本 30 天仅 9 条，窗口内大概率碰不到，首例出现时核对 `input_kind=text+image_missing` 的决策、执行与告警。
 - 部署后手工重新入队 raw 20102 一次（Q5，notify_only 群，无资金影响）。它当前的决策原因是 `mimo_authoritative_failed_exhausted`，不会被补下载自动重新入队。
 - 回滚：`tg-deploy <部署前生产 sha>`。
+
+### 部署与观察（2026-10-01，用户在本会话确认「部署」）
+
+- rebase 到 origin/main `60b010a6` 后，代码 sha 变为 **`08eaec4dd6be1addd8a94cf183bdf29a3bc44957`**（原候选 `7388588a` 的同内容）。受影响测试 517 passed，全量 **10960 passed, 4 skipped**。
+- 预检：生产 HEAD `45e404bc`，候选是其后代且包含 origin/main；实盘绑定 391–396 全部 closed，之后无新绑定；最近管理批次 195 succeeded；消息任务无积压。
+- `tg-deploy 08eaec4d…`：02:08:39Z 完成，worker / web / ingest 均 active，ingest 重启后无报错。随后同一 sha 推 `origin/main`（非强推）；双向核对通过，判决式检查 `PASS: 0 code files beyond production`。
+- **回滚**：`tg-deploy 45e404bc27a9fc7ad699f3b528d49a97b23beeb8`。
+- **L2 观察 PASS**：服务器只读监视器 `/root/image-unavailable-l2/monitor.log`，02:14–02:44Z 每分钟 31 个采样全部健康（三服务 active、HEAD 不变、无 Traceback、无积压超 5 分钟的任务、无 failed 任务、无失败的识别 run），窗口内滚动 30 分钟消息数 19–21 条（起始）至 5 条（结束），2–4 个群。缺图正向样本未出现（30 天仅 9 条，预期如此），首例出现时核对。
+- **raw 20102 重跑（Q5）未能产生识别样本**：02:09Z 用 `_enqueue_processing_jobs(resume_terminal_jobs=True)` 以 worker 用户重新入队（任务 8341，原 `failed/5`）。worker 的时效保护随即以 `expired_stale_instruction` 作废了这个任务，决策改为 `skipped / authoritative_gap_recovery_expired`（`recovery_guard`），没有调用模型：消息已约 16 小时，超出补识别窗口。这是防止旧消息被重新识别成交易的既有保护，fail-closed 正确；颜驰群 notify_only，该原因只在 auto_trade 群告警。没有绕过它。
