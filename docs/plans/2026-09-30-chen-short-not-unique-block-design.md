@@ -3,7 +3,7 @@
 - 日期：2026-09-30（时间均为 UTC）
 - 对象：陈哥群 `-1002337721508`，lifecycle 1385，执行绑定 393，管理批次 191–194，值守提案 4–6
 - 状态：**已批准（2026-09-30）：做 F1 + F2；F3 不做；两段式消息维持全平；167 / 175 / 191 历史记账不修。** 实施到候选 sha + 全量通过为止，不部署、不推 origin/main。
-- **部署：2026-09-30 23:23:50Z 部署 `45e404bc`（代码提交 `aa1bba03`，rebase 到 `73677f1c` 后全量 10936 passed / 4 skipped），回滚 `tg-deploy bba228e3700e268c3896c3451feb9b68eaf5e698`。L2 观察进行中（见第 9 节）。**
+- **部署：2026-09-30 23:23:50Z 部署 `45e404bc`（代码提交 `aa1bba03`，rebase 到 `73677f1c` 后全量 10936 passed / 4 skipped），回滚 `tg-deploy bba228e3700e268c3896c3451feb9b68eaf5e698`。**L2 观察 PASS**（见第 9 节）。**
 - 生产 HEAD：`bba228e3`（另一会话的 L2 观察窗进行中，本调查全程只读）
 
 ## 1. 一句话结论
@@ -222,3 +222,4 @@ F2 没有既有测试把 0 行场景断言成 `not_unique`，未改任何 F2 相
 - 部署后：web / ingest / worker 健康端点 200，三服务自部署起错误行 0。
 - 观察：服务器只读监视器 `/var/lib/telegram-kol-observations/20260930-full-exit-reconcile/`（`obs.py`、`samples.jsonl`、结束时写 `RESULT`），每分钟采样；健康判据：三服务 PID 不变且 active、对账轮 >0、worker 无 ERROR/Traceback、worker loop-health 200、新批次无 `recovery_required` 且无 `management_reconciliation_identity_mismatch`；连续 30 分钟且 ≥5 条真实消息即 PASS，上限 24 小时。
 - 正向样本（第二腿先撤后 full_exit 的真实成交确认）要等自然出现，不作为本窗口的通过条件。
+- **结果：PASS。** 窗口 2026-09-30 23:24:48Z – 2026-10-01 00:34:54Z，连续健康 70.1 分钟，5 条真实消息、来自 3 个群，5 个消息任务全部 succeeded；71 个样本全部健康，对账 78 轮，worker 错误 0，三服务 PID 未变；窗口内无新管理批次，`management_reconciliation_identity_mismatch` 0 次。证据：服务器 `/var/lib/telegram-kol-observations/20260930-full-exit-reconcile/`（`samples.jsonl`、`RESULT`）。
